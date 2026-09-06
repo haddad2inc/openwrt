@@ -654,19 +654,10 @@ ath79_setup_macs()
 		lan_mac=$(fritz_tffs -n maca -i $(find_mtd_part "tffs (1)"))
 		wan_mac=$(fritz_tffs -n macb -i $(find_mtd_part "tffs (1)"))
 		;;
-	comfast,cf-e375ac)
+	comfast,cf-e375ac|\
+    comfast,cf-wa350)
 		wan_mac=$(macaddr_add $(mtd_get_mac_binary art 0x0) 1)
 		;;
-    comfast,cf-wa350)
-        lan_mac=$(mtd_get_mac_binary art 0x0)
-        [ -n "$lan_mac" ] || return
-
-        wan_mac=$(macaddr_add "$lan_mac" 1)
-        label_mac=$lan_mac
-
-        ucidef_set_interface_macaddr "lan" "$lan_mac"
-        ucidef_set_interface_macaddr "wan" "$wan_mac"
-        ;;
 	compex,wpj344-16m|\
 	compex,wpj558-16m|\
 	compex,wpj563)
