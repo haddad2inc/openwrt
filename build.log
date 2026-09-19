@@ -6,3 +6,8 @@ Commit: 52ea5a57793f6f7263b36f151843aa53129162f6
 ========================================
 Build started at: Sun Sep 20 00:46:14 +03 2026
 ========================================
+=== Checking for .config file ===
+❌ ERROR: .config file not found in repository root!
+=== Uploading log to repository ===
+=== BUILD LOG END - Sun Sep 20 00:46:15 +03 2026 ===
+Build completed with status: failure
