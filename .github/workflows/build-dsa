@@ -6,8 +6,8 @@ on:
     branches: [ main ]
 
 env:
-  REPO_URL: https://git.openwrt.org/openwrt/openwrt.git
-  # تم إزالة تحديد الفرع ليتم بناء سناب شوت (الفرع الافتراضي master)
+  REPO_URL: https://github.com/haddad2inc/openwrt.git
+  REPO_BRANCH: using-dsa
   TZ: Asia/Riyadh
 
 jobs:
@@ -69,7 +69,7 @@ jobs:
     - name: Clone OpenWrt source (shallow)
       run: |
         echo "=== Cloning OpenWrt source ===" | tee -a build.log
-        git clone --depth 1 $REPO_URL openwrt 2>&1 | tee -a build.log
+        git clone --depth 1 --branch $REPO_BRANCH $REPO_URL openwrt 2>&1 | tee -a build.log
         rm -rf openwrt/.git 2>&1 | tee -a build.log
 
     - name: Update & Install feeds
@@ -196,7 +196,6 @@ jobs:
         # 6. حفظ نسخة من .config بعد defconfig
         cp .config config-after.txt
 
-        # 7. إعادة فرض الجهاز المستهدف إذا فُقد
         echo "=== Checking target device AFTER defconfig ===" | tee -a ../build.log
         if ! grep -q "CONFIG_TARGET_ath79_generic_DEVICE_comfast_cf-wa350=y" .config; then
           echo "⚠️ Target device option missing after defconfig, re-adding..." | tee -a ../build.log
@@ -211,7 +210,7 @@ jobs:
           echo "✅ Target device still correctly set AFTER defconfig." | tee -a ../build.log
         fi
 
-        # 8. طباعة الخيارات المفعّلة بعد defconfig
+        # 8.printing
         echo "=== Active options AFTER defconfig ===" | tee -a ../build.log
         echo "Count of enabled options (y/m):" | tee -a ../build.log
         grep -E '^CONFIG_.*=[ym]' .config | wc -l | tee -a ../build.log
