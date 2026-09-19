@@ -3,7 +3,7 @@ name: Build OpenWrt for COMFAST CF-WA350 (with config diff)
 on:
   workflow_dispatch:
   push:
-    branches: [ main ]
+    branches: [ using-dsa ]
 
 env:
   REPO_URL: https://github.com/haddad2inc/openwrt.git
