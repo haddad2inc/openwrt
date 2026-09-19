@@ -1,0 +1,6 @@
+
+# تفعيل خدمة lldpd وتشكيل البث لضمان ظهور الراوتر في MikroTik Neighbors
+/etc/init.d/lldpd enable
+/etc/init.d/lldpd start
+
+exit 0

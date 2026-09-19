@@ -1,0 +1,13 @@
+{
+	"admin/wizard": {
+		"title": "البرمجة السريعة",
+		"order": 98,
+		"action": {
+			"type": "view",
+			"path": "wizard"
+		},
+		"depends": {
+			"acl": [ "luci-app-wizard" ]
+		}
+	}
+}

@@ -1,0 +1,340 @@
+#!/bin/sh /etc/rc.common
+
+USE_PROCD=1
+START=99
+STOP=10
+
+service_triggers() {
+	procd_add_reload_trigger "wizard"
+}
+
+boot() {
+	XBOOT=1 start
+}
+
+start_service() {
+	if [ "x$XBOOT" = "x1" ]; then
+		_reverse_sync
+		return 0
+	fi
+	_apply_direct
+}
+
+reload_service() {
+	_apply_direct
+}
+
+restart_service() {
+	_apply_direct
+}
+
+_reverse_sync() {
+	local existing_ip=$(uci -q get wizard.default.lan_ipaddr 2>/dev/null)
+	[ -n "$existing_ip" ] && return 0
+
+	local ssid=$(uci -q get wireless.@wifi-iface[0].ssid 2>/dev/null)
+	local key=$(uci -q get wireless.@wifi-iface[0].key 2>/dev/null)
+	local ipaddr=$(uci -q get network.lan.ipaddr 2>/dev/null)
+	local netmask=$(uci -q get network.lan.netmask 2>/dev/null)
+
+	uci -q set wizard.default=wizard
+	[ -n "$ssid" ] && uci -q set wizard.default.wifi_ssid="$ssid"
+	[ -n "$key" ] && uci -q set wizard.default.wifi_key="$key"
+	[ -n "$ipaddr" ] && uci -q set wizard.default.lan_ipaddr="$ipaddr"
+	[ -n "$netmask" ] && uci -q set wizard.default.lan_netmask="$netmask"
+	uci -q commit wizard
+	logger -t wizard "Reverse sync done"
+}
+
+_apply_direct() {
+
+. /lib/functions/system.sh
+# --- Guard: this script is for the DSA build only -----------------------------
+if [ ! -e /sys/class/net/lan ] || [ ! -e /sys/class/net/wan ]; then
+    echo "ERROR: DSA port netdevs 'lan'/'wan' not found." >&2
+    echo "ERROR: This script must only run on the DSA build of the CF-WA350." >&2
+    exit 1
+fi
+
+# --- Vendor MAC scheme (same as board.d) ---------------------------------------
+LAN_MAC=$(mtd_get_mac_binary art 0x0)
+WAN_MAC=$(macaddr_add "$LAN_MAC" 1)
+if [ -z "$LAN_MAC" ] || [ -z "$WAN_MAC" ]; then
+    echo "ERROR: could not read MAC address from art partition." >&2
+    exit 1
+fi
+
+NEW_ULA=$(printf "fd%02x:%04x:%04x::/48" $((RANDOM%256)) $((RANDOM%65536)) $((RANDOM%65536)))
+
+	local lan_ipaddr=$(uci -q get wizard.default.lan_ipaddr)
+	[ -z "$lan_ipaddr" ] && { logger -t wizard "No IP, aborting"; return 1; }
+
+	local lan_netmask=$(uci -q get wizard.default.lan_netmask)
+	local operation_mode=$(uci -q get wizard.default.operation_mode)
+	local wifi_ssid=$(uci -q get wizard.default.wifi_ssid)
+	local wifi_key=$(uci -q get wizard.default.wifi_key)
+	local mesh_id=$(uci -q get wizard.default.mesh_id)
+	local mesh_encryption=$(uci -q get wizard.default.mesh_encryption)
+	local mesh_key=$(uci -q get wizard.default.mesh_key)
+	local client_ssid=$(uci -q get wizard.default.client_ssid)
+	local client_encryption=$(uci -q get wizard.default.client_encryption)
+	local client_key=$(uci -q get wizard.default.client_key)
+	local channel_2g=$(uci -q get wizard.default.channel_2g)
+	local channel_5g=$(uci -q get wizard.default.channel_5g)
+	local vlan_id=$(uci -q get wizard.default.vlan_id)
+	local remove_old_config=$(uci -q get wizard.default.remove_old_config)
+	local root_password=$(uci -q get wizard.default.root_password)
+	local cell_density=$(uci -q get wizard.default.cell_density)
+
+	[ -z "$wifi_ssid" ] && wifi_ssid="Haddad-WiFi"
+	[ -z "$mesh_id" ] && mesh_id="Haddad-Mesh"
+	[ -z "$client_ssid" ] && client_ssid="Haddad-Sender"
+	[ -z "$channel_2g" ] && channel_2g="auto"
+	[ -z "$channel_5g" ] && channel_5g="36"
+	[ -z "$cell_density" ] && cell_density="0"
+
+	local gateway="${lan_ipaddr%.*}.1"
+	local is_mesh=0 is_client=0 has_vlan=0
+
+	case "$operation_mode" in *mesh*) is_mesh=1 ;; esac
+	case "$operation_mode" in *client*) is_client=1 ;; esac
+	case "$operation_mode" in *vlan*) has_vlan=1 ;; esac
+
+	logger -t wizard "MODE=$operation_mode IP=$lan_ipaddr VLAN=$has_vlan"
+
+	if [ -n "$root_password" ]; then
+		(echo "$root_password"; echo "$root_password") | passwd root >/dev/null 2>&1
+		uci -q delete wizard.default.root_password
+		uci -q commit wizard
+	fi
+
+	if [ "$remove_old_config" != "0" ]; then
+		logger -t wizard "Resetting network and wireless"
+		for i in $(uci show network | grep switch_vlan | cut -d'.' -f2 | cut -d'=' -f1); do
+  			uci -q delete network.$i
+		done
+		# Remove all existing switch_vlan sections to prevent duplication/errors
+		while uci -q delete network.@switch_vlan[0]; do :; done
+		while uci -q delete network.@device[0]; do :; done
+
+		for section in $(uci -q show network | grep '=interface' | cut -d. -f2 | cut -d= -f1); do
+			[ "$section" != "loopback" ] && uci -q delete network.$section
+		done
+		for section in $(uci -q show network | grep '=device' | cut -d. -f2 | cut -d= -f1); do
+			uci -q delete network.$section
+		done
+		for iface in $(uci -q show wireless | sed -n 's/^wireless\.\(.*\)=wifi-iface$/\1/p'); do
+			uci -q delete wireless.$iface
+		done
+             uci -q commit wireless
+            uci -q commit network
+
+# ── إعادة تسمية أجهزة الراديو إلى أسماء ثابتة (5G / 2G) ──
+rename_radio() {
+    local old_name="$1"
+    local band=$(uci -q get wireless.$old_name.band 2>/dev/null)
+    [ -z "$band" ] && return
+
+    local new_name=""
+    case "$band" in
+      *5g*|*5G*|*5.0g*|*5.0G*|*5.8g*|*5.8G*) new_name="5G" ;;
+      *2g*|*2G*|*2.4g*|*2.4G*) new_name="2G" ;;
+        *) return ;;
+    esac
+
+    # إذا كان القسم الجديد موجوداً بالفعل (ولا يساوي القديم)، احذفه أولاً لتجنب التعارض
+    if [ "$(uci -q get wireless.$new_name 2>/dev/null)" ] && [ "$old_name" != "$new_name" ]; then
+        uci -q delete wireless.$new_name
+    fi
+
+    # أعد التسمية فقط إذا كان الاسمان مختلفين
+    if [ "$old_name" != "$new_name" ]; then
+        uci -q rename wireless.$old_name="$new_name"
+        logger -t wizard "Renamed radio $old_name ($band) to $new_name"
+    fi
+}
+
+# تنفيذ إعادة التسمية لكل من radio0 و radio1 (إن وجدا)
+for radio in radio0 radio1; do
+    if uci -q get wireless.$radio >/dev/null 2>&1; then
+        rename_radio "$radio"
+    fi
+done
+
+		uci -q set network.loopback='interface'
+		uci -q set network.loopback.device='lo'
+		uci -q set network.loopback.proto='static'
+		uci -q set network.loopback.ipaddr='127.0.0.1'
+		uci -q set network.loopback.netmask='255.0.0.0'
+	#	uci -q set network.globals='globals'
+	#	uci -q set network.globals.ula_prefix='auto'
+	
+	if ! uci -q get network.globals > /dev/null; then
+    	uci -q set network.globals='globals'
+	fi
+		uci -q set network.globals.ula_prefix="$NEW_ULA"
+		uci -q set network.globals.packet_steering='1'
+
+		uci -q set network.lan_dev='device'
+		uci -q set network.lan_dev.name='lan'
+		uci -q set network.lan_dev.macaddr="$LAN_MAC"
+
+		uci -q set network.wan_dev='device'
+		uci -q set network.wan_dev.name='wan'
+		uci -q set network.wan_dev.macaddr="$WAN_MAC"
+		uci -q set network.br_lan='device'
+		uci -q set network.br_lan.name='br-lan'
+		uci -q set network.br_lan.type='bridge'
+		uci -q add_list network.br_lan.ports='lan'
+		uci -q add_list network.br_lan.ports='wan'
+		uci -q set network.lan='interface'
+		uci -q set network.lan.device='br-lan'
+		uci -q set network.lan.proto='static'
+		uci -q set network.lan.ipaddr="$lan_ipaddr"
+		uci -q set network.lan.netmask="$lan_netmask"
+		uci -q set network.lan.gateway="$gateway"
+		uci -q set network.lan.dns="$gateway"
+		uci -q set network.lan.delegate='0'
+	fi
+
+	uci -q set wireless.5G.disabled='0'
+	uci -q set wireless.2G.disabled='0'
+	uci -q set wireless.5G.cell_density="$cell_density"
+	uci -q set wireless.2G.cell_density="$cell_density"
+	uci -q set wireless.5G.channel="$channel_5g"
+	uci -q set wireless.2G.channel="$channel_2g"
+
+	local idx=0
+	local ap_network='lan'
+	[ "$has_vlan" = "1" ] && ap_network='vlan'
+
+	if [ "$is_mesh" = "1" ]; then
+		uci -q set wireless.wifinet${idx}='wifi-iface'
+		uci -q set wireless.wifinet${idx}.device='5G'
+		uci -q set wireless.wifinet${idx}.mode='mesh'
+		uci -q set wireless.wifinet${idx}.mesh_id="$mesh_id"
+		uci -q set wireless.wifinet${idx}.mesh_fwding='1'
+		uci -q set wireless.wifinet${idx}.mesh_rssi_threshold='0'
+		uci -q set wireless.wifinet${idx}.encryption="$mesh_encryption"
+		[ "$mesh_encryption" != "none" ] && [ -n "$mesh_key" ] && uci -q set wireless.wifinet${idx}.key="$mesh_key"
+		uci -q set wireless.wifinet${idx}.network='lan'
+		idx=$((idx + 1))
+	fi
+
+	if [ "$is_client" = "1" ]; then
+		uci -q set wireless.wifinet${idx}='wifi-iface'
+		uci -q set wireless.wifinet${idx}.device='5G'
+		uci -q set wireless.wifinet${idx}.mode='sta'
+		uci -q set wireless.wifinet${idx}.ssid="$client_ssid"
+		uci -q set wireless.wifinet${idx}.wds='1'
+		uci -q set wireless.wifinet${idx}.encryption="$client_encryption"
+		[ "$client_encryption" != "none" ] && [ -n "$client_key" ] && uci -q set wireless.wifinet${idx}.key="$client_key"
+		uci -q set wireless.wifinet${idx}.disassoc_low_ack='0'
+		uci -q set wireless.wifinet${idx}.network='lan'
+		idx=$((idx + 1))
+	fi
+
+	uci -q set wireless.wifinet${idx}='wifi-iface'
+	uci -q set wireless.wifinet${idx}.device='2G'
+	uci -q set wireless.wifinet${idx}.mode='ap'
+	uci -q set wireless.wifinet${idx}.ssid="$wifi_ssid"
+	uci -q set wireless.wifinet${idx}.wds='1'
+	uci -q set wireless.wifinet${idx}.isolate='1'
+	uci -q set wireless.wifinet${idx}.disassoc_low_ack='0'
+	if [ -n "$wifi_key" ]; then
+		uci -q set wireless.wifinet${idx}.encryption='psk2'
+		uci -q set wireless.wifinet${idx}.key="$wifi_key"
+	else
+		uci -q set wireless.wifinet${idx}.encryption='none'
+	fi
+	uci -q set wireless.wifinet${idx}.network="$ap_network"
+	idx=$((idx + 1))
+
+	uci -q set wireless.wifinet${idx}='wifi-iface'
+	uci -q set wireless.wifinet${idx}.device='5G'
+	uci -q set wireless.wifinet${idx}.mode='ap'
+	uci -q set wireless.wifinet${idx}.ssid="${wifi_ssid} 5G"
+	uci -q set wireless.wifinet${idx}.wds='1'
+	uci -q set wireless.wifinet${idx}.isolate='1'
+	uci -q set wireless.wifinet${idx}.disassoc_low_ack='0'
+	if [ -n "$wifi_key" ]; then
+		uci -q set wireless.wifinet${idx}.encryption='psk2'
+		uci -q set wireless.wifinet${idx}.key="$wifi_key"
+	else
+		uci -q set wireless.wifinet${idx}.encryption='none'
+	fi
+	uci -q set wireless.wifinet${idx}.network="$ap_network"
+	idx=$((idx + 1))
+
+	if [ "$has_vlan" = "1" ] && [ -n "$vlan_id" ]; then
+		logger -t wizard "VLAN $vlan_id"
+		uci -q set network.vlan_tag='device'
+		uci -q set network.vlan_tag.type='8021q'
+		uci -q set network.vlan_tag.ifname='br-lan'
+		uci -q set network.vlan_tag.vid="$vlan_id"
+		uci -q set network.vlan_tag.name="br-lan.${vlan_id}"
+		uci -q set network.br_vlan='device'
+		uci -q set network.br_vlan.name='br-vlan'
+		uci -q set network.br_vlan.type='bridge'
+		uci -q delete network.br_vlan.ports 2>/dev/null
+		uci -q add_list network.br_vlan.ports="br-lan.${vlan_id}"
+		uci -q set network.vlan='interface'
+		uci -q set network.vlan.device='br-vlan'
+		uci -q set network.vlan.proto='none'
+	else
+		uci -q delete network.vlan_tag
+		uci -q delete network.br_vlan
+		uci -q delete network.vlan
+	fi
+	# ─── Watchcat ───
+	local enable_watchcat=$(uci -q get wizard.default.enable_watchcat)
+	if [ "$enable_watchcat" = "1" ]; then
+		logger -t wizard "Enabling watchcat"
+		# حذف الإعدادات القديمة
+		for wc in $(uci -q show watchcat 2>/dev/null | sed -n 's/^watchcat\.\(.*\)=watchcat$/\1/p'); do
+			uci -q delete watchcat.$wc
+		done
+		# إنشاء جديد
+		local wc_section=$(uci -q add watchcat watchcat)
+		uci -q set watchcat.$wc_section.period='10m'
+		uci -q set watchcat.$wc_section.mode='ping_reboot'
+		uci -q set watchcat.$wc_section.pinghosts='8.8.8.8'
+		uci -q set watchcat.$wc_section.forcedelay='30'
+		uci -q commit watchcat
+		/etc/init.d/watchcat enable 2>/dev/null
+		/etc/init.d/watchcat restart 2>/dev/null
+	else
+		logger -t wizard "Disabling watchcat"
+		/etc/init.d/watchcat disable 2>/dev/null
+		/etc/init.d/watchcat stop 2>/dev/null
+	fi
+
+	# ─── زر الريسيت ───
+	local disable_reset=$(uci -q get wizard.default.disable_reset_button)
+	if [ "$disable_reset" = "1" ]; then
+		logger -t wizard "Disabling reset button"
+		cat > /etc/rc.button/reset << 'EOFBTN'
+#!/bin/sh
+logger -t reset-button "Reset button pressed but disabled by wizard"
+exit 0
+EOFBTN
+		chmod +x /etc/rc.button/reset
+	else
+		if [ -f /etc/rc.button/reset ]; then
+			logger -t wizard "Restoring reset button"
+			rm -f /etc/rc.button/reset
+		fi
+	fi
+	uci -q commit network
+	uci -q commit wireless
+	uci -q commit dhcp
+	logger -t wizard "UCI committed"
+
+	logger -t wizard "Reloading..."
+	/sbin/wifi reload
+	sleep 3
+	/etc/init.d/network reload
+	sleep 1
+	/etc/init.d/dnsmasq reload
+	logger -t wizard "=== DONE ==="
+}
