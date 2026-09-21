@@ -1,0 +1,347 @@
+name: CF-WA350 pipeline bisect
+
+# =============================================================================
+# يعيد إنتاج **خط الإنتاج الحقيقي** عندك (نمط فرع using-dsa) بدقّة:
+#   clone upstream  ->  apply_patches.py  ->  dts/...  ->  .config الجاهز  ->  build
+# مع **متغيّر واحد فقط**: إصدار النواة (kernel_pin).
+#
+# لماذا هذا الملف؟
+#   اللوجات الثلاثة أثبتت أن نفس خريطة الجهاز تعمل على 6.6.144 و6.12.108 و6.18.44،
+#   أي أن المشكلة ليست في الـ DTS. ولحسم «هل 6.18.52 هي السبب؟» يجب البناء بخط
+#   الإنتاج نفسه مع تغيير النواة وحدها - وهذا ما يفعله هذا الـ workflow.
+#
+#   كذلك: فرع using-dsa **فقد مجلد dts/** (لا يوجد أي ملف wa350 في 13592 مسارًا)،
+#   وapply_patches.py يطبع "!!! DTS source not found" ثم يُكمل بقية الترقيعات،
+#   فيُبنى كل أجهزة ath79 ولا تُنتج صورة لجهازك. هذا الـ workflow يجلب الـ DTS
+#   من كوميت مثبّت في فرع comfast-cf-wa350-support ويعيد مجلد dts/ إلى مكانه.
+# =============================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        description: 'قاعدة OpenWrt: main (سنابشوت) أو v24.10.8 أو openwrt-25.12 أو SHA كامل'
+        required: false
+        default: "main"
+      kernel_pin:
+        description: 'إصدار النواة المطلوب: 6.18.44 / 6.18.48 / 6.18.50 / 6.18.51 / 6.18.52 (فارغ = اترك القاعدة كما هي)'
+        required: false
+        default: "6.18.52"
+      dts_ref:
+        description: 'المرجع الذي يُجلب منه DTS الجهاز وملفات board.d'
+        required: false
+        default: "949b9f785c85b32c8daa3acfb9ccd01ce221cae1"
+      margin_ms:
+        description: 'فرض hw_margin_ms في الـ DTS (فارغ = اتركه كما في dts_ref)'
+        required: false
+        default: ""
+      extra_config:
+        description: 'أسطر .config إضافية'
+        required: false
+        default: ""
+
+concurrency:
+  group: wa350-pipeline-${{ github.run_id }}
+  cancel-in-progress: false
+
+env:
+  SRC_REPO: https://github.com/haddad2inc/openwrt.git
+  UPSTREAM: https://github.com/openwrt/openwrt.git
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: base=${{ inputs.base_ref }} kernel=${{ inputs.kernel_pin }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 420
+    steps:
+      - name: Checkout this fork (ci-wa350) to get .config / apply_patches.py / files
+        uses: actions/checkout@v4
+        with:
+          ref: ci-wa350
+          fetch-depth: 1
+          path: fork
+
+      - name: Fetch the board DTS + board.d from the pinned device ref
+        run: |
+          set -uo pipefail
+          DTS_REF="${{ inputs.dts_ref }}"
+          mkdir -p dts
+          curl -fsSL --retry 5 --max-time 120 \
+            "https://raw.githubusercontent.com/haddad2inc/openwrt/${DTS_REF}/target/linux/ath79/dts/qca9563_comfast_cf-wa350.dts" \
+            -o dts/qca9563_comfast_cf-wa350.dts || { echo "::error::could not fetch the DTS from $DTS_REF"; exit 1; }
+          echo "== DTS fetched: $(wc -c < dts/qca9563_comfast_cf-wa350.dts) bytes"
+          grep -n -E "hw_margin_ms|always-running|ethernet-switch@|qca,qca8337|spi-max-frequency" dts/qca9563_comfast_cf-wa350.dts || true
+          if [ -n "${{ inputs.margin_ms }}" ]; then
+            sed -i -E "s/hw_margin_ms = <[0-9]+>;/hw_margin_ms = <${{ inputs.margin_ms }}>;/" dts/qca9563_comfast_cf-wa350.dts
+            echo "== hw_margin_ms forced to ${{ inputs.margin_ms }}"
+            grep -n hw_margin_ms dts/qca9563_comfast_cf-wa350.dts
+          fi
+
+      - name: Clone the OpenWrt base
+        run: |
+          set -uo pipefail
+          BASE="${{ inputs.base_ref }}"
+          rm -rf ow
+          git init -q ow
+          cd ow
+          git remote add origin "$UPSTREAM"
+          git fetch -q --depth 1 origin "$BASE" || { echo "::error::cannot fetch base '$BASE' from upstream"; exit 1; }
+          git checkout -q FETCH_HEAD
+          echo "base HEAD      = $(git rev-parse HEAD)"
+          echo "base subject   = $(git log -1 --format=%s)"
+          echo "base date      = $(git log -1 --format=%cI)"
+          for f in target/linux/generic/kernel-6.6 target/linux/generic/kernel-6.12 target/linux/generic/kernel-6.18; do
+            [ -f "$f" ] && echo "  $f : $(tr '\n' ' ' < "$f" | cut -c1-90)"
+          done
+          echo "KERNEL_PATCHVER(ath79) = $(grep -m1 '^KERNEL_PATCHVER' target/linux/ath79/Makefile || echo n/a)"
+
+      - name: Pin the kernel (verbatim from the upstream bump commit)
+        run: |
+          set -uo pipefail
+          cd ow
+          PIN="${{ inputs.kernel_pin }}"
+          if [ -z "$PIN" ]; then echo "== no kernel pin requested =="; exit 0; fi
+          SHA=""
+          case "$PIN" in
+            6.18.38) SHA=5b6bc962bd1a7cf61176400b82304e0fcfe71f61 ;;
+            6.18.39) SHA=276214fc060984a2edf62176f2985ddda7a5fe3f ;;
+            6.18.40) SHA=7105bec48f27ea189f0b4a2f41c5e114af2774bd ;;
+            6.18.41) SHA=d3191cb05603359991ecb8336662cc5408d9c2f9 ;;
+            6.18.43) SHA=a4c51ebd7681f3e5d82e80104e1738436da938c9 ;;
+            6.18.44) SHA=53a0d54766e90b0263f268949979f730d42bec04 ;;
+            6.18.45) SHA=5edc3c1b8a0d3b0ea2d0d2688a91ae7e0eadef39 ;;
+            6.18.46) SHA=87e5289908bc5b7a2fd4a4f5707a757ba335d17a ;;
+            6.18.47) SHA=af76d8e9b3d9740da9c2fdf228bd54556a67337f ;;
+            6.18.48) SHA=f42e9340ac1bd01f7d2d2cea00e15437be65e285 ;;
+            6.18.49) SHA=02f267cbc67cbb7250f5ce678d2d96ed096a31a8 ;;
+            6.18.50) SHA=f1e0c4ac4042bb7a3f9480beb30dae7efa599568 ;;
+            6.18.51) SHA=829a6e6fb21b3936ebbaec10fbcc0b121b6ffbaa ;;
+            6.18.52) SHA=ddbf9c85575ccea2414c8ee4a1fdfee0d7152849 ;;
+            *) echo "::error::kernel_pin '$PIN' غير معروف. المدعوم: 6.18.38..6.18.52"; exit 1 ;;
+          esac
+          F=target/linux/generic/kernel-6.18
+          URL="https://raw.githubusercontent.com/openwrt/openwrt/${SHA}/${F}"
+          echo "== pinning kernel to $PIN via $URL"
+          curl -fsSL --retry 5 --max-time 120 "$URL" -o "$F.new" || { echo "::error::download failed"; exit 1; }
+          grep -qE '^LINUX_VERSION-6\.18 = \.[0-9]+$' "$F.new" || { echo "::error::bad file"; cat -A "$F.new"; exit 1; }
+          mv "$F.new" "$F"
+          cat "$F"
+          KV=$(sed -nE 's/^LINUX_VERSION-6\.18 = \.([0-9]+)$/\1/p' "$F")
+          KH=$(sed -nE "s/^LINUX_KERNEL_HASH-6\.18\.${KV} = ([0-9a-f]{64})$/\1/p" "$F")
+          echo "PINNED = 6.18.${KV} ; sha256 = ${KH}"
+          echo "KERNEL_MINOR=${KV}" >> "$GITHUB_ENV"
+
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang flex bison g++ gawk \
+            gcc-multilib g++-multilib gettext git libncurses-dev libssl-dev \
+            python3-setuptools python3-dev python3-pyelftools rsync unzip \
+            zlib1g-dev file wget swig time ccache qemu-utils device-tree-compiler
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
+
+      - name: Update and install feeds
+        run: |
+          set -euo pipefail
+          cd ow
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Apply the production patches (apply_patches.py) + inject cfw-leds
+        run: |
+          set -uo pipefail
+          cd ow
+          # 1) DTS + board.d + generic.mk عبر سكربت الإنتاج نفسه
+          cp ../fork/apply_patches.py ./apply_patches.py
+          python3 ./apply_patches.py 2>&1 | tee /tmp/patches.log
+          if grep -q "DTS source not found" /tmp/patches.log; then
+            echo "::error::apply_patches.py could not find dts/ - the DTS was not injected"
+            exit 1
+          fi
+          # 2) شبكة الأمان: إن لم يصل الـ DTS لأي سبب، انسخه مباشرة
+          if [ ! -f target/linux/ath79/dts/qca9563_comfast_cf-wa350.dts ]; then
+            echo "::warning::DTS missing after apply_patches.py - copying it directly"
+            cp ../dts/qca9563_comfast_cf-wa350.dts target/linux/ath79/dts/
+          fi
+          # 3) مجلد files/ (معالج Comfast وأصدقاءه)
+          if [ -d ../fork/files ]; then mkdir -p files; cp -a ../fork/files/. files/; echo "== files/ injected"; fi
+          # 4) حزمة cfw-leds
+          curl -fsSL --retry 3 --max-time 120 \
+            "https://raw.githubusercontent.com/haddad2inc/openwrt/${{ inputs.dts_ref }}/package/utils/cfw-leds/Makefile" \
+            -o /tmp/cfw-makefile || echo "::warning::cfw-leds Makefile fetch failed"
+          if [ -s /tmp/cfw-makefile ]; then
+            mkdir -p package/utils/cfw-leds/files
+            cp /tmp/cfw-makefile package/utils/cfw-leds/Makefile
+            for f in LICENSE files/cfw_led_ctrl files/cfw-leds.init; do
+              curl -fsSL --retry 3 --max-time 120 \
+                "https://raw.githubusercontent.com/haddad2inc/openwrt/${{ inputs.dts_ref }}/package/utils/cfw-leds/$f" \
+                -o "package/utils/cfw-leds/$f" || echo "::warning::cfw-leds/$f fetch failed"
+            done
+            chmod +x package/utils/cfw-leds/files/* 2>/dev/null || true
+            echo "== cfw-leds injected"; find package/utils/cfw-leds -type f | sed 's/^/     /'
+          fi
+          # 5) تحقق
+          echo "== device recipe =="
+          grep -n -A6 "define Device/comfast_cf-wa350" target/linux/ath79/image/generic.mk || { echo "::error::device recipe missing"; exit 1; }
+          echo "== board.d =="
+          grep -n "cf-wa350" target/linux/ath79/generic/base-files/etc/board.d/01_leds || echo "   (01_leds: no entry)"
+          grep -n "cf-wa350" target/linux/ath79/generic/base-files/etc/board.d/02_network || echo "   (02_network: no entry)"
+          ls -l target/linux/ath79/dts/qca9563_comfast_cf-wa350.dts
+
+      - name: Seed .config from the production file
+        run: |
+          set -uo pipefail
+          cd ow
+          if [ -f ../fork/.config ]; then
+            cp ../fork/.config .config
+            echo "== using the production .config ($(wc -l < .config) lines)"
+          else
+            echo "== no production .config - seeding a minimal one"
+            {
+              echo "CONFIG_TARGET_ath79=y"
+              echo "CONFIG_TARGET_ath79_generic=y"
+              echo "CONFIG_TARGET_ath79_generic_DEVICE_comfast_cf-wa350=y"
+            } > .config
+          fi
+          # أسقط رموز اختيار النواة حتى لا تتعارض مع القاعدة/التثبيت
+          sed -i '/^CONFIG_LINUX_[0-9_]*=y$/d' .config
+          sed -i '/^# CONFIG_LINUX_[0-9_]* is not set$/d' .config
+          {
+            echo "CONFIG_TARGET_ath79_generic_DEVICE_comfast_cf-wa350=y"
+            echo "CONFIG_TARGET_ROOTFS_SQUASHFS=y"
+            echo "CONFIG_TARGET_ROOTFS_INITRAMFS=y"
+            printf '%s\n' "${{ inputs.extra_config }}"
+          } >> .config
+          make olddefconfig || true
+          make defconfig
+
+      - name: HARD GATE - the device must be selected with DSA
+        run: |
+          set -uo pipefail
+          cd ow
+          FAIL=0
+          grep -E "^CONFIG_TARGET_PROFILE|DEVICE_comfast_cf-wa350|^CONFIG_PACKAGE_(kmod-dsa|kmod-phy-qca83xx|cfw-leds|swconfig)|ROOTFS_INITRAMFS|^CONFIG_LINUX_6" .config || true
+          grep -q "^CONFIG_TARGET_ath79_generic_DEVICE_comfast_cf-wa350=y" .config || { echo "::error::device symbol dropped"; FAIL=1; }
+          grep -q "^CONFIG_PACKAGE_kmod-dsa-qca8k=y" .config || { echo "::error::kmod-dsa-qca8k missing"; FAIL=1; }
+          [ "$FAIL" -eq 0 ] || exit 1
+          echo "HARD GATE passed"
+
+      - name: Download sources (retry + diagnostics)
+        run: |
+          set -uo pipefail
+          cd ow
+          mkdir -p logs
+          df -h . | sed 's/^/   /'
+          N=0; RC=1
+          while [ "$N" -lt 3 ] && [ "$RC" -ne 0 ]; do
+            N=$((N+1))
+            echo "===== make download attempt $N/3 ====="
+            make -j"$(nproc)" download V=s > "logs/download-$N.log" 2>&1
+            RC=$?
+            echo "   exit code: $RC"
+            if [ "$RC" -ne 0 ]; then
+              tail -n 100 "logs/download-$N.log"
+              grep -n -iE "hash|mismatch|failed|error|No such|404" "logs/download-$N.log" | tail -n 40 || true
+              ls -la dl 2>/dev/null | tail -n 20 || true
+              sleep 15
+            fi
+          done
+          [ "$RC" -eq 0 ] || { echo "::error::make download failed after $N attempts"; exit "$RC"; }
+
+      - name: Build images
+        run: |
+          set -uo pipefail
+          cd ow
+          mkdir -p logs
+          echo "== build started $(date -u +%FT%TZ) =="
+          make -j"$(nproc)" V=s > logs/build.log 2>&1
+          RC=$?
+          echo "== build exit code: $RC (finished $(date -u +%FT%TZ)) =="
+          tail -n 60 logs/build.log
+          if [ "$RC" -ne 0 ]; then
+            echo "==== BUILD FAILED - last 250 lines ===="
+            tail -n 250 logs/build.log
+            echo "==== error-looking lines ===="
+            grep -n -iE "error|failed|No rule to make|cannot|exceeded|too large|undefined reference" logs/build.log | tail -n 80 || true
+            exit "$RC"
+          fi
+
+      - name: Verify the image
+        run: |
+          set -uo pipefail
+          cd ow
+          D=bin/targets/ath79/generic
+          FAIL=0
+          ls -la "$D" 2>/dev/null | sed 's/^/   /' || { echo "::error::$D missing"; exit 1; }
+          for f in "$D"/*.bin; do [ -e "$f" ] && echo "   $(sha256sum "$f")"; done
+          SYS=$(find "$D" -maxdepth 1 -name 'openwrt-*comfast_cf-wa350*squashfs-sysupgrade.bin' | head -1)
+          INI=$(find "$D" -maxdepth 1 -name 'openwrt-*comfast_cf-wa350*initramfs-kernel.bin' | head -1)
+          [ -n "$SYS" ] && echo "== sysupgrade: $SYS" || { echo "::error::no sysupgrade image"; FAIL=1; }
+          [ -n "$INI" ] && echo "== initramfs : $INI" || echo "::warning::no initramfs image"
+          KVER=$(grep -m1 -oE "6\.[0-9]+\.[0-9]+" "$D"/version.buildinfo 2>/dev/null | head -1)
+          echo "== kernel in image = ${KVER:-unknown} (pin: ${{ inputs.kernel_pin }})"
+          if [ -n "$SYS" ]; then
+            SZ=$(stat -c %s "$SYS"); LIMIT=$((16000*1024))
+            echo "== size: $SZ / $LIMIT bytes (IMAGE_SIZE 16000k)"
+            [ "$SZ" -gt "$LIMIT" ] && { echo "::error::image exceeds the firmware partition"; FAIL=1; }
+            STR=/tmp/wa350-strings.txt
+            strings -a "$SYS" > "$STR" 2>/dev/null || tr -c '[:print:]' '\n' < "$SYS" > "$STR"
+            echo "   extracted $(wc -l < "$STR") printable lines"
+            chk() { if grep -qF -- "$1" "$STR"; then echo "   OK   '$1'"; else echo "   MISS '$1'"; FAIL=1; fi; }
+            chk "COMFAST CF-WA350"; chk "comfast,cf-wa350"
+            chk "linux,wdt-gpio";   chk "always-running"
+            chk "qca,qca8337";      chk "ethernet-ports"
+          fi
+          [ "$FAIL" -eq 0 ] || { echo "::error::verification FAILED"; exit 1; }
+          echo "== verification OK =="
+
+      - name: Build info
+        if: always()
+        run: |
+          set -uo pipefail
+          cd ow 2>/dev/null || exit 0
+          D=bin/targets/ath79/generic
+          mkdir -p "$D"
+          {
+            echo "base_ref    = ${{ inputs.base_ref }}"
+            echo "base_sha    = $(git rev-parse HEAD 2>/dev/null)"
+            echo "kernel_pin  = ${{ inputs.kernel_pin }}"
+            echo "dts_ref     = ${{ inputs.dts_ref }}"
+            echo "margin_ms   = ${{ inputs.margin_ms }}"
+            echo "--- kernel-6.18 ---"; cat target/linux/generic/kernel-6.18 2>/dev/null || true
+            echo "--- version.buildinfo ---"; cat "$D"/version.buildinfo 2>/dev/null || true
+            echo "--- hw_margin_ms ---"; grep -o 'hw_margin_ms = <[0-9]*>' target/linux/ath79/dts/qca9563_comfast_cf-wa350.dts 2>/dev/null || true
+            echo "built_at    = $(date -u +%FT%TZ)"
+          } > "$D/BUILD-INFO.txt"
+          cat "$D/BUILD-INFO.txt"
+          (cd "$D" && sha256sum *.bin > sha256sums.ci 2>/dev/null) || true
+          exit 0
+
+      - name: Upload images
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wa350-pipeline-${{ inputs.base_ref }}-k${{ inputs.kernel_pin }}
+          path: |
+            ow/bin/targets/ath79/generic/openwrt-*comfast_cf-wa350*
+            ow/bin/targets/ath79/generic/sha256sums*
+            ow/bin/targets/ath79/generic/BUILD-INFO.txt
+            ow/bin/targets/ath79/generic/version.buildinfo
+            ow/.config
+          if-no-files-found: warn
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wa350-pipeline-${{ inputs.base_ref }}-k${{ inputs.kernel_pin }}-log
+          path: |
+            ow/logs/build.log
+            ow/logs/download*.log
+          if-no-files-found: ignore
