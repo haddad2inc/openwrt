@@ -1,0 +1,476 @@
+name: CF-WA350 bisect matrix
+
+# =============================================================================
+# Diagnostic build matrix — COMFAST CF-WA350 (QCA9563 + QCA8337, qca8k DSA)
+#
+# GROUND TRUTH (from the live boot log of the unit that WORKS, in production):
+#   Linux version 6.18.44 (mips-openwrt-linux-musl-gcc, OpenWrt GCC 13.4.0
+#   r36159-b4c5ac2908) — MIPS: machine is COMFAST CF-WA350
+#   switch0: Atheros AR8337 rev. 2 switch registered on mdio.0
+#   Atheros AR8216/AR8236/AR8316 mdio.0:00: probe ... failed with error -22  (harmless)
+#   qca8k mdio.0:10: configuring for fixed/sgmii link mode
+#   qca8k mdio.0:10: Link is Up - 1Gbps/Full
+#   qca8k mdio.0:10 wan: PHY [mdio.0:00] / lan: PHY [mdio.0:01] (Qualcomm Atheros 8337 internal PHY)
+#   ag71xx-legacy 19000000.eth eth0: mode: sgmii      (fixed-link; "legacy" = OpenWrt's own ag71xx)
+#   DSA: tree 0 setup
+#   => working image = DSA/qca8k, kernel 6.18.44, hw_margin_ms = 1000
+#
+# WHAT CHANGED AFTERWARDS (the two and only two variables that matter):
+#   * kernel 6.18.44 -> 6.18.52   (upstream bump ddbf9c8557, 2026-09-14;
+#                                  6.18.51 landed 2026-09-11 in 829a6e6fb2)
+#   * hw_margin_ms 1000 -> 500    (commit 00be69e9b9, 2026-09-13)
+#   ...plus every upstream commit between the 00be69e9b9 base and the
+#      949b9f785 base. In that window the only ath79 changes are other boards'
+#      DTS files (c657838ee, 65712b492, 9cbe6ea52) and
+#      CONFIG_IC17XX_PHY removal (820fbf4a9) — nothing that touches this board.
+#      So the prime suspect is the kernel bump itself.
+#
+# WHY THE PREVIOUS WORKFLOWS PRODUCED NOTHING USEFUL
+#   They checked out *upstream* (master / v24.10.8) and never injected the
+#   device files — PR #25040 is still OPEN, so no upstream ref contains
+#   qca9563_comfast_cf-wa350.dts. `make defconfig` therefore silently dropped
+#   CONFIG_TARGET_ath79_generic_DEVICE_comfast_cf-wa350, the target fell back
+#   to building *every* ath79 device, and the job died on its timeout.
+#   The "force kernel to 6.18.44" step was a no-op too: it edited
+#   include/kernel-version.mk, which contains no LINUX_VERSION:=<x.y.z> line.
+#   The kernel version of this tree lives in target/linux/generic/kernel-6.18.
+#
+# WHAT THIS WORKFLOW DOES
+#   * builds pinned SHAs of haddad2inc/openwrt (device files always present)
+#   * changes exactly ONE factor per matrix cell
+#   * pins the kernel the supported way (target/linux/generic/kernel-6.18)
+#   * accepts dispatch-time overrides so a kernel bisect needs no new commits
+#   * also builds initramfs (TFTP-testable without touching flash)
+#   * hard-fails when the device or kmod-dsa-qca8k is missing, and verifies
+#     DTB strings, image size and kmod vermagic before publishing artifacts
+# =============================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_override:
+        description: "Optional kernel pin applied to EVERY cell: 'VER|SHA256' (e.g. 6.18.48|5ebdadb10a4b5708fc6b1c457764a110bc49f8150cc3502c59b921ead8c6fc8c)"
+        required: false
+        default: ""
+      margin_override:
+        description: "Optional hw_margin_ms applied to EVERY cell (e.g. 1000). Empty = per-matrix value."
+        required: false
+        default: ""
+      dts_sed:
+        description: "Optional extra sed -E expression applied to the board DTS (e.g. s/^/x/ or /qca,sgmii-enable-pll/d)"
+        required: false
+        default: ""
+      skip_variants:
+        description: "Comma-separated variants to SKIP (e.g. m5,m6)"
+        required: false
+        default: ""
+      extra_config:
+        description: "Extra .config lines (one per line)"
+        required: false
+        default: |
+          CONFIG_PACKAGE_luci=y
+          CONFIG_PACKAGE_luci-theme-bootstrap=y
+
+concurrency:
+  group: wa350-bisect-${{ github.run_id }}
+  cancel-in-progress: false
+
+env:
+  SRC_REPO: https://github.com/haddad2inc/openwrt.git
+  UPSTREAM: https://github.com/openwrt/openwrt.git
+
+jobs:
+  build:
+    name: ${{ matrix.variant }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 420
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        include:
+          # -------------------------------------------------------------------
+          # M1  PR head exactly as-is (kernel 6.18.52, margin 500)
+          #     = the image reported as NOT booting. Baseline for comparison.
+          # -------------------------------------------------------------------
+          - variant: m1-head-k6.18.52-m500
+            src_repo: fork
+            src_ref: 949b9f785c85b32c8daa3acfb9ccd01ce221cae1
+            overlay_ref: ""
+            kernel_file: ""
+            kernel_ver: ""
+            margin_ms: ""
+            expect_dsa: "1"
+            note: "current PR head - reported broken"
+
+          # -------------------------------------------------------------------
+          # M2  Sep-13 head as-is: DSA, kernel 6.18.44, margin 1000
+          #     = the era you confirm as working, taken straight from git.
+          # -------------------------------------------------------------------
+          - variant: m2-sep13-k6.18.44-m1000
+            src_repo: fork
+            src_ref: 3c80ef2c5bc5f1afc8698ae3e52cbcda4321d8bd
+            overlay_ref: ""
+            kernel_file: ""
+            kernel_ver: ""
+            margin_ms: ""
+            expect_dsa: "1"
+            note: "Sep-13 head (known-good era): 6.18.44 + margin 1000"
+
+          # -------------------------------------------------------------------
+          # M3  Sep-13 head as-is but margin forced to 500.
+          #     You already tested 00be69e9b9 and it BOOTED -> this cell should
+          #     boot too, which proves margin 500 is NOT the culprit.
+          # -------------------------------------------------------------------
+          - variant: m3-sep13-k6.18.44-m500
+            src_repo: fork
+            src_ref: 00be69e9b96731d9898419754f236cc248002524
+            overlay_ref: ""
+            kernel_file: ""
+            kernel_ver: ""
+            margin_ms: ""
+            expect_dsa: "1"
+            note: "Sep-13 late head: 6.18.44 + margin 500 (you reported this boots)"
+
+          # -------------------------------------------------------------------
+          # M4  PR head + kernel pinned back to 6.18.44  *** DECISIVE ***
+          #     boots  -> kernel regression 6.18.44 -> 6.18.52
+          #     loops  -> regression is in the tree/DTS delta Sep 13 -> Sep 17
+          # -------------------------------------------------------------------
+          - variant: m4-head-kpin-6.18.44-m500
+            src_repo: fork
+            src_ref: 949b9f785c85b32c8daa3acfb9ccd01ce221cae1
+            overlay_ref: ""
+            kernel_file: target/linux/generic/kernel-6.18
+            kernel_ver: "LINUX_VERSION-6.18 = .44
+LINUX_KERNEL_HASH-6.18.44 = 0f72d938f06828e82c90405174fe572287db7bfe089e2fc46572a99a7f240d43"
+            margin_ms: ""
+            expect_dsa: "1"
+            note: "PR head with kernel forced back to 6.18.44 (decisive test)"
+
+          # -------------------------------------------------------------------
+          # M5  PR head + margin forced back to 1000 (kernel stays 6.18.52)
+          #     boots -> the tight margin is the culprit on the new kernel
+          # -------------------------------------------------------------------
+          - variant: m5-head-k6.18.52-m1000
+            src_repo: fork
+            src_ref: 949b9f785c85b32c8daa3acfb9ccd01ce221cae1
+            overlay_ref: ""
+            kernel_file: ""
+            kernel_ver: ""
+            margin_ms: "1000"
+            expect_dsa: "1"
+            note: "PR head, kernel 6.18.52, margin restored to 1000"
+
+          # -------------------------------------------------------------------
+          # M6  Sep-13 head + kernel pinned FORWARD to 6.18.52
+          #     loops -> confirms the kernel is the regression, independently
+          #              of the DTS delta (cross-check of M4)
+          # -------------------------------------------------------------------
+          - variant: m6-sep13-kpin-6.18.52-m1000
+            src_repo: fork
+            src_ref: 3c80ef2c5bc5f1afc8698ae3e52cbcda4321d8bd
+            overlay_ref: ""
+            kernel_file: target/linux/generic/kernel-6.18
+            kernel_ver: "LINUX_VERSION-6.18 = .52
+LINUX_KERNEL_HASH-6.18.52 = 2b69564f7d4fea0c859b1959ba33709ee6e9139bd100e30a853b57159a8221b8"
+            margin_ms: ""
+            expect_dsa: "1"
+            note: "known-good tree with kernel forced forward to 6.18.52"
+
+    steps:
+      - name: Skip check
+        if: contains(inputs.skip_variants, matrix.variant)
+        run: |
+          echo "::notice::variant ${{ matrix.variant }} skipped by request"
+          echo "SKIPPED=1" >> "$GITHUB_ENV"
+
+      - name: Checkout source tree (pinned ref)
+        if: env.SKIPPED != '1'
+        run: |
+          set -euo pipefail
+          REF="${{ matrix.src_ref }}"
+          if [ "${{ matrix.src_repo }}" = "upstream" ]; then URL="$UPSTREAM"; else URL="$SRC_REPO"; fi
+          echo "::group::Cloning $URL @ $REF"
+          rm -rf ow
+          git init -q ow
+          cd ow
+          git remote add origin "$URL"
+          git fetch -q --depth 1 origin "$REF"
+          git checkout -q FETCH_HEAD
+          echo "HEAD      = $(git rev-parse HEAD)"
+          echo "HEAD date = $(git log -1 --format=%cI)"
+          echo "subject   = $(git log -1 --format=%s)"
+          echo "kernel    = $(tr '\n' ' ' < target/linux/generic/kernel-6.18 2>/dev/null || echo n/a)"
+          echo "::endgroup::"
+
+      - name: Overlay device files from another ref (optional)
+        if: env.SKIPPED != '1' && matrix.overlay_ref != ''
+        run: |
+          set -euo pipefail
+          cd ow
+          git config user.name  "ci-wa350"
+          git config user.email "ci-wa350@users.noreply.github.com"
+          git remote add ovl "$SRC_REPO"
+          git fetch -q --depth 1 ovl "${{ matrix.overlay_ref }}"
+          for f in \
+            target/linux/ath79/dts/qca9563_comfast_cf-wa350.dts \
+            target/linux/ath79/image/generic.mk \
+            target/linux/ath79/generic/base-files/etc/board.d/01_leds \
+            target/linux/ath79/generic/base-files/etc/board.d/02_network \
+            package/utils/cfw-leds ; do
+            git checkout FETCH_HEAD -- "$f" && echo "   overlaid: $f" || echo "   !! could not overlay: $f"
+          done
+
+      - name: Pin kernel version (dispatch override wins)
+        if: env.SKIPPED != '1'
+        run: |
+          set -euo pipefail
+          cd ow
+          F=target/linux/generic/kernel-6.18
+          OV="${{ inputs.kernel_override }}"
+          if [ -n "$OV" ]; then
+            VER="${OV%%|*}"; HASH="${OV##*|}"
+            printf 'LINUX_VERSION-6.18 = .%s\nLINUX_KERNEL_HASH-6.18.%s = %s\n' "${VER#6.18.}" "$VER" "$HASH" > "$F"
+            echo "== kernel pinned by dispatch input =="
+          elif [ -n "${{ matrix.kernel_file }}" ]; then
+            printf '%s\n' '${{ matrix.kernel_ver }}' > "$F"
+            echo "== kernel pinned by matrix cell =="
+          else
+            echo "== kernel left as-is =="
+          fi
+          cat "$F"
+
+      - name: Force hw_margin_ms (dispatch override wins)
+        if: env.SKIPPED != '1'
+        run: |
+          set -euo pipefail
+          cd ow
+          DTS=target/linux/ath79/dts/qca9563_comfast_cf-wa350.dts
+          M="${{ inputs.margin_override }}"
+          [ -z "$M" ] && M="${{ matrix.margin_ms }}"
+          if [ -n "$M" ]; then
+            sed -i -E "s/hw_margin_ms = <[0-9]+>;/hw_margin_ms = <$M>;/" "$DTS"
+            echo "== hw_margin_ms forced to $M =="
+          fi
+          if [ -n "${{ inputs.dts_sed }}" ]; then
+            sed -i -E "${{ inputs.dts_sed }}" "$DTS"
+            echo "== extra dts_sed applied: ${{ inputs.dts_sed }} =="
+          fi
+          grep -n -E "hw_margin_ms|always-running|linux,wdt-gpio|qca8337|sgmii" "$DTS" || true
+
+      - name: Print exactly what will be built
+        if: env.SKIPPED != '1'
+        run: |
+          cd ow
+          echo "===== device recipe ====="
+          grep -n -A9 "define Device/comfast_cf-wa350" target/linux/ath79/image/generic.mk || echo "!! DEVICE RECIPE MISSING"
+          echo "===== DTS: watchdog ====="
+          sed -n '/watchdog {/,/};/p' target/linux/ath79/dts/qca9563_comfast_cf-wa350.dts || true
+          echo "===== DTS: switch ====="
+          sed -n '/ethernet-switch@10/,+16p' target/linux/ath79/dts/qca9563_comfast_cf-wa350.dts || \
+            sed -n '/ar8327-initvals/,+6p' target/linux/ath79/dts/qca9563_comfast_cf-wa350.dts || true
+          echo "===== board.d ====="
+          grep -n "cf-wa350" target/linux/ath79/generic/base-files/etc/board.d/01_leds \
+                             target/linux/ath79/generic/base-files/etc/board.d/02_network || echo "!! board.d entries missing"
+          echo "===== ath79 kernel config: OF_MDIO/PHYLIB/GPIO_WATCHDOG are BUILT IN ====="
+          grep -nE "OF_MDIO|MDIO_BUS|FWNODE_MDIO|MDIO_DEVRES|PHYLIB|AR8216_PHY|NET_SELFTESTS" target/linux/ath79/config-6.* 2>/dev/null | head -20
+          grep -nE "GPIO_WATCHDOG" target/linux/ath79/generic/config-default 2>/dev/null | head
+
+      - name: Install build dependencies
+        if: env.SKIPPED != '1'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang flex bison g++ gawk \
+            gcc-multilib g++-multilib gettext git libncurses-dev libssl-dev \
+            python3-setuptools python3-dev python3-pyelftools rsync unzip \
+            zlib1g-dev file wget swig time ccache qemu-utils
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
+
+      - name: Update and install feeds
+        if: env.SKIPPED != '1'
+        run: |
+          set -euo pipefail
+          cd ow
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Seed .config (single device) and defconfig
+        if: env.SKIPPED != '1'
+        env:
+          EXTRA: ${{ inputs.extra_config }}
+        run: |
+          set -euo pipefail
+          cd ow
+          {
+            echo "CONFIG_TARGET_ath79=y"
+            echo "CONFIG_TARGET_ath79_generic=y"
+            echo "CONFIG_TARGET_ath79_generic_DEVICE_comfast_cf-wa350=y"
+            echo "# CONFIG_TARGET_MULTI_PROFILE is not set"
+            echo "# CONFIG_TARGET_PER_DEVICE_ROOTFS is not set"
+            echo "CONFIG_TARGET_ROOTFS_SQUASHFS=y"
+            echo "CONFIG_TARGET_ROOTFS_INITRAMFS=y"
+            echo "# CONFIG_COLLECT_KERNEL_DEBUG is not set"
+            echo "CONFIG_DEVEL=y"
+            echo "CONFIG_CCACHE=y"
+            printf '%s\n' "$EXTRA"
+          } > .config
+          make defconfig
+
+      - name: HARD GATE - device and DSA driver must be in the image
+        if: env.SKIPPED != '1'
+        run: |
+          cd ow
+          echo "== resolved .config (relevant lines) =="
+          grep -E "^CONFIG_TARGET_(ath79|PROFILE)|DEVICE_comfast_cf-wa350|^CONFIG_PACKAGE_(kmod-dsa|kmod-phy-qca83xx|cfw-leds|swconfig|kmod-ath10k-ct)|ROOTFS_INITRAMFS|^CONFIG_LINUX_6" .config || true
+          if ! grep -q "^CONFIG_TARGET_ath79_generic_DEVICE_comfast_cf-wa350=y" .config; then
+            echo "::error::device symbol DROPPED by defconfig -> the device files are missing from this tree"
+            echo "== generic.mk =="; grep -n "cf-wa350" target/linux/ath79/image/generic.mk || echo "(no match)"
+            echo "== dts dir ==";    ls target/linux/ath79/dts | grep -i wa350 || echo "(no DTS)"
+            echo "== board.d ==";    grep -rn "cf-wa350" target/linux/ath79/generic/base-files/etc/board.d/ || echo "(no board.d)"
+            exit 1
+          fi
+          if ! grep -q "^CONFIG_PACKAGE_kmod-dsa-qca8k=y" .config; then
+            echo "::error::kmod-dsa-qca8k is not selected - DSA cannot work on this board"
+            exit 1
+          fi
+          echo "== must be ABSENT (built into the ath79 kernel, or replaced by DSA) =="
+          grep -E "^CONFIG_PACKAGE_(swconfig|kmod-of-mdio)=" .config || echo "   OK - swconfig / kmod-of-mdio absent"
+
+      - name: Download sources
+        if: env.SKIPPED != '1'
+        run: |
+          cd ow
+          make -j"$(nproc)" download V=s || make download V=s
+
+      - name: Build images
+        if: env.SKIPPED != '1'
+        run: |
+          cd ow
+          mkdir -p logs
+          set +e
+          make -j"$(nproc)" V=s > logs/build.log 2>&1
+          RC=$?
+          set -e
+          echo "== build exit code: $RC =="
+          tail -n 60 logs/build.log
+          if [ "$RC" -ne 0 ]; then
+            echo "==== BUILD FAILED - last 250 lines ===="
+            tail -n 250 logs/build.log
+            exit "$RC"
+          fi
+
+      - name: Verify the produced image really contains this board
+        if: env.SKIPPED != '1'
+        env:
+          EXPECT_DSA: ${{ matrix.expect_dsa }}
+        run: |
+          cd ow
+          D=bin/targets/ath79/generic
+          FAIL=0
+          echo "== artifacts =="
+          ls -l "$D" | sed 's/^/   /'
+          SYS=$(ls "$D"/openwrt-*comfast_cf-wa350*squashfs-sysupgrade.bin 2>/dev/null | head -1 || true)
+          INI=$(ls "$D"/openwrt-*comfast_cf-wa350*initramfs-kernel.bin  2>/dev/null | head -1 || true)
+          [ -z "$SYS" ] && { echo "::error::no sysupgrade image for comfast_cf-wa350"; FAIL=1; }
+          [ -z "$INI" ] && { echo "::error::no initramfs image (CONFIG_TARGET_ROOTFS_INITRAMFS=y missing?)"; FAIL=1; }
+
+          KVER=$(grep -m1 -oE "6\.[0-9]+\.[0-9]+" "$D"/version.buildinfo 2>/dev/null || true)
+          [ -z "$KVER" ] && KVER=$(grep -m1 -oE "Linux version [0-9.]+" logs/build.log | awk '{print $3}')
+          echo "kernel in image = ${KVER:-unknown}"
+
+          if [ -n "$SYS" ]; then
+            SZ=$(stat -c %s "$SYS"); LIMIT=$((16000*1024))
+            echo "== size: sysupgrade $SZ bytes / partition $LIMIT bytes (IMAGE_SIZE 16000k)"
+            [ "$SZ" -gt "$LIMIT" ] && { echo "::error::image bigger than the firmware partition"; FAIL=1; }
+            echo "== strings the kernel+DTB must contain =="
+            for s in "COMFAST CF-WA350" "comfast,cf-wa350" "linux,wdt-gpio" "always-running"; do
+              if strings -a "$SYS" | grep -qF -- "$s"; then echo "   OK   '$s'"; else echo "   MISS '$s'"; FAIL=1; fi
+            done
+            if [ "$EXPECT_DSA" = "1" ]; then
+              for s in "qca,qca8337" "ethernet-ports"; do
+                if strings -a "$SYS" | grep -qF -- "$s"; then echo "   OK   '$s'"; else echo "   MISS '$s' -> DSA switch node absent"; FAIL=1; fi
+              done
+            fi
+          fi
+
+          echo "== kmod vermagic vs built kernel =="
+          QK=$(find build_dir -name "qca8k.ko" 2>/dev/null | head -1 || true)
+          if [ -n "$QK" ]; then
+            VM=$(modinfo -F vermagic "$QK" 2>/dev/null || true)
+            echo "   qca8k vermagic = $VM"
+            if [ -n "$KVER" ] && [ -n "$VM" ] && ! echo "$VM" | grep -q "$KVER"; then
+              echo "::error::vermagic mismatch -> modules would NOT load (no DSA, dead network)"; FAIL=1
+            fi
+          else
+            echo "   (qca8k.ko not found - skipped)"
+          fi
+
+          if [ "$FAIL" -ne 0 ]; then echo "::error::image verification FAILED - do NOT flash this artifact"; exit 1; fi
+          echo "image verification OK"
+
+      - name: Build info
+        if: env.SKIPPED != '1'
+        run: |
+          cd ow
+          D=bin/targets/ath79/generic
+          {
+            echo "variant         = ${{ matrix.variant }}"
+            echo "note            = ${{ matrix.note }}"
+            echo "src_ref         = ${{ matrix.src_ref }}"
+            echo "overlay_ref     = ${{ matrix.overlay_ref }}"
+            echo "head_sha        = $(git rev-parse HEAD)"
+            echo "kernel_override = ${{ inputs.kernel_override }}"
+            echo "margin_override = ${{ inputs.margin_override }}"
+            echo "dts_sed         = ${{ inputs.dts_sed }}"
+            echo "hw_margin_ms    = ${{ matrix.margin_ms }}"
+            echo "expect_dsa      = ${{ matrix.expect_dsa }}"
+            echo "--- version.buildinfo ---"; cat "$D"/version.buildinfo 2>/dev/null || true
+            echo "built_at        = $(date -u +%FT%TZ)"
+            echo "run_url         = ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          } > "$D/BUILD-INFO.txt"
+          cat "$D/BUILD-INFO.txt"
+          (cd "$D" && sha256sum *.bin > sha256sums.ci 2>/dev/null || true)
+          cat "$D/sha256sums.ci" 2>/dev/null || true
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "## ${{ matrix.variant }}"
+            echo ""
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| note | ${{ matrix.note }} |"
+            echo "| src_ref | \`${{ matrix.src_ref }}\` |"
+            echo "| overlay_ref | \`${{ matrix.overlay_ref }}\` |"
+            echo "| kernel pin | \`${{ matrix.kernel_file }}\` |"
+            echo "| kernel override | \`${{ inputs.kernel_override }}\` |"
+            echo "| hw_margin_ms | \`${{ matrix.margin_ms }}\` |"
+            echo "| margin override | \`${{ inputs.margin_override }}\` |"
+            echo ""
+            echo "Artifacts: **cf-wa350-${{ matrix.variant }}** (images + .config) and **cf-wa350-${{ matrix.variant }}-log**."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload images
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cf-wa350-${{ matrix.variant }}
+          path: |
+            ow/bin/targets/ath79/generic/openwrt-*comfast_cf-wa350*
+            ow/bin/targets/ath79/generic/sha256sums*
+            ow/bin/targets/ath79/generic/BUILD-INFO.txt
+            ow/bin/targets/ath79/generic/config.buildinfo
+            ow/.config
+          if-no-files-found: warn
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cf-wa350-${{ matrix.variant }}-log
+          path: ow/logs/build.log
+          if-no-files-found: ignore
