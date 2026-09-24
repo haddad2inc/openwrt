@@ -1,0 +1,232 @@
+#!/bin/sh
+#===============================================================================
+# setup-wa350-production.sh (v2) — COMFAST CF-WA350 production defaults, DSA
+#-------------------------------------------------------------------------------
+# v2 change: the network configuration is no longer patched surgically
+# (anonymous board.d device sections are fragile to script against and a
+# failed lookup could create two conflicting br-lan definitions).
+# Instead, /etc/config/network is rebuilt from scratch as a fully named,
+# deterministic, idempotent configuration, with the vendor MAC scheme
+# re-pinned explicitly (lan = art 0x0, wan = art 0x0 + 1).
+#
+# DSA builds only — the guard below aborts on anything else.
+# Run once after first boot, then reboot.
+#===============================================================================
+
+. /lib/functions/system.sh
+# --- Guard: this script is for the DSA build only -----------------------------
+if [ ! -e /sys/class/net/lan ] || [ ! -e /sys/class/net/wan ]; then
+    echo "ERROR: DSA port netdevs 'lan'/'wan' not found." >&2
+    echo "ERROR: This script must only run on the DSA build of the CF-WA350." >&2
+    exit 1
+fi
+
+# --- Vendor MAC scheme (same as board.d) ---------------------------------------
+LAN_MAC=$(mtd_get_mac_binary art 0x0)
+WAN_MAC=$(macaddr_add "$LAN_MAC" 1)
+if [ -z "$LAN_MAC" ] || [ -z "$WAN_MAC" ]; then
+    echo "ERROR: could not read MAC address from art partition." >&2
+    exit 1
+fi
+
+NEW_ULA=$(printf "fd%02x:%04x:%04x::/48" $((RANDOM%256)) $((RANDOM%65536)) $((RANDOM%65536)))
+
+uci del dhcp.wan
+uci del dhcp.lan.ra
+uci del dhcp.lan.ra_slaac
+uci del dhcp.lan.ra_flags
+uci set dhcp.lan.ignore='1'
+uci del network.lan.ip6assign
+uci del dhcp.lan.dhcpv6
+uci del dhcp.odhcpd
+
+# dnsmasq: DNS forwarder only (the upstream gateway does not serve DNS here)
+uci set dhcp.@dnsmasq[0].noresolv='1'
+uci -q delete dhcp.@dnsmasq[0].server
+uci add_list dhcp.@dnsmasq[0].server='8.8.8.8'
+uci add_list dhcp.@dnsmasq[0].server='1.1.1.1'
+
+#uci -q delete system.@button[0]
+uci commit system
+uci commit dhcp
+
+exec >/tmp/setup.log 2>&1
+
+for i in firewall mwan3 odhcpd; do
+  if /etc/init.d/"$i" enabled; then
+    /etc/init.d/"$i" disable
+    /etc/init.d/"$i" stop
+  fi
+done
+
+service odhcpd disable
+service log disable
+service firewall disable
+
+uci delete network.wan
+uci delete network.wan6
+uci delete network.lan
+uci delete network.br-lan
+uci delete network.br-wan
+uci delete network.switch0
+uci delete network.switch_vlan
+# حذف أي أقسام switch_vlan أخرى إن وجدت
+for i in $(uci show network | grep switch_vlan | cut -d'.' -f2 | cut -d'=' -f1); do
+  uci delete network.$i
+done
+# Remove all existing switch_vlan sections to prevent duplication/errors
+while uci -q delete network.@switch_vlan[0]; do :; done
+while uci -q delete network.@device[0]; do :; done
+
+# --- 1.  Network Configuration  ---
+
+# Port netdevs with the vendor MAC scheme (lan = art 0x0, wan = art 0x0 + 1)
+uci set network.lan_dev='device'
+uci set network.lan_dev.name='lan'
+uci set network.lan_dev.macaddr="$LAN_MAC"
+
+uci set network.wan_dev='device'
+uci set network.wan_dev.name='wan'
+uci set network.wan_dev.macaddr="$WAN_MAC"
+
+# Create bridge br-lan with device eth0.1
+uci set network.lan_br='device'
+uci set network.lan_br.name='br-lan'
+uci set network.lan_br.type='bridge'
+uci add_list network.lan_br.ports='lan'
+uci add_list network.lan_br.ports='wan'
+uci set network.lan_br.vlan_filtering='0'
+
+if ! uci -q get network.globals > /dev/null; then
+    uci set network.globals='globals'
+fi
+uci set network.globals.ula_prefix="$NEW_ULA"
+uci set network.globals.packet_steering='1'
+
+# Configure LAN Interface
+uci set network.lan='interface'
+uci set network.lan.device='br-lan'
+uci set network.lan.proto='static'
+uci set network.lan.ipaddr='192.168.100.22'
+uci set network.lan.netmask='255.255.255.0'
+uci set network.lan.gateway='192.168.100.1'
+uci set network.lan.delegate='0'
+
+# Configure WAN Interface
+uci set network.wan='interface'
+uci set network.wan.proto='none'
+uci set network.wan.device='wan'
+
+# --- 2. DHCP & Services Configuration ---
+uci set dhcp.lan.ignore='1'
+uci -q del dhcp.wan
+uci -q del dhcp.lan.ra
+uci -q del dhcp.lan.ra_slaac
+uci -q del dhcp.lan.ra_flags
+uci -q del dhcp.odhcpd
+uci commit network
+ /etc/init.d/log start
+
+# --- 3. Wireless Configuration ---
+# Remove existing wireless interfaces safely
+for j in $(seq 0 4); do uci -q delete wireless.@wifi-iface[0]; done
+
+# Radio ordering differs among models
+case $(uci get wireless.radio0.band) in
+  ('5g') uci rename wireless.radio0='5G';;
+  '2g') uci rename wireless.radio0='2G';;
+esac
+case $(uci get wireless.radio1.band) in
+  '5g') uci rename wireless.radio1='5G';;
+  '2g') uci rename wireless.radio1='2G';;
+esac
+
+# Configure Radio 0 (Mesh & STA)
+uci del wireless.5G.disabled 2>/dev/null
+uci set wireless.5G.beacon_int='200'
+uci set wireless.5G.country='US'
+uci set wireless.5G.htmode='HT20'
+uci set wireless.5G.channel='157'
+uci set wireless.5G.txpower='28'
+uci set wireless.5G.cell_density='0'
+
+# Configure 5G (AP)
+uci set wireless.wifinet0=wifi-iface
+uci set wireless.wifinet0.device='5G'
+uci set wireless.wifinet0.mode='ap'
+uci set wireless.wifinet0.encryption='none'
+uci set wireless.wifinet0.ssid='COMFAST-WA350 - 5G'
+uci set wireless.wifinet0.disassoc_low_ack='0'
+uci set wireless.wifinet0.network='lan'
+uci set wireless.wifinet0.isolate='1'
+uci set wireless.wifinet0.wds='1'
+
+# Configure 2G (AP)
+uci del wireless.2G.disabled 2>/dev/null
+uci set wireless.2G.beacon_int='200'
+uci set wireless.2G.noscan='1'
+uci set wireless.2G.country='US'
+uci set wireless.2G.htmode='HT20'
+uci set wireless.2G.channel='1'
+uci set wireless.2G.cell_density='0'
+uci set wireless.2G.txpower='27'
+
+# Wifinet1: AP (WPA3 SAE)
+uci set wireless.wifinet1=wifi-iface
+uci set wireless.wifinet1.device='2G'
+uci set wireless.wifinet1.mode='ap'
+uci set wireless.wifinet1.ssid='COMFAST-WA350'
+uci set wireless.wifinet1.encryption='none'
+uci set wireless.wifinet1.disassoc_low_ack='0'
+uci set wireless.wifinet1.network='lan'
+uci set wireless.wifinet1.isolate='1'
+uci set wireless.wifinet1.wds='1'
+
+# --- 4. System & Hostname Configuration ---
+uci set system.@system[0].hostname='COMFAST-WA350'
+uci set system.@system[0].notes='Haddad Inc - Developed by Eng. Salah'
+uci set system.@system[0].zonename='Asia/Aden'
+uci set system.@system[0].timezone='<+03>-3'
+uci set system.@system[0].log_proto='udp'
+uci set system.@system[0].conloglevel='8'
+uci set system.@system.cronloglevel='5' 2>/dev/null || uci set system.@system[0].cronloglevel='5'
+
+uci -q del system.ntp.enabled
+uci -q del system.ntp.enable_server
+
+# --- 5. Firewall & Security Configuration ---
+if [ -f /etc/config/firewall ]; then
+    mv /etc/config/firewall /etc/config/firewall.unused
+fi
+echo "Removing root password..."
+passwd -d root
+# Secure Dropbear SSH
+uci set dropbear.@dropbear[0].PasswordAuth='1'
+uci set dropbear.@dropbear[0].RootPasswordAuth='1'
+
+# --- 6. Customization & Branding ---
+if [ -f /www/luci-static/resources/view/status/include/10_system.js ]; then
+    sed -i "s/boardinfo\.model/\'COMFAST\ CF\ WA350\ -\ Devloped-by\ HADDAD-INC\'/g" /www/luci-static/resources/view/status/include/10_system.js
+fi
+#if [ -f /www/luci-static/resources/view/status/include/10_system.js ]; then
+ #   sed -i "s/_('Firmware Version'),.*/_('Firmware Version'), 'Haddad-Inc / ' + (L.isObject(boardinfo.release) ? boardinfo.release.description + ' \/ ' : '') + (luciversion || ''),/g" /www/luci-static/resources/view/status/include/10_system.js
+#fi
+# تعديل ملف إصدار النظام ليظهر بالشكل المخصص في الشبكة والمايكروتك
+if [ -f /etc/openwrt_release ]; then
+    sed -i "s/DISTRIB_DESCRIPTION=.*/DISTRIB_DESCRIPTION='Haddad-Inc @'/g" /etc/openwrt_release
+fi
+
+if [ -f /etc/os-release ]; then
+    sed -i "s/PRETTY_NAME=.*/PRETTY_NAME='Haddad-Inc @ '/g" /etc/os-release
+fi
+FOOTER="/usr/share/ucode/luci/template/themes/bootstrap/footer.ut"
+
+if [ -f "$FOOTER" ]; then
+    sed -i '/{% endif %}/a \                <span style="margin-left:8px;color:var(--primary);"> ✦ <a href="https:\/\/www.facebook.com\/eng.salah.alhaddad\/" target="_blank" rel="noreferrer" style="color:var(--primary);text-decoration:none;font-weight:bold;">Modified by Eng Salah / Haddad-Inc</a></span>' "$FOOTER"
+fi
+# Commit all changes
+uci commit
+
+echo "All done! Enan Net Switch, Bridge & IP Settings Applied for OpenWrt ."
+
+exit 0
