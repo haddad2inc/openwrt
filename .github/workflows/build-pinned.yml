@@ -246,6 +246,50 @@ jobs:
         run: |
           make V=s -j1 2>&1 | tee logs/31-build-verbose.log | tail -400 || true
 
+      - name: Verify the ar8216 guard reached the compiled kernel
+        if: ${{ always() }}
+        run: |
+          {
+            echo "## ar8216 guard (patch 731) verification"
+            echo
+            DTSF="target/linux/ath79/dts/qca9563_comfast_cf-wa350.dts"
+            if [ -f "$DTSF" ] && grep -q 'phy-mode = "internal"' "$DTSF"; then
+              REQ="**REQUIRED** - this DTS uses the switch's internal MDIO bus"
+            elif [ -f "$DTSF" ] && grep -q 'phy-handle' "$DTSF"; then
+              REQ="optional - this DTS declares the port PHYs on the external MDIO bus"
+            else
+              REQ="optional - legacy mapping (no phy-handle, no mdio child)"
+            fi
+            echo "- guard is: $REQ"
+            KD="$(ls -d build_dir/target-*/linux-ath79_generic 2>/dev/null | head -1)"
+            SRC="$(ls -d ${KD:-/nonexistent}/linux-* 2>/dev/null | head -1)"
+            echo "- kernel build dir: ${KD:-NOT FOUND}"
+            echo "- kernel source dir: ${SRC:-NOT FOUND}"
+            if [ -n "${SRC:-}" ] && [ -f "$SRC/drivers/net/phy/ar8216.c" ]; then
+              if grep -q "Never claim a PHY" "$SRC/drivers/net/phy/ar8216.c"; then
+                echo "- **RESULT: PASS** - the guard IS in the kernel source that was compiled"
+                echo
+                echo '```c'
+                grep -n -B2 -A14 "Never claim a PHY" "$SRC/drivers/net/phy/ar8216.c" | head -24
+                echo '```'
+              else
+                echo "- **RESULT: NOT PRESENT** - patch 731 was not applied to this kernel"
+              fi
+            else
+              echo "- RESULT: UNKNOWN - kernel source not found (build failed early?)"
+            fi
+            echo
+            echo "### ar8216 patches present in the tree"
+            echo '```'
+            ls -1 target/linux/ath79/patches-*/ 2>/dev/null | grep -i ar8216 || echo "(none)"
+            echo '```'
+            echo
+            echo "### CONFIG_AR8216_PHY in the built kernel .config"
+            echo '```'
+            grep -H "CONFIG_AR8216_PHY\|CONFIG_SWCONFIG" "${SRC:-/nonexistent}/.config" 2>/dev/null || echo "(kernel .config not found)"
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY" logs/22-ar8216-guard.txt
+
       - name: Collect artifacts (images, kernel, dtb, injected files, logs)
         if: ${{ always() }}
         run: |
@@ -284,10 +328,8 @@ jobs:
           cp -v target/linux/ath79/patches-*/*ar8216*.patch                      out/injected/ 2>/dev/null || true
           cp -v .config                                                          out/injected/dot-config 2>/dev/null || true
           [ -e patch_openwrt.py ] && cp -v patch_openwrt.py out/injected/ || true
-          [ -e apply_patches.py ] && cp -v apply_patches.py out/injected/ || true
           [ -d dts ]      && cp -rv dts      out/injected/dts-src      || true
           [ -d patches ]  && cp -rv patches  out/injected/patches-src  || true
-          [ -d files ]    && cp -rv files    out/injected/files-src    || true
           [ -d package/utils/cfw-leds ] && cp -rv package/utils/cfw-leds out/injected/cfw-leds || true
 
           cp -v logs/* out/logs/ 2>/dev/null || true

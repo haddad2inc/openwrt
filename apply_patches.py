@@ -1,74 +1,247 @@
 #!/usr/bin/env python3
-"""Patch OpenWrt source tree to add support for COMFAST CF-WA350."""
+"""Patch an OpenWrt source tree to add support for the COMFAST CF-WA350.
 
+Everything device specific lives OUTSIDE the OpenWrt tree, next to this
+script, so it can be edited without touching the repository:
+
+    patch_openwrt.py
+    dts/qca9563_comfast_cf-wa350.dts      -> target/linux/ath79/dts/
+    patches/*.patch                       -> target/linux/ath79/patches-<ver>/
+    openwrt/                              the OpenWrt source tree (BASE)
+
+Kernel patches are installed into the patch directory that matches the
+kernel this tree will actually build:
+
+    1. CONFIG_LINUX_<X>_<Y>=y in <BASE>/.config          (what you selected)
+    2. KERNEL_PATCHVER / KERNEL_TESTING_PATCHVER in target/linux/ath79/Makefile
+    3. every existing target/linux/ath79/patches-*/ directory
+
+The directory is created when it does not exist yet, the patch is renumbered
+so that it sorts AFTER the patch it depends on (the ar8216 atomic register
+access one), and every install is verified by replaying the real patch series
+against this tree's own ar8216.c in a scratch directory.
+"""
+
+import argparse
 import difflib
 import glob
 import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 
-BASE = "openwrt"
-
-NETWORK_FILE = (
-    f"{BASE}/target/linux/ath79/generic/base-files/etc/board.d/02_network"
-)
-LEDS_FILE = (
-    f"{BASE}/target/linux/ath79/generic/base-files/etc/board.d/01_leds"
-)
-GENERIC_MK = f"{BASE}/target/linux/ath79/image/generic.mk"
+# --------------------------------------------------------------------------
+# layout
+# --------------------------------------------------------------------------
+BASE = "openwrt"                     # overridden by --base
 DTS_SRC = "dts/qca9563_comfast_cf-wa350.dts"
-DTS_DST = f"{BASE}/target/linux/ath79/dts/qca9563_comfast_cf-wa350.dts"
+PATCH_SRC_DIR = "patches"
 
-# --- ar8216 kernel patch (731) -------------------------------------------
-ATH79_DIR = f"{BASE}/target/linux/ath79"
-AR8216_REL = "target/linux/generic/files/drivers/net/phy/ar8216.c"
-AR8216_FILE = f"{BASE}/{AR8216_REL}"
-KERNEL_REL = "drivers/net/phy/ar8216.c"
-PATCH_MARKER = "Never claim a PHY that lives on another switch"
-PATCH_BASENAME = "ar8216-skip-phys-on-switch-internal-mdio-bus"
-PATCH_SUBJECT = "ath79: ar8216: skip PHYs on another switch's internal MDIO bus"
-PATCH_MESSAGE = """CONFIG_AR8216_PHY is built into every ath79 kernel on the generic
-subtarget and its phy_driver matches the PHY IDs of the QCA83xx port PHYs
-(0x004d0000/0xffff0000 covers 0x004dd036), so it also probes the PHYs that
-qca8k exposes on the switch's internal MDIO bus once a board is converted
-to DSA.
+ATH79 = "target/linux/ath79"
+GENERIC = "target/linux/generic"
+AR8216_TREE_REL = "target/linux/generic/files/drivers/net/phy/ar8216.c"
+AR8216_KERNEL_REL = "drivers/net/phy/ar8216.c"
 
-That is fatal on ath79: 730-ar8216-make-reg-access-atomic.patch wraps every
-register access in local_irq_save()/local_irq_restore() and warns that it
-"breaks the driver on any mdio master with interrupts used". qca8k's MDIO
-master takes a mutex, may allocate and transmit skbs
-(qca8k_phy_eth_command) and busy-waits up to QCA8K_BUSY_WAIT_TIMEOUT
-(2000 ms) per transaction, while ar8xxx_read_id() retries up to
-AR8X16_PROBE_RETRIES times. On a single-core MIPS this locks the CPU up
-with interrupts disabled, the watchdog keepalive starves and the board
-resets in a loop before preinit.
+# marks OUR patch, so re-runs never duplicate it and a future upstream fix is
+# recognised even if the file name changes
+GUARD_MARKER = "Never claim a PHY that lives on another switch"
+# marks the patch we must be applied AFTER (ath79 atomic register access)
+ATOMIC_HINTS = ("local_irq_save", "make switch register access atomic")
+DEFAULT_NUMBER = 731
 
-Skip PHYs whose MDIO bus is parented by an mdio_device that is not bound
-to this driver: that is another switch's internal bus. SoC MDIO buses
-(ag71xx, mdio-gpio, mdio-bitbang) are parented by platform devices, and our
-own ar8xxx-mdio bus is exempted by comparing the parent's driver, so
-swconfig boards - including the built-in switches described by the
-"mdio-bus" child node in qca956x.dtsi, qca953x.dtsi, ar7240.dtsi and
-ar9330.dtsi - are unaffected."""
 
-TAB = "\t"
+def P(*parts):
+    return os.path.join(BASE, *parts)
 
-# Inserted right after '#include "ar8216.h"'
+
+def read(path):
+    with open(path, "r", errors="replace") as f:
+        return f.read()
+
+
+def write(path, text):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        f.write(text)
+
+
+# ==========================================================================
+# 1. which kernel version will this tree build?
+# ==========================================================================
+def detect_versions():
+    """Return [(version, why)] best first."""
+    found = []
+
+    cfg = P(".config")
+    if os.path.exists(cfg):
+        for line in read(cfg).splitlines():
+            m = re.match(r"CONFIG_LINUX_(\d+)_(\d+)=y\b", line.strip())
+            if m:
+                found.append((f"{m.group(1)}.{m.group(2)}", ".config"))
+
+    mk = P(ATH79, "Makefile")
+    if os.path.exists(mk):
+        text = read(mk)
+        for key in ("KERNEL_PATCHVER", "KERNEL_TESTING_PATCHVER"):
+            m = re.search(rf"^{key}\s*:?=\s*([0-9]+\.[0-9]+)", text, re.M)
+            if m:
+                found.append((m.group(1), f"ath79/Makefile {key}"))
+
+    for d in sorted(glob.glob(P(ATH79, "patches-*"))):
+        m = re.match(r"patches-([0-9]+\.[0-9]+)$", os.path.basename(d))
+        if m:
+            found.append((m.group(1), "existing patches dir"))
+
+    # de-duplicate, keep order
+    seen, out = set(), []
+    for v, why in found:
+        if v not in seen:
+            seen.add(v)
+            out.append((v, why))
+    return out
+
+
+def generic_patch_dirs(ver):
+    """Kernel patch dirs that OpenWrt applies BEFORE the target ones."""
+    dirs = []
+    for kind in ("backport", "pending", "hack"):
+        d = P(GENERIC, f"{kind}-{ver}")
+        if os.path.isdir(d):
+            dirs.append(d)
+    plain = P(GENERIC, "patches")
+    if os.path.isdir(plain):
+        dirs.append(plain)
+    return dirs
+
+
+# ==========================================================================
+# 2. numbering / idempotency helpers
+# ==========================================================================
+def patch_number(path):
+    m = re.match(r"(\d+)", os.path.basename(path))
+    return int(m.group(1)) if m else None
+
+
+def used_numbers(d):
+    nums = set()
+    for p in glob.glob(os.path.join(d, "*.patch")):
+        n = patch_number(p)
+        if n is not None:
+            nums.add(n)
+    return nums
+
+
+def atomic_patch_number(d):
+    """Number of the ath79 patch that makes ar8216 register access atomic.
+
+    Our own patch quotes that patch in its commit message, so anything that
+    already carries our guard marker must be ignored here - otherwise every
+    re-run would renumber the patch one higher.
+    """
+    best = None
+    for p in sorted(glob.glob(os.path.join(d, "*.patch"))):
+        name = os.path.basename(p)
+        if "ar8216" not in name and "ar8327" not in name:
+            continue
+        text = read(p)
+        if GUARD_MARKER in text:
+            continue                      # this is ours
+        # it must really ADD the irq save/restore, not just talk about it
+        adds = [l for l in text.splitlines()
+                if l.startswith("+") and "local_irq_save" in l]
+        if not adds and not any(h in text[:2000] for h in ATOMIC_HINTS):
+            continue
+        n = patch_number(p)
+        if n is not None:
+            best = n if best is None else max(best, n)
+    return best
+
+
+def find_installed_guard(d):
+    for p in sorted(glob.glob(os.path.join(d, "*.patch"))):
+        if GUARD_MARKER in read(p):
+            return p
+    return None
+
+
+def split_patch_name(name):
+    """'731-foo.patch' -> (731, 'foo.patch');  'foo.patch' -> (None, 'foo.patch')"""
+    m = re.match(r"(\d+)-(.+)$", name)
+    if m:
+        return int(m.group(1)), m.group(2)
+    return None, name
+
+
+# ==========================================================================
+# 3. verification: replay the real series in a scratch tree
+# ==========================================================================
+def _run_patch(tmp, patch_file, extra=()):
+    cmd = ["patch", "-p1", "--no-backup-if-mismatch", "-d", tmp,
+           "-i", os.path.abspath(patch_file)] + list(extra)
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def verify_patch(patch_file, d, ver):
+    """Replay the real patch series in a scratch tree, then apply ours."""
+    if shutil.which("patch") is None:
+        return None, "'patch' not installed - verification skipped"
+
+    ar8216 = P(AR8216_TREE_REL)
+    if not os.path.exists(ar8216):
+        return None, f"{AR8216_TREE_REL} not found - verification skipped"
+
+    mine = os.path.abspath(patch_file)
+    mine_num = patch_number(patch_file)
+
+    # OpenWrt applies the generic kernel patches before the target ones
+    series = []
+    for gd in generic_patch_dirs(ver):
+        series += sorted(glob.glob(os.path.join(gd, "*.patch")))
+    earlier = []
+    for p in sorted(glob.glob(os.path.join(d, "*.patch"))):
+        if os.path.abspath(p) == mine:
+            continue
+        n = patch_number(p)
+        if mine_num is not None and n is not None and n > mine_num:
+            continue          # applied after ours - irrelevant here
+        earlier.append(p)
+    series += earlier
+
+    tmp = tempfile.mkdtemp(prefix="wa350-verify-")
+    try:
+        dst = os.path.join(tmp, AR8216_KERNEL_REL)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copyfile(ar8216, dst)
+
+        applied = 0
+        for p in series:
+            if AR8216_KERNEL_REL not in read(p)[:6000]:
+                continue
+            r = _run_patch(tmp, p, ("-s", "-N"))
+            applied += 1 if r.returncode == 0 else 0
+
+        r = _run_patch(tmp, patch_file)
+        ok = r.returncode == 0 and GUARD_MARKER in read(dst)
+        detail = (r.stdout + r.stderr).strip() or f"clean (replayed {applied} earlier patch(es))"
+        return ok, detail
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ==========================================================================
+# 4. regenerating the diff from THIS tree (fallback when the file is stale)
+# ==========================================================================
 FWD_DECL = (
     "\n\n/* defined at the bottom of this file; used to recognise our own bus */\n"
     "static struct mdio_driver ar8xxx_mdio_driver;"
 )
-
-# Inserted after the "skip PHYs at unused adresses" filter
-GUARD_ANCHOR = (
-    "if (phydev->mdio.addr != 0 && phydev->mdio.addr != 3 && "
-    "phydev->mdio.addr != 4)"
-)
+GUARD_ANCHOR = ("if (phydev->mdio.addr != 0 && phydev->mdio.addr != 3 && "
+                "phydev->mdio.addr != 4)")
+TAB = "\t"
 GUARD = (
-    "\n"
-    + TAB + "/*\n"
+    TAB + "/*\n"
     + TAB + " * Never claim a PHY that lives on another switch driver's internal\n"
     + TAB + " * MDIO bus, such as the one qca8k registers for the QCA83xx port\n"
     + TAB + " * PHYs. The register accessors below disable interrupts around every\n"
@@ -91,9 +264,158 @@ GUARD = (
 )
 
 
-# ---------------------------------------------------------------------------
-# Regex that matches the previously-injected cf-wa350 LED block (anywhere)
-# ---------------------------------------------------------------------------
+def insert_guard(text):
+    if GUARD_MARKER in text:
+        return text
+    inc = '#include "ar8216.h"'
+    if inc not in text:
+        return None
+    text = text.replace(inc, inc + FWD_DECL, 1)
+    lines = text.split("\n")
+    idx = next((i for i, l in enumerate(lines) if GUARD_ANCHOR in l), None)
+    if idx is None:
+        return None
+    j = idx + 1
+    while j < len(lines) and not lines[j].strip():
+        j += 1
+    if j >= len(lines) or lines[j].strip() != "return -ENODEV;":
+        return None
+    return "\n".join(lines[:j + 1] + [""] + GUARD.rstrip("\n").split("\n")
+                     + lines[j + 1:])
+
+
+def build_patch_text(orig, new, header):
+    diff = difflib.unified_diff(orig.splitlines(), new.splitlines(),
+                                fromfile="a/" + AR8216_KERNEL_REL,
+                                tofile="b/" + AR8216_KERNEL_REL,
+                                n=3, lineterm="")
+    body = "\n".join(diff)
+    if not body:
+        return None
+    return header.rstrip("\n") + "\n---\n" + body + "\n"
+
+
+def split_header(text):
+    """Everything before the first '--- a/' line (the git-style message)."""
+    i = text.find("\n--- a/")
+    if i == -1:
+        i = text.find("\n---\n")
+    return text[:i] if i != -1 else ""
+
+
+# ==========================================================================
+# 5. install one external patch into one target directory
+# ==========================================================================
+def install_patch(src, d, ver, autofix=True):
+    name = os.path.basename(src)
+    want_num, rest = split_patch_name(name)
+    text = read(src)
+
+    if GUARD_MARKER not in text:
+        print(f"!!! {name}: does not contain the expected guard - installing as is")
+
+    # already present in this tree (ours or an upstream equivalent)?
+    existing = find_installed_guard(d)
+    if existing and os.path.basename(existing) != name:
+        print(f">>> {name}: an equivalent patch is already installed "
+              f"({os.path.basename(existing)}) - skipping")
+        return True
+    if GUARD_MARKER in read(P(AR8216_TREE_REL)) if os.path.exists(P(AR8216_TREE_REL)) else False:
+        print(f">>> {name}: ar8216.c in this tree already contains the guard - skipping")
+        return True
+
+    # pick the number: after the atomic-access patch, and not already taken
+    after = atomic_patch_number(d)
+    minimum = (after + 1) if after is not None else DEFAULT_NUMBER
+    num = want_num if (want_num is not None and want_num >= minimum) else minimum
+    used = used_numbers(d)
+    if existing:
+        used.discard(patch_number(existing))
+    while num in used:
+        num += 1
+    dst = os.path.join(d, f"{num}-{rest}")
+
+    # remove stale copies of ours under a different number
+    for old in glob.glob(os.path.join(d, f"*-{rest}")):
+        if os.path.abspath(old) != os.path.abspath(dst):
+            os.remove(old)
+            print(f">>> removed stale {os.path.basename(old)}")
+
+    write(dst, text)
+    note = "" if num == want_num else f" (renumbered {want_num} -> {num})"
+    print(f">>> installed {os.path.basename(dst)}{note}")
+
+    ok, detail = verify_patch(dst, d, ver)
+    if ok is None:
+        print(f"    verify: SKIP ({detail})")
+        return True
+    if ok:
+        print("    verify: PASS")
+        return True
+
+    print(f"    verify: FAIL - {detail.splitlines()[0] if detail else 'unknown'}")
+    if not autofix:
+        return False
+
+    # regenerate the diff against THIS tree, keeping the commit message
+    ar = P(AR8216_TREE_REL)
+    if not os.path.exists(ar):
+        return False
+    orig = read(ar)
+    new = insert_guard(orig)
+    if new is None:
+        print("    autofix: anchors not found in this tree's ar8216.c - giving up")
+        return False
+    regen = build_patch_text(orig, new, split_header(text))
+    if not regen:
+        print("    autofix: nothing to change - giving up")
+        return False
+    write(dst, regen)
+    write(src, regen)          # keep the editable copy in patches/ in sync
+    ok2, detail2 = verify_patch(dst, d, ver)
+    if ok2:
+        print(f"    autofix: regenerated the diff for this tree -> PASS "
+              f"(patches/{name} updated)")
+        return True
+    print(f"    autofix: still failing - {detail2}")
+    return False
+
+
+def install_patches(versions, only_version=None, all_versions=False, autofix=True):
+    if not os.path.isdir(PATCH_SRC_DIR):
+        print(f"!!! {PATCH_SRC_DIR}/ not found - no kernel patches to install")
+        return True
+    srcs = sorted(glob.glob(os.path.join(PATCH_SRC_DIR, "*.patch")))
+    if not srcs:
+        print(f"!!! no .patch files in {PATCH_SRC_DIR}/")
+        return True
+
+    if not versions:
+        print("!!! could not determine the kernel version of this tree")
+        return False
+
+    if only_version:
+        targets = [(only_version, "--kver")]
+    elif all_versions:
+        targets = versions
+    else:
+        targets = versions[:1]
+
+    ok = True
+    for ver, why in targets:
+        d = P(ATH79, f"patches-{ver}")
+        if not os.path.isdir(d):
+            os.makedirs(d, exist_ok=True)
+            print(f">>> created {d}")
+        print(f"--- kernel {ver} ({why}) -> {d}")
+        for s in srcs:
+            ok = install_patch(s, d, ver, autofix) and ok
+    return ok
+
+
+# ==========================================================================
+# 6. the device files (01_leds / 02_network / generic.mk / dts)
+# ==========================================================================
 LED_BLOCK_RE = re.compile(
     r'[\t ]*comfast,cf-wa350\)\n'
     r'(?:[\t ]*ucidef_set_led_[a-z]+ [^\n]*\n)+'
@@ -101,33 +423,19 @@ LED_BLOCK_RE = re.compile(
 )
 
 
-# ---------------------------------------------------------------------------
-# 01_leds — line-based anchor injection after telco,t1) case
-# ---------------------------------------------------------------------------
 def patch_leds():
-    if not os.path.exists(LEDS_FILE):
+    path = P(ATH79, "generic/base-files/etc/board.d/01_leds")
+    if not os.path.exists(path):
         print("!!! 01_leds not found")
         return
+    content = read(path)
 
-    with open(LEDS_FILE, "r") as f:
-        content = f.read()
-
-    # --- 1. Clean up any broken/previous cf-wa350 injection ---
     if LED_BLOCK_RE.search(content):
         content = LED_BLOCK_RE.sub('', content)
-        # Remove any accidental double blank lines left behind
         content = re.sub(r'\n\n\n+', '\n\n', content)
         print(">>> 01_leds: removed previous cf-wa350 block")
 
-    # --- 2. Locate anchor line: "telco,t1)" ---
     lines = content.split('\n')
-    anchor_idx = -1
-    for i, line in enumerate(lines):
-        if line.strip() == 'telco,t1)':
-            anchor_idx = i
-            break
-
-    # --- 3. Prepare the injection block ---
     injection = [
         '\tcomfast,cf-wa350)',
         '\t\tucidef_set_led_netdev "wan" "WAN" "red:wan" "wan"',
@@ -136,187 +444,118 @@ def patch_leds():
         '\t\t;;',
     ]
 
+    anchor_idx = next((i for i, l in enumerate(lines)
+                       if l.strip() == 'telco,t1)'), -1)
     if anchor_idx != -1:
-        # Find the ";;" that closes the telco case (first one after anchor)
-        end_idx = -1
-        for j in range(anchor_idx + 1, len(lines)):
-            if lines[j].strip() == ';;':
-                end_idx = j
-                break
-
+        end_idx = next((j for j in range(anchor_idx + 1, len(lines))
+                        if lines[j].strip() == ';;'), -1)
         if end_idx != -1:
             lines = lines[:end_idx + 1] + injection + lines[end_idx + 1:]
-            with open(LEDS_FILE, "w") as f:
-                f.write('\n'.join(lines))
+            write(path, '\n'.join(lines))
             print(">>> 01_leds patched (anchor: telco,t1)")
             return
-        else:
-            print("!!! No ';;' found after telco,t1), falling back to esac")
-
+        print("!!! no ';;' after telco,t1) - falling back to esac")
     else:
-        print("!!! 'telco,t1)' anchor not found, falling back to esac")
+        print("!!! 'telco,t1)' anchor not found - falling back to esac")
 
-    # --- Fallback: inject just before the last 'esac' ---
-    esac_idx = -1
-    for i in range(len(lines) - 1, -1, -1):
-        if lines[i].strip() == 'esac':
-            esac_idx = i
-            break
-
+    esac_idx = next((i for i in range(len(lines) - 1, -1, -1)
+                     if lines[i].strip() == 'esac'), -1)
     if esac_idx == -1:
-        print("!!! No 'esac' found either, aborting")
+        print("!!! no 'esac' found either, aborting")
         return
-
     lines = lines[:esac_idx] + injection + lines[esac_idx:]
-    with open(LEDS_FILE, "w") as f:
-        f.write('\n'.join(lines))
+    write(path, '\n'.join(lines))
     print(">>> 01_leds patched (esac fallback)")
 
 
-# ---------------------------------------------------------------------------
-# 02_network — interfaces:
-#   Line-based anchor injection after the "tplink,tl-wdr6500-v2)" case.
-# ---------------------------------------------------------------------------
 def patch_network():
-    if not os.path.exists(NETWORK_FILE):
+    path = P(ATH79, "generic/base-files/etc/board.d/02_network")
+    if not os.path.exists(path):
         print("!!! 02_network not found")
         return
+    content = read(path)
 
-    with open(NETWORK_FILE, "r") as f:
-        content = f.read()
-
-    iface_func_pos = content.find("ath79_setup_interfaces")
-    macs_func_pos = content.find("ath79_setup_macs")
-    if iface_func_pos == -1 or macs_func_pos == -1:
+    iface_pos = content.find("ath79_setup_interfaces")
+    macs_pos = content.find("ath79_setup_macs")
+    if iface_pos == -1 or macs_pos == -1:
         print("!!! ath79_setup_interfaces / ath79_setup_macs not found")
         return
 
-    iface_block = content[iface_func_pos:macs_func_pos]
-
-    if "comfast,cf-wa350)" in iface_block:
+    block = content[iface_pos:macs_pos]
+    if "comfast,cf-wa350)" in block:
         print(">>> 02_network interfaces already patched")
         return
 
-    # --- Prepare the injection block ---
     injection = [
         '\tcomfast,cf-wa350)',
         '\t\tucidef_set_interfaces_lan_wan "lan" "wan"',
         '\t\t;;',
     ]
-
-    lines = iface_block.split('\n')
-
-    # --- Locate the anchor line: "tplink,tl-wdr6500-v2)" ---
-    anchor_idx = -1
-    for i, line in enumerate(lines):
-        if line.strip() == 'tplink,tl-wdr6500-v2)':
-            anchor_idx = i
-            break
-
+    lines = block.split('\n')
+    anchor_idx = next((i for i, l in enumerate(lines)
+                       if l.strip() == 'tplink,tl-wdr6500-v2)'), -1)
     if anchor_idx != -1:
-        # Find the closing ';;' for this case
-        end_idx = -1
-        for j in range(anchor_idx + 1, len(lines)):
-            if lines[j].strip() == ';;':
-                end_idx = j
-                break
-
+        end_idx = next((j for j in range(anchor_idx + 1, len(lines))
+                        if lines[j].strip() == ';;'), -1)
         if end_idx != -1:
             lines = lines[:end_idx + 1] + injection + lines[end_idx + 1:]
-            new_block = '\n'.join(lines)
-            content = content[:iface_func_pos] + new_block + content[macs_func_pos:]
-            with open(NETWORK_FILE, "w") as f:
-                f.write(content)
+            write(path, content[:iface_pos] + '\n'.join(lines) + content[macs_pos:])
             print(">>> 02_network interfaces patched (after tplink,tl-wdr6500-v2)")
             return
-        else:
-            print("!!! No ';;' found after tplink,tl-wdr6500-v2), falling back to esac")
+        print("!!! no ';;' after tplink,tl-wdr6500-v2) - falling back to esac")
     else:
-        print("!!! 'tplink,tl-wdr6500-v2)' anchor not found, falling back to esac")
+        print("!!! 'tplink,tl-wdr6500-v2)' anchor not found - falling back to esac")
 
-    # --- Fallback: inject before the last esac inside ath79_setup_interfaces ---
-    esac_idx = -1
-    for i in range(len(lines) - 1, -1, -1):
-        if lines[i].strip() == 'esac':
-            esac_idx = i
-            break
-
+    esac_idx = next((i for i in range(len(lines) - 1, -1, -1)
+                     if lines[i].strip() == 'esac'), -1)
     if esac_idx == -1:
         print("!!! esac not found in ath79_setup_interfaces")
         return
-
     lines = lines[:esac_idx] + injection + lines[esac_idx:]
-    new_block = '\n'.join(lines)
-    content = content[:iface_func_pos] + new_block + content[macs_func_pos:]
-    with open(NETWORK_FILE, "w") as f:
-        f.write(content)
+    write(path, content[:iface_pos] + '\n'.join(lines) + content[macs_pos:])
     print(">>> 02_network interfaces patched (esac fallback)")
 
 
-# ---------------------------------------------------------------------------
-# 02_network — MACs: extend comfast,cf-e375ac) to also cover cf-wa350
-# ---------------------------------------------------------------------------
 def patch_network_mac():
-    if not os.path.exists(NETWORK_FILE):
+    path = P(ATH79, "generic/base-files/etc/board.d/02_network")
+    if not os.path.exists(path):
         print("!!! 02_network not found for MAC")
         return
-
-    with open(NETWORK_FILE, "r") as f:
-        content = f.read()
-
+    content = read(path)
     macs_pos = content.find("ath79_setup_macs")
     if macs_pos == -1:
         print("!!! ath79_setup_macs not found")
         return
-
-    macs_block = content[macs_pos:]
-
-    if "comfast,cf-wa350)" in macs_block:
+    block = content[macs_pos:]
+    if "comfast,cf-wa350)" in block:
         print(">>> 02_network MAC already patched")
         return
 
-    old_entry = (
-        '\tcomfast,cf-e375ac)\n'
-        '\t\twan_mac=$(macaddr_add $(mtd_get_mac_binary art 0x0) 1)\n'
-        '\t\t;;\n'
-    )
-
-    new_entry = (
-        '\tcomfast,cf-e375ac|\\\n'
-        '\tcomfast,cf-wa350)\n'
-        '\t\twan_mac=$(macaddr_add $(mtd_get_mac_binary art 0x0) 1)\n'
-        '\t\t;;\n'
-    )
-
-    if old_entry not in macs_block:
-        print("!!! Target block 'comfast,cf-e375ac)' not found in ath79_setup_macs")
+    old = ('\tcomfast,cf-e375ac)\n'
+           '\t\twan_mac=$(macaddr_add $(mtd_get_mac_binary art 0x0) 1)\n'
+           '\t\t;;\n')
+    new = ('\tcomfast,cf-e375ac|\\\n'
+           '\tcomfast,cf-wa350)\n'
+           '\t\twan_mac=$(macaddr_add $(mtd_get_mac_binary art 0x0) 1)\n'
+           '\t\t;;\n')
+    if old not in block:
+        print("!!! target block 'comfast,cf-e375ac)' not found in ath79_setup_macs")
         return
-
-    new_macs_block = macs_block.replace(old_entry, new_entry, 1)
-    content = content[:macs_pos] + new_macs_block
-
-    with open(NETWORK_FILE, "w") as f:
-        f.write(content)
+    write(path, content[:macs_pos] + block.replace(old, new, 1))
     print(">>> 02_network MAC patched")
 
 
-# ---------------------------------------------------------------------------
-# image/generic.mk — inject device definition after comfast_cf-ew72
-# ---------------------------------------------------------------------------
 def patch_generic_mk():
-    if not os.path.exists(GENERIC_MK):
+    path = P(ATH79, "image/generic.mk")
+    if not os.path.exists(path):
         print("!!! generic.mk not found")
         return
-
-    with open(GENERIC_MK, "r") as f:
-        content = f.read()
-
+    content = read(path)
     if "comfast_cf-wa350" in content:
         print(">>> generic.mk already patched")
         return
 
     anchor = "TARGET_DEVICES += comfast_cf-ew72\n"
-
     injection = (
         '\n'
         'define Device/comfast_cf-wa350\n'
@@ -329,230 +568,67 @@ def patch_generic_mk():
         'endef\n'
         'TARGET_DEVICES += comfast_cf-wa350\n'
     )
-
     if anchor in content:
-        content = content.replace(anchor, anchor + injection, 1)
-        with open(GENERIC_MK, "w") as f:
-            f.write(content)
+        write(path, content.replace(anchor, anchor + injection, 1))
         print(">>> generic.mk patched (anchor-based)")
         return
-
-    # Fallback: append to end of file
-    print("!!! Anchor 'TARGET_DEVICES += comfast_cf-ew72' not found, appending to EOF")
-    with open(GENERIC_MK, "a") as f:
+    print("!!! anchor 'TARGET_DEVICES += comfast_cf-ew72' not found - appending")
+    with open(path, "a") as f:
         f.write(injection)
     print(">>> generic.mk patched (EOF fallback)")
 
 
-# ---------------------------------------------------------------------------
-# Copy the custom DTS file
-# ---------------------------------------------------------------------------
 def copy_dts():
     if not os.path.exists(DTS_SRC):
-        print("!!! DTS source not found")
+        print(f"!!! {DTS_SRC} not found")
         return
-
-    os.makedirs(os.path.dirname(DTS_DST), exist_ok=True)
-    with open(DTS_SRC, "r") as f:
-        data = f.read()
-    with open(DTS_DST, "w") as f:
-        f.write(data)
-    print(">>> DTS copied")
+    write(P(ATH79, "dts", os.path.basename(DTS_SRC)), read(DTS_SRC))
+    print(f">>> DTS copied -> {P(ATH79, 'dts', os.path.basename(DTS_SRC))}")
 
 
-# ---------------------------------------------------------------------------
-# 731 — generate + install the ar8216 kernel patch
-#
-# The patch is GENERATED from the ar8216.c that is actually in this tree, so
-# the context and the line numbers always match (works for 6.12 and 6.18
-# alike).  It is installed into every target/linux/ath79/patches-*/ directory
-# with a number right after the existing ar8216 atomic-access patch (730),
-# because it must be applied on top of it.
-# ---------------------------------------------------------------------------
-def _insert_guard(text):
-    """Return the patched ar8216.c text, or None when the anchors are missing."""
-    if PATCH_MARKER in text:
-        return text  # already patched
+# ==========================================================================
+def main():
+    global BASE
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--base", default=BASE, help="OpenWrt source tree (default: openwrt)")
+    ap.add_argument("--kver", help="force the kernel version, e.g. 6.12")
+    ap.add_argument("--all-versions", action="store_true",
+                    help="install into every patches-* dir of this tree")
+    ap.add_argument("--no-autofix", action="store_true",
+                    help="do not regenerate a patch that fails to apply")
+    ap.add_argument("--list", action="store_true",
+                    help="only show the detected kernel versions and exit")
+    args = ap.parse_args()
+    BASE = args.base
 
-    inc = '#include "ar8216.h"'
-    if inc not in text:
-        print('!!! anchor \'#include "ar8216.h"\' not found in ar8216.c')
-        return None
-    text = text.replace(inc, inc + "\n" + FWD_DECL, 1)
+    if not os.path.isdir(P(ATH79)):
+        print(f"!!! {P(ATH79)} not found - wrong --base?")
+        return 1
 
-    lines = text.split("\n")
+    versions = detect_versions()
+    print("=" * 72)
+    print("detected kernel version(s):")
+    for v, why in versions:
+        print(f"   {v:8s} <- {why}")
+    if args.list:
+        return 0
+    print("=" * 72)
 
-    # locate: if (phydev->mdio.addr != 0 && ... != 4)  /  return -ENODEV;
-    idx = None
-    for i, line in enumerate(lines):
-        if GUARD_ANCHOR in line:
-            idx = i
-            break
-    if idx is None:
-        print("!!! anchor for the address filter not found in ar8216.c")
-        return None
-
-    j = idx + 1
-    while j < len(lines) and not lines[j].strip():
-        j += 1
-    if j >= len(lines) or lines[j].strip() != "return -ENODEV;":
-        print("!!! 'return -ENODEV;' after the address filter not found")
-        return None
-
-    guard_lines = [""] + GUARD.strip("\n").split("\n")
-    return "\n".join(lines[:j + 1] + guard_lines + lines[j + 1:])
-
-
-def _make_patch_text(orig, new):
-    diff = difflib.unified_diff(
-        orig.splitlines(), new.splitlines(),
-        fromfile="a/" + KERNEL_REL, tofile="b/" + KERNEL_REL,
-        n=3, lineterm="",
-    )
-    body = "\n".join(diff)
-    if not body:
-        return None
-    header = (
-        "From: Salah Ahmed <haddad2inc@gmail.com>\n"
-        "Subject: [PATCH] " + PATCH_SUBJECT + "\n\n"
-        + PATCH_MESSAGE
-        + "\n\nSigned-off-by: Salah Ahmed <haddad2inc@gmail.com>\n---\n"
-    )
-    return header + body + "\n"
-
-
-def _patch_dirs():
-    dirs = [d for d in sorted(glob.glob(os.path.join(ATH79_DIR, "patches-*")))
-            if os.path.isdir(d)]
-    plain = os.path.join(ATH79_DIR, "patches")
-    if os.path.isdir(plain):
-        dirs.append(plain)
-    return dirs
-
-
-def _existing_ar8216_number(d):
-    """Number of the patch that makes ar8216 register access atomic (730)."""
-    best = 730
-    for p in sorted(glob.glob(os.path.join(d, "*.patch"))):
-        try:
-            t = open(p, errors="replace").read(4000)
-        except OSError:
-            continue
-        if "ar8216" in os.path.basename(p) and "atomic" in t.lower():
-            m = re.match(r"(\d+)", os.path.basename(p))
-            if m:
-                best = max(best, int(m.group(1)))
-    return best
-
-
-def _used_numbers(d):
-    nums = set()
-    for p in glob.glob(os.path.join(d, "*.patch")):
-        m = re.match(r"(\d+)", os.path.basename(p))
-        if m:
-            nums.add(int(m.group(1)))
-    return nums
-
-
-def verify_ar8216_patch(patch_file, pristine_text):
-    """Apply 730 (if any) + our patch to a scratch copy; report PASS/FAIL."""
-    if shutil.which("patch") is None:
-        print(">>> verify: 'patch' not installed, skipping verification")
-        return True
-    tmp = tempfile.mkdtemp(prefix="wa350-verify-")
-    try:
-        dst = os.path.join(tmp, KERNEL_REL)
-        os.makedirs(os.path.dirname(dst), exist_ok=True)
-        with open(dst, "w") as f:
-            f.write(pristine_text)
-        # every existing ath79 patch that touches ar8216.c, in order
-        d = os.path.dirname(patch_file)
-        for p in sorted(glob.glob(os.path.join(d, "*.patch"))):
-            if p == patch_file:
-                continue
-            try:
-                t = open(p, errors="replace").read()
-            except OSError:
-                continue
-            if KERNEL_REL not in t:
-                continue
-            subprocess.run(["patch", "-p1", "-s", "--no-backup-if-mismatch",
-                            "-d", tmp, "-i", os.path.abspath(p)],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        r = subprocess.run(["patch", "-p1", "--no-backup-if-mismatch",
-                            "-d", tmp, "-i", os.path.abspath(patch_file)],
-                           capture_output=True, text=True)
-        ok = r.returncode == 0 and PATCH_MARKER in open(dst).read()
-        if ok:
-            print(">>> verify: PASS (patch applies on top of the existing ath79 patches)")
-        else:
-            print("!!! verify: FAIL")
-            print(r.stdout.strip()[:800])
-            print(r.stderr.strip()[:800])
-        return ok
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
-
-
-def patch_ar8216():
-    if not os.path.exists(AR8216_FILE):
-        print(f"!!! {AR8216_FILE} not found - cannot install the ar8216 patch")
-        return False
-
-    with open(AR8216_FILE, "r") as f:
-        orig = f.read()
-
-    if PATCH_MARKER in orig:
-        print(">>> ar8216.c already contains the guard in this tree")
-
-    new = _insert_guard(orig)
-    if new is None:
-        print("!!! ar8216 patch NOT installed (anchors not found - check the tree)")
-        return False
-
-    patch_text = _make_patch_text(orig, new)
-    if patch_text is None:
-        print(">>> ar8216: nothing to do (file already patched)")
-        return True
-
-    dirs = _patch_dirs()
-    if not dirs:
-        print(f"!!! no {ATH79_DIR}/patches-* directory found")
-        return False
-
-    installed = []
-    for d in dirs:
-        # reuse our own patch file if a previous run already created it
-        mine = sorted(glob.glob(os.path.join(d, f"*-{PATCH_BASENAME}.patch")))
-        if mine:
-            path = mine[0]
-            for extra in mine[1:]:
-                os.remove(extra)
-                print(f">>> removed duplicate {extra}")
-        else:
-            num = _existing_ar8216_number(d)
-            used = _used_numbers(d)
-            while num in used:
-                num += 1
-            path = os.path.join(d, f"{num}-{PATCH_BASENAME}.patch")
-        with open(path, "w") as f:
-            f.write(patch_text)
-        installed.append(path)
-        print(f">>> ar8216 patch installed: {path}")
-
-    return verify_ar8216_patch(installed[0], orig)
-
-
-if __name__ == "__main__":
-    print("=" * 70)
-    ok = patch_ar8216()
-    print("=" * 70)
+    ok = install_patches(versions, args.kver, args.all_versions,
+                         autofix=not args.no_autofix)
+    print("=" * 72)
     if not ok:
-        print("!!! WARNING: the ar8216 guard is NOT in place - internal MDIO")
-        print("!!!          will boot-loop on this target. Fix it before building.")
+        print("!!! WARNING: a kernel patch is NOT in place - internal MDIO will")
+        print("!!!          boot-loop on ath79/generic. Fix it before building.")
     copy_dts()
     patch_generic_mk()
     patch_leds()
     patch_network()
     patch_network_mac()
     print(">>> All patches applied!")
+    return 0 if ok else 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
