@@ -1,0 +1,11 @@
+{
+  "luci-app-wizard": {
+    "description": "Grant access to Quick Wizard",
+    "read": {
+      "uci": [ "wizard", "wireless", "network", "dhcp" ]
+    },
+    "write": {
+      "uci": [ "wizard", "wireless", "network", "dhcp" ]
+    }
+  }
+}

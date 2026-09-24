@@ -1,0 +1,27 @@
+#!/bin/sh
+[ "$(board_name)" = "comfast,cf-wa350" ] || exit 0
+
+uci -q batch <<EOF
+# --- التكوين الجديد (25.12) ---
+delete wireless.default_radio0.disabled
+delete wireless.default_radio1.disabled
+set wireless.default_radio0.ssid='COMFAST CF-WA350-5G'
+set wireless.default_radio0.encryption='none'
+set wireless.default_radio1.ssid='COMFAST CF-WA350'
+set wireless.default_radio1.encryption='none'
+
+# --- التكوين القديم (24.10) كاحتياط ---
+delete wireless.radio0.disabled
+delete wireless.radio1.disabled
+
+# --- الشبكة ---
+set network.lan.proto='static'
+set network.lan.ipaddr='192.168.1.1'
+set network.lan.netmask='255.255.255.0'
+EOF
+
+uci -q commit wireless
+uci -q commit network
+
+logger -t rescue-wifi "WA350 rescue WiFi enabled (diagnostic build)"
+exit 0

@@ -222,7 +222,7 @@
       };
     };
   };
-};
+}
 
 &wdt {
   status = "disabled";
