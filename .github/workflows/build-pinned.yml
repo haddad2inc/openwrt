@@ -284,8 +284,10 @@ jobs:
           cp -v target/linux/ath79/patches-*/*ar8216*.patch                      out/injected/ 2>/dev/null || true
           cp -v .config                                                          out/injected/dot-config 2>/dev/null || true
           [ -e patch_openwrt.py ] && cp -v patch_openwrt.py out/injected/ || true
+          [ -e apply_patches.py ] && cp -v apply_patches.py out/injected/ || true
           [ -d dts ]      && cp -rv dts      out/injected/dts-src      || true
           [ -d patches ]  && cp -rv patches  out/injected/patches-src  || true
+          [ -d files ]    && cp -rv files    out/injected/files-src    || true
           [ -d package/utils/cfw-leds ] && cp -rv package/utils/cfw-leds out/injected/cfw-leds || true
 
           cp -v logs/* out/logs/ 2>/dev/null || true
