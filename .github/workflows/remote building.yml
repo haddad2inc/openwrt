@@ -584,16 +584,32 @@ jobs:
 
         cp .config config-before.txt
 
-        rm -f tmp/.config tmp/.config.old 2>/dev/null || true
+        # -----------------------------------------------------------------
+        # STEP 0: Refresh feeds index so newly imported packages are known
+        # -----------------------------------------------------------------
+        echo "=== STEP 0: Refreshing feeds (new packages are now in tree) ===" | tee -a "../$LOGFILE"
+        ./scripts/feeds install -a 2>&1 | tee -a "../$LOGFILE" || true
 
+        # Remove stale tmp/ to force OpenWrt to rebuild the package Kconfig
+        # index (tmp/.config-package.in). Without this, olddefconfig/defconfig
+        # will NOT see the packages we just imported and will report
+        # "your configuration is out of sync".
+        echo "--- Removing stale tmp/ directory ---" | tee -a "../$LOGFILE"
+        rm -rf tmp
+        mkdir -p tmp
+
+        # -----------------------------------------------------------------
         # STEP 1: Generate a complete, consistent base config
+        # -----------------------------------------------------------------
         echo "=== STEP 1: Running make defconfig (expand base config) ===" | tee -a "../$LOGFILE"
         make defconfig 2>&1 | tee -a "../$LOGFILE"
 
         echo "=== Active options AFTER base defconfig ===" | tee -a "../$LOGFILE"
         grep -E '^CONFIG_.*=[ym]' .config | wc -l | tee -a "../$LOGFILE"
 
+        # -----------------------------------------------------------------
         # STEP 2: Inject custom options
+        # -----------------------------------------------------------------
         echo "=== STEP 2: Injecting custom options ===" | tee -a "../$LOGFILE"
 
         if [ "${{ github.event.inputs.attach_theme }}" = "true" ]; then
@@ -621,21 +637,23 @@ jobs:
           echo "✅ Target device is set." | tee -a "../$LOGFILE"
         fi
 
-        # STEP 3: Merge custom options and resolve dependencies
-        echo "=== STEP 3: Running make olddefconfig (merge custom options) ===" | tee -a "../$LOGFILE"
-        KCONFIG_OVERWRITECONFIG=1 make olddefconfig 2>&1 | tee -a "../$LOGFILE"
+        # -----------------------------------------------------------------
+        # STEP 3: Run defconfig AGAIN to merge the injected options
+        # -----------------------------------------------------------------
+        echo "=== STEP 3: Running make defconfig (merge custom options) ===" | tee -a "../$LOGFILE"
+        make defconfig 2>&1 | tee -a "../$LOGFILE"
 
         cp .config config-after.txt
 
-        echo "=== Verifying target device AFTER olddefconfig ===" | tee -a "../$LOGFILE"
+        echo "=== Verifying target device AFTER defconfig ===" | tee -a "../$LOGFILE"
         if grep -q "CONFIG_TARGET_ath79_generic_DEVICE_comfast_cf-wa350=y" .config; then
           echo "✅ Target device still correctly set." | tee -a "../$LOGFILE"
         else
-          echo "⚠️ Target device lost after olddefconfig → re-adding..." | tee -a "../$LOGFILE"
+          echo "⚠️ Target device lost after defconfig → re-adding..." | tee -a "../$LOGFILE"
           echo "CONFIG_TARGET_ath79=y" >> .config
           echo "CONFIG_TARGET_ath79_generic=y" >> .config
           echo "CONFIG_TARGET_ath79_generic_DEVICE_comfast_cf-wa350=y" >> .config
-          KCONFIG_OVERWRITECONFIG=1 make olddefconfig 2>&1 | tee -a "../$LOGFILE"
+          make defconfig 2>&1 | tee -a "../$LOGFILE"
           cp .config config-after.txt
         fi
 
@@ -649,6 +667,20 @@ jobs:
             echo "✅ Re-disabled cfw-leds." | tee -a "../$LOGFILE"
           else
             echo "✅ cfw-leds remains disabled." | tee -a "../$LOGFILE"
+          fi
+        fi
+
+        if [ "${{ github.event.inputs.attach_theme }}" = "true" ]; then
+          echo "=== Verifying theme is still enabled ===" | tee -a "../$LOGFILE"
+          if grep -qE '^CONFIG_PACKAGE_luci-theme-enan-dashboard=y' .config; then
+            echo "✅ Theme remains enabled." | tee -a "../$LOGFILE"
+          else
+            echo "⚠️ Theme lost after defconfig → re-injecting..." | tee -a "../$LOGFILE"
+            sed -i '/^CONFIG_PACKAGE_luci-theme-enan-dashboard=/d' .config
+            sed -i '/^# CONFIG_PACKAGE_luci-theme-enan-dashboard is not set/d' .config
+            echo "CONFIG_PACKAGE_luci-theme-enan-dashboard=y" >> .config
+            make defconfig 2>&1 | tee -a "../$LOGFILE"
+            cp .config config-after.txt
           fi
         fi
 
