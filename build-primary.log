@@ -1,17 +1,17 @@
-=== BUILD LOG (primary) - Fri Sep 25 05:07:55 +03 2026 ===
+=== BUILD LOG (primary) - Fri Sep 25 05:10:28 +03 2026 ===
 Matrix slot           : primary
 Matrix label          : snapshot-latest
 Workflow triggered by : workflow_dispatch
 Repository            : haddad2inc/openwrt
-Commit                : 22b41b30319dc5a94f3fde64267a85b34e414497
+Commit                : d5e1dc3b20c262e842d5c2d6cb51efae61656147
 OpenWrt branch input  : snapshot
 OpenWrt git branch    : master
 OpenWrt tag           : <none>
 Patch version input   : <empty>
 include_files         : true
-include_patches       : true
+include_patches       : false
 import_cfw_leds       : true
 attach_theme          : true
 ========================================
-Build started at: Fri Sep 25 05:07:55 +03 2026
+Build started at: Fri Sep 25 05:10:28 +03 2026
 ========================================
