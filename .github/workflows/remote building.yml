@@ -50,12 +50,12 @@ on:
         default: false
         type: boolean
       import_cfw_leds:
-        description: 'Import cfw-leds package into openwrt/package/utils/'
+        description: 'Import cfw-leds package (from building-helper) into openwrt/package/utils/'
         required: false
         default: true
         type: boolean
       attach_theme:
-        description: 'Import luci-theme-enan-dashboard package and enable it in .config'
+        description: 'Import luci-theme-enan-dashboard package (from building-helper) and enable it'
         required: false
         default: false
         type: boolean
@@ -300,9 +300,10 @@ jobs:
         rm -rf openwrt/.git 2>&1 | tee -a "$LOGFILE"
 
     # -----------------------------------------------------------------------
-    # Import building-helper repository
-    #   Always required : .config, dts, apply_patches.py
-    #   Optional        : patches (include_patches=true), files (include_files=true)
+    # Import building-helper repository (UNIFIED — everything comes from here)
+    #   Always required : .config, dts, apply_patches.py, cfw-leds
+    #   Optional        : patches (include_patches=true), files (include_files=true),
+    #                     luci-theme-enan-dashboard (attach_theme=true)
     # -----------------------------------------------------------------------
     - name: Import building-helper repository
       run: |
@@ -332,6 +333,44 @@ jobs:
             exit 1
           fi
         done
+
+        if [ "${{ github.event.inputs.import_cfw_leds }}" != "false" ]; then
+          echo "=== cfw-leds package (import_cfw_leds=true) ===" | tee -a "$LOGFILE"
+          if [ -d "$BUILD_HELPER_DIR/cfw-leds" ]; then
+            echo "✅ Found (import_cfw_leds=true): cfw-leds/" | tee -a "$LOGFILE"
+            ls -la "$BUILD_HELPER_DIR/cfw-leds" | tee -a "$LOGFILE"
+            if [ -f "$BUILD_HELPER_DIR/cfw-leds/Makefile" ]; then
+              echo "✅ cfw-leds/Makefile found." | tee -a "$LOGFILE"
+            else
+              echo "❌ MISSING: cfw-leds/Makefile" | tee -a "$LOGFILE"
+              exit 1
+            fi
+          else
+            echo "❌ MISSING (import_cfw_leds=true): cfw-leds/" | tee -a "$LOGFILE"
+            exit 1
+          fi
+        else
+          echo "=== import_cfw_leds=false → cfw-leds/ will NOT be imported ===" | tee -a "$LOGFILE"
+        fi
+
+        if [ "${{ github.event.inputs.attach_theme }}" = "true" ]; then
+          echo "=== luci-theme-enan-dashboard package (attach_theme=true) ===" | tee -a "$LOGFILE"
+          if [ -d "$BUILD_HELPER_DIR/luci-theme-enan-dashboard" ]; then
+            echo "✅ Found (attach_theme=true): luci-theme-enan-dashboard/" | tee -a "$LOGFILE"
+            ls -la "$BUILD_HELPER_DIR/luci-theme-enan-dashboard" | tee -a "$LOGFILE"
+            if [ -f "$BUILD_HELPER_DIR/luci-theme-enan-dashboard/Makefile" ]; then
+              echo "✅ luci-theme-enan-dashboard/Makefile found." | tee -a "$LOGFILE"
+            else
+              echo "❌ MISSING: luci-theme-enan-dashboard/Makefile" | tee -a "$LOGFILE"
+              exit 1
+            fi
+          else
+            echo "❌ MISSING (attach_theme=true): luci-theme-enan-dashboard/" | tee -a "$LOGFILE"
+            exit 1
+          fi
+        else
+          echo "=== attach_theme=false → luci-theme-enan-dashboard/ will NOT be imported ===" | tee -a "$LOGFILE"
+        fi
 
         if [ "${{ github.event.inputs.include_patches }}" = "true" ]; then
           echo "=== Optional items (include_patches=true) ===" | tee -a "$LOGFILE"
@@ -371,10 +410,6 @@ jobs:
 
     # -----------------------------------------------------------------------
     # Apply patches via Python script — ALWAYS RUNS
-    #   - apply_patches.py is always copied from building-helper
-    #   - dts/            is always copied from building-helper
-    #   - patches/        is copied ONLY if include_patches=true
-    #   The script handles a missing patches/ folder gracefully.
     # -----------------------------------------------------------------------
     - name: Apply patches via Python script
       run: |
@@ -454,43 +489,37 @@ jobs:
         echo "=== include_files=false → skipping custom files injection ===" | tee -a "$LOGFILE"
 
     # -----------------------------------------------------------------------
-    # Import cfw-leds package (from REMOTE GitHub repo)
+    # Import cfw-leds package (from building-helper — LOCAL)
     # -----------------------------------------------------------------------
     - name: Import cfw-leds package into openwrt/package/utils/
       if: ${{ github.event.inputs.import_cfw_leds != 'false' }}
       run: |
         set -o pipefail
-        echo "=== Importing cfw-leds package from remote repo ===" | tee -a "$LOGFILE"
-        CFW_REPO="https://github.com/haddad2inc/cfw-leds.git"
+        echo "=== Importing cfw-leds package from building-helper ===" | tee -a "$LOGFILE"
+        BUILD_HELPER_SRC="/tmp/building-helper/cfw-leds"
         TARGET_PARENT="openwrt/package/utils"
         TARGET_DIR="$TARGET_PARENT/cfw-leds"
-        TMP_DIR="/tmp/cfw-leds-src"
 
-        echo "Repo: $CFW_REPO" | tee -a "$LOGFILE"
+        echo "Source       : $BUILD_HELPER_SRC" | tee -a "$LOGFILE"
         echo "Target parent: $TARGET_PARENT" | tee -a "$LOGFILE"
-        echo "Expected final path: $TARGET_DIR" | tee -a "$LOGFILE"
+        echo "Target dir   : $TARGET_DIR" | tee -a "$LOGFILE"
 
-        rm -rf "$TMP_DIR"
-        if git clone --depth 1 "$CFW_REPO" "$TMP_DIR" 2>&1 | tee -a "$LOGFILE"; then
-          echo "✅ Clone succeeded." | tee -a "$LOGFILE"
-        else
-          echo "❌ Clone FAILED." | tee -a "$LOGFILE"
+        if [ ! -d "$BUILD_HELPER_SRC" ]; then
+          echo "❌ ERROR: Source folder '$BUILD_HELPER_SRC' not found." | tee -a "$LOGFILE"
+          ls -la /tmp/building-helper | tee -a "$LOGFILE"
           exit 1
         fi
 
-        rm -rf "$TMP_DIR/.git"
-
-        SRC_DIR="$TMP_DIR/cfw-leds"
-        if [ ! -d "$SRC_DIR" ]; then
-          echo "❌ ERROR: Expected subfolder '$SRC_DIR' not found." | tee -a "$LOGFILE"
-          ls -la "$TMP_DIR" | tee -a "$LOGFILE"
+        if [ ! -f "$BUILD_HELPER_SRC/Makefile" ]; then
+          echo "❌ ERROR: Makefile NOT found in '$BUILD_HELPER_SRC/Makefile'" | tee -a "$LOGFILE"
+          ls -la "$BUILD_HELPER_SRC" | tee -a "$LOGFILE"
           exit 1
         fi
 
         mkdir -p "$TARGET_PARENT"
         rm -rf "$TARGET_DIR"
 
-        if cp -rv "$SRC_DIR" "$TARGET_PARENT"/ 2>&1 | tee -a "$LOGFILE"; then
+        if cp -rv "$BUILD_HELPER_SRC" "$TARGET_PARENT"/ 2>&1 | tee -a "$LOGFILE"; then
           echo "✅ Copy to $TARGET_PARENT succeeded." | tee -a "$LOGFILE"
         else
           echo "❌ Copy FAILED." | tee -a "$LOGFILE"
@@ -515,39 +544,37 @@ jobs:
         echo "✅ cfw-leds package import completed." | tee -a "$LOGFILE"
 
     # -----------------------------------------------------------------------
-    # Import luci-theme-enan-dashboard package (from REMOTE GitHub repo)
+    # Import luci-theme-enan-dashboard package (from building-helper — LOCAL)
     # -----------------------------------------------------------------------
     - name: Import luci-theme-enan-dashboard package into openwrt/package/
       if: ${{ github.event.inputs.attach_theme == 'true' }}
       run: |
         set -o pipefail
-        echo "=== Importing luci-theme-enan-dashboard package from remote repo ===" | tee -a "$LOGFILE"
-        THEME_REPO="https://github.com/haddad2inc/cfw-leds.git"
+        echo "=== Importing luci-theme-enan-dashboard package from building-helper ===" | tee -a "$LOGFILE"
+        BUILD_HELPER_SRC="/tmp/building-helper/luci-theme-enan-dashboard"
         TARGET_PARENT="openwrt/package"
         TARGET_DIR="$TARGET_PARENT/luci-theme-enan-dashboard"
-        TMP_DIR="/tmp/cfw-theme-src"
 
-        rm -rf "$TMP_DIR"
-        if git clone --depth 1 "$THEME_REPO" "$TMP_DIR" 2>&1 | tee -a "$LOGFILE"; then
-          echo "✅ Clone succeeded." | tee -a "$LOGFILE"
-        else
-          echo "❌ Clone FAILED." | tee -a "$LOGFILE"
+        echo "Source       : $BUILD_HELPER_SRC" | tee -a "$LOGFILE"
+        echo "Target parent: $TARGET_PARENT" | tee -a "$LOGFILE"
+        echo "Target dir   : $TARGET_DIR" | tee -a "$LOGFILE"
+
+        if [ ! -d "$BUILD_HELPER_SRC" ]; then
+          echo "❌ ERROR: Source folder '$BUILD_HELPER_SRC' not found." | tee -a "$LOGFILE"
+          ls -la /tmp/building-helper | tee -a "$LOGFILE"
           exit 1
         fi
 
-        rm -rf "$TMP_DIR/.git"
-
-        SRC_DIR="$TMP_DIR/luci-theme-enan-dashboard"
-        if [ ! -d "$SRC_DIR" ]; then
-          echo "❌ ERROR: Expected subfolder '$SRC_DIR' not found." | tee -a "$LOGFILE"
-          ls -la "$TMP_DIR" | tee -a "$LOGFILE"
+        if [ ! -f "$BUILD_HELPER_SRC/Makefile" ]; then
+          echo "❌ ERROR: Makefile NOT found in '$BUILD_HELPER_SRC/Makefile'" | tee -a "$LOGFILE"
+          ls -la "$BUILD_HELPER_SRC" | tee -a "$LOGFILE"
           exit 1
         fi
 
         mkdir -p "$TARGET_PARENT"
         rm -rf "$TARGET_DIR"
 
-        if cp -rv "$SRC_DIR" "$TARGET_PARENT"/ 2>&1 | tee -a "$LOGFILE"; then
+        if cp -rv "$BUILD_HELPER_SRC" "$TARGET_PARENT"/ 2>&1 | tee -a "$LOGFILE"; then
           echo "✅ Copy to $TARGET_PARENT succeeded." | tee -a "$LOGFILE"
         else
           echo "❌ Copy FAILED." | tee -a "$LOGFILE"
@@ -590,10 +617,6 @@ jobs:
         echo "=== STEP 0: Refreshing feeds (new packages are now in tree) ===" | tee -a "../$LOGFILE"
         ./scripts/feeds install -a 2>&1 | tee -a "../$LOGFILE" || true
 
-        # Remove stale tmp/ to force OpenWrt to rebuild the package Kconfig
-        # index (tmp/.config-package.in). Without this, olddefconfig/defconfig
-        # will NOT see the packages we just imported and will report
-        # "your configuration is out of sync".
         echo "--- Removing stale tmp/ directory ---" | tee -a "../$LOGFILE"
         rm -rf tmp
         mkdir -p tmp
