@@ -153,20 +153,27 @@
  * hardcoded MDIO window 0x10-0x18, while the five port PHYs answer at 0-4.
  * Anchor the switch node at 0x10 so it does not collide with PHY 0.
  *
- * No PHY is declared on the external ag71xx bus and no "mdio" child is
- * declared here, so qca8k uses its legacy port-to-PHY mapping (port N ->
- * internal PHY N - 1) and registers "qca8k-legacy user mii" as
- * ds->user_mii_bus. All PHY traffic then goes through the switch MDIO
- * master, which also disconnects the external MDC/MDIO passthrough.
+ * The port PHYs are declared on the switch's internal MDIO bus and both user
+ * ports select it with phy-mode = "internal", so qca8k_setup_mdio_bus() picks
+ * the internal mask, registers the MDIO master bus and leaves the external
+ * MDC/MDIO passthrough disconnected. This is required on the generic
+ * subtarget, where CONFIG_AR8216_PHY=y is built into the kernel and its
+ * phy_driver matches this switch's PHY ID (0x004dd036): with the PHYs on the
+ * external ag71xx bus that driver identifies the chip through the 0x10/0x18
+ * window, registers a swconfig switch on a DSA-only board and only lets go of
+ * the PHY because its probe then fails on the missing qca,ar8327-initvals.
  *
- * This is what keeps CONFIG_AR8216_PHY - built into every ath79 kernel on
- * the generic subtarget - away from the switch: the legacy bus enumerates
- * the PHYs at the *port* addresses (1 and 2), and ar8xxx_phy_probe() only
- * ever looks at MDIO addresses 0, 3 and 4, so it returns -ENODEV without
- * reading a single register. With PHY nodes on the external bus instead,
- * that driver identifies the chip through its 0x10/0x18 window, registers a
- * bogus swconfig switch and only then fails on the missing
- * qca,ar8327-initvals.
+ * phy-mode = "internal" is mandatory: qca8k_setup_mdio_bus() ignores the
+ * of_get_phy_mode() error and leaves the mode uninitialized when the property
+ * is missing, and a mixed internal/external mask is rejected outright.
+ *
+ * NOTE: on ath79 this layout also needs the ar8216 guard from
+ * 731-ar8216-skip-phys-on-switch-internal-mdio-bus.patch. Without it the
+ * built-in legacy driver probes the PHY at internal address 0 and reaches the
+ * switch through ar8xxx_read(), which 730-ar8216-make-reg-access-atomic.patch
+ * wraps in local_irq_save(); qca8k's MDIO master may sleep there and
+ * busy-waits up to 2000 ms per access, which locks the single CPU up with
+ * interrupts off and resets the board in a loop before preinit.
  */
 &mdio0 {
 	status = "okay";
@@ -206,12 +213,28 @@
 				reg = <1>;
 				label = "wan";
 				phy-mode = "internal";
+				phy-handle = <&phy_port1>;
 			};
 
 			ethernet-port@2 {
 				reg = <2>;
 				label = "lan";
 				phy-mode = "internal";
+				phy-handle = <&phy_port2>;
+			};
+		};
+
+		mdio {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			/* qca8k maps port N to internal PHY N - 1 */
+			phy_port1: ethernet-phy@0 {
+				reg = <0>;
+			};
+
+			phy_port2: ethernet-phy@1 {
+				reg = <1>;
 			};
 		};
 	};
