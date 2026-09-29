@@ -36,7 +36,7 @@ Signed-off-by: Salah Ahmed <haddad2inc@gmail.com>
 
 --- a/drivers/mtd/spi-nor/macronix.c
 +++ b/drivers/mtd/spi-nor/macronix.c
-@@ -143,6 +143,7 @@ static const struct flash_info macronix_nor_parts[] = {
+@@ -143,6 +143,7 @@ static const struct flash_info macronix_
  	}, {
  		/* MX25L12805D */
  		.id = SNOR_ID(0xc2, 0x20, 0x18),
