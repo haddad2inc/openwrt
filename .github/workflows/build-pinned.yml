@@ -1,369 +1,139 @@
-name: Build CF-WA350 (pinned commit)
-
-# ==========================================================================
-# Builds ONE device (comfast_cf-wa350) from a pinned commit of THIS repo.
-# Default ref = b4c5ac2908fd6ee0045a5c9a2ac5f07375c4a801
-#               (2026-09-11, last known-good image, kernel 6.18.44)
-#
-# Put this file at:  .github/workflows/build-pinned.yml
-# On a PUBLIC fork -> GitHub Actions minutes are unlimited.
-#
-# Run:  Actions -> "Build CF-WA350 (pinned commit)" -> Run workflow
-#       -> pick the branch holding THIS file -> set "ref" to the commit.
-#
-# Notes:
-#   * Use FULL 40-char SHAs (the server rejects short SHAs on fetch).
-#   * "ref" must exist in this repo; press "Sync fork" for newer upstream ones.
-#   * device_files_ref : branch holding patch_openwrt.py + dts/ + patches/
-#                        (used when building a plain upstream commit)
-#   * package_ref      : branch holding package/utils/cfw-leds
-#   * kernel_from_ref  : pin the kernel by copying target/linux/generic/kernel-*
-#                        from another ref (e.g. 0f8cceb46912... = 6.18.44)
-# ==========================================================================
+name: build-cf-wa350-v2
 
 on:
   workflow_dispatch:
     inputs:
-      ref:
-        description: "Commit / branch / tag to build (full SHA recommended)"
-        required: true
-        default: "b4c5ac2908fd6ee0045a5c9a2ac5f07375c4a801"
-      device_files_ref:
-        description: "Optional: take patch_openwrt.py + dts/ + patches/ from this ref and run the injector"
+      openwrt_commit:
+        description: Exact SHA to build from haddad2inc/openwrt (hard-verified)
         required: false
-        default: ""
-      package_ref:
-        description: "Optional: take package/utils/cfw-leds from this ref if the tree lacks it"
+        default: 3ecebea434
+        type: string
+      dts_file:
+        description: DTS variant from root dts/ folder on ci-wa350
         required: false
-        default: "comfast-cf-wa350-support"
-      kernel_from_ref:
-        description: "Optional: pin the kernel from this upstream ref (0f8cceb46912d9af3f522edff69870fdc6d4b617 = 6.18.44)"
-        required: false
-        default: ""
-      config_extra:
-        description: "Extra .config lines, one per line"
-        required: false
-        default: ""
-      build_initramfs:
-        description: "Also build initramfs-kernel.bin (slower)"
-        type: boolean
-        default: false
-      verbose_on_error:
-        description: "On failure, re-run serially with V=s to expose the real error"
-        type: boolean
-        default: true
-
-permissions:
-  contents: read
-
-concurrency:
-  group: wa350-pinned-${{ github.ref }}-${{ inputs.ref }}
-  cancel-in-progress: false
-
-env:
-  DEBIAN_FRONTEND: noninteractive
-  TZ: UTC
-  IN_REF: ${{ inputs.ref }}
-  IN_DEVICE_REF: ${{ inputs.device_files_ref }}
-  IN_PKG_REF: ${{ inputs.package_ref }}
-  IN_KERNEL_REF: ${{ inputs.kernel_from_ref }}
-  IN_CONFIG_EXTRA: ${{ inputs.config_extra }}
-  IN_INITRAMFS: ${{ inputs.build_initramfs }}
-  WANT_PACKAGES: cfw-leds luci luci-base luci-mod-admin-full luci-mod-network luci-mod-status luci-mod-system luci-app-package-manager luci-theme-footstrap uhttpd
+        default: qca9563_comfast_cf-wa350.dts
+        type: choice
+        options:
+          - qca9563_comfast_cf-wa350.dts
+          - qca9563_comfast_cf-wa350-internal-mdio.dts
+          - qca9563_comfast_cf-wa350-explicit-mdio.dts
+          - qca9563_comfast_cf-wa350-external.dts
 
 jobs:
   build:
-    name: build ${{ inputs.ref }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 480
-
+    timeout-minutes: 300
     steps:
-      - name: Free disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/lib/jvm /opt/hostedtoolcache/CodeQL || true
-          sudo docker image prune -af >/dev/null 2>&1 || true
-          df -h /
-
-      - name: Install build dependencies
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
-            build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
-            gettext git libncurses-dev libssl-dev python3-distutils-extra \
-            python3-setuptools rsync ruby swig unzip zlib1g-dev file wget curl \
-            device-tree-compiler ccache libelf-dev quilt xsltproc libpython3-dev time
-          gcc --version | head -1
-          echo "cores=$(nproc)"; free -h
-
-      - name: Checkout the pinned tree
+      - name: Checkout pinned commit
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref }}
+          repository: haddad2inc/openwrt
+          ref: ${{ inputs.openwrt_commit }}
           fetch-depth: 1
 
-      - name: Short ref for artifact names
-        id: sr
+      - name: Verify HEAD equals requested SHA
         run: |
-          s="$(echo "$IN_REF" | tr -c 'A-Za-z0-9._-' '-' | cut -c1-12)"
-          echo "short=$s" >> "$GITHUB_OUTPUT"
-          echo "artifact suffix: $s"
+          set +e
+          H="$(git rev-parse HEAD)"
+          echo "HEAD = $H ; requested = ${{ inputs.openwrt_commit }}"
+          case "$H" in
+            ${{ inputs.openwrt_commit }}*) echo OK ;;
+            *) echo "::error::HEAD mismatch"; exit 1 ;;
+          esac
+          exit 0
 
-      - name: Record what is being built
+      - name: Pull root assets from ci-wa350
         run: |
-          mkdir -p logs
-          {
-            git log -1 --format='commit  %H%nauthor  %an%ndate    %cd%nsubject %s' --date=iso
-            echo "--- kernel details files ---"
-            grep -H 'LINUX_VERSION\|LINUX_KERNEL_HASH' target/linux/generic/kernel-* 2>/dev/null || true
-            echo "--- ath79 KERNEL_PATCHVER ---"
-            grep -H 'KERNEL_PATCHVER\|KERNEL_TESTING_PATCHVER' target/linux/ath79/Makefile || true
-          } | tee logs/00-commit.txt
-
-      - name: Optional - pin the kernel from another ref
-        if: ${{ env.IN_KERNEL_REF != '' }}
-        run: |
-          set -e
-          for f in target/linux/generic/kernel-*; do
-            v="${f##*kernel-}"
-            url="https://raw.githubusercontent.com/openwrt/openwrt/${IN_KERNEL_REF}/target/linux/generic/kernel-${v}"
-            if curl -fsSL "$url" -o "$f.new"; then
-              mv "$f.new" "$f"
-              echo "pinned kernel-${v} from ${IN_KERNEL_REF}:"
-              grep 'LINUX_VERSION' "$f"
-            else
-              rm -f "$f.new"
-              echo "kernel-${v} not present at ${IN_KERNEL_REF} - untouched"
-            fi
+          set +e
+          git fetch --depth 1 origin ci-wa350 || exit 1
+          mkdir -p logs /tmp/assets
+          for f in "dts/${{ inputs.dts_file }}" ".config" \
+                   "patches/731-ar8216-skip-phys-on-switch-internal-mdio-bus.patch" \
+                   "patches/740-mtd-spi-nor-macronix-restore-mx25l12805d-name-size.patch"; do
+            git show "origin/ci-wa350:$f" > "/tmp/assets/$(basename "$f")" || exit 1
           done
+          sha256sum /tmp/assets/* | tee logs/assets.sha256
+          exit 0
 
-      - name: Optional - inject device files (patch_openwrt.py + dts + patches)
-        if: ${{ env.IN_DEVICE_REF != '' }}
+      - name: Inject DTS + classify variant + sha gate
         run: |
-          set -e
-          git fetch --depth 1 origin "${IN_DEVICE_REF}"
-          git checkout FETCH_HEAD -- patch_openwrt.py dts patches
-          python3 patch_openwrt.py --base .
-          echo "--- installed ath79 patches ---"
-          ls -1 target/linux/ath79/patches-*/ | sort
+          set +e
+          D=target/linux/ath79/dts/qca9563_comfast_cf-wa350.dts
+          cp "/tmp/assets/${{ inputs.dts_file }}" "$D"
+          S="$(sha256sum "$D" | cut -d' ' -f1)"
+          PH="$(grep -c 'phy-handle *=' "$D")"; IN="$(grep -cE '^[[:space:]]+phy-mode = "internal";' "$D")"; MD="$(grep -cE '^[[:space:]]+mdio \{' "$D")"
+          case "${{ inputs.dts_file }}" in
+            *external*) V=EXTERNAL-MDIO;     E=c7cd13705d797229600a2d85f180fdb6736f39b493a7205c0211c746aaf015ca ;;
+            *explicit*) V=INTERNAL-EXPLICIT; E=a755306340109abe2c63c47adb4144131011e12913f7ee3781c095be1dbe637e ;;
+            *)          V=INTERNAL-LEGACY;   E=1544a5482fabf497479b6acb6d21ec68ab450a7f253239b84ff61fd843c9bb30 ;;
+          esac
+          { echo "variant    = $V"; echo "dts_file   = ${{ inputs.dts_file }}"; echo "dts_sha256 = $S"; echo "counters   = phy-handle:$PH internal:$IN mdio-child:$MD"; } | tee logs/variant.txt
+          [ "$S" = "$E" ] || { echo "::error::DTS sha mismatch"; exit 1; }
+          echo "V=$V" >> "$GITHUB_ENV"
+          exit 0
 
-      - name: Optional - fetch the cfw-leds package
-        if: ${{ env.IN_PKG_REF != '' }}
+      - name: Patch policy per variant
         run: |
-          if [ -d package/utils/cfw-leds ]; then
-            echo "cfw-leds already present in this tree"
-          else
-            echo "fetching package/utils/cfw-leds from ${IN_PKG_REF}"
-            git fetch --depth 1 origin "${IN_PKG_REF}" || { echo "!! fetch failed"; exit 0; }
-            git checkout FETCH_HEAD -- package/utils/cfw-leds || echo "!! cfw-leds not found at ${IN_PKG_REF}"
-          fi
-          ls -l package/utils/cfw-leds 2>/dev/null || true
-
-      - name: Restore dl/ cache
-        uses: actions/cache@v4
-        with:
-          path: dl
-          key: dl-ath79-${{ steps.sr.outputs.short }}
-          restore-keys: |
-            dl-ath79-
-            dl-
-
-      - name: Restore ccache
-        uses: actions/cache@v4
-        with:
-          path: .ccache
-          key: ccache-ath79-${{ steps.sr.outputs.short }}-${{ github.run_id }}
-          restore-keys: |
-            ccache-ath79-${{ steps.sr.outputs.short }}-
-            ccache-ath79-
-            ccache-
-
-      - name: Update and install feeds
-        run: |
-          ./scripts/feeds update -a 2>&1 | tee logs/10-feeds.log
-          ./scripts/feeds install -a 2>&1 | tee -a logs/10-feeds.log
-
-      - name: Write .config (single device + LuCI + cfw-leds)
-        run: |
-          cat > .config <<'CFG'
-          CONFIG_TARGET_ath79=y
-          CONFIG_TARGET_ath79_generic=y
-          CONFIG_TARGET_ath79_generic_DEVICE_comfast_cf-wa350=y
-          CONFIG_TARGET_PER_DEVICE_ROOTFS=y
-          CONFIG_TARGET_MULTI_PROFILE=n
-          CONFIG_TARGET_ROOTFS_CPIOGZ=n
-          CONFIG_TARGET_ROOTFS_TARGZ=n
-          CONFIG_BUILD_PATENTED=n
-          CONFIG_CCACHE=y
-          CONFIG_DEVEL=y
-          CONFIG_PACKAGE_cfw-leds=y
-          CONFIG_PACKAGE_luci=y
-          CONFIG_PACKAGE_luci-base=y
-          CONFIG_PACKAGE_luci-mod-admin-full=y
-          CONFIG_PACKAGE_luci-mod-network=y
-          CONFIG_PACKAGE_luci-mod-status=y
-          CONFIG_PACKAGE_luci-mod-system=y
-          CONFIG_PACKAGE_luci-app-package-manager=y
-          CONFIG_PACKAGE_luci-theme-footstrap=y
-          CONFIG_PACKAGE_uhttpd=y
-          CFG
-          sed -i 's/^          //' .config
-          if [ "$IN_INITRAMFS" = "true" ]; then
-            echo 'CONFIG_TARGET_ROOTFS_INITRAMFS=y' >> .config
-          else
-            echo '# CONFIG_TARGET_ROOTFS_INITRAMFS is not set' >> .config
-          fi
-          if [ -n "$IN_CONFIG_EXTRA" ]; then
-            printf '%s\n' "$IN_CONFIG_EXTRA" >> .config
-          fi
-          make defconfig
-          ./scripts/diffconfig.sh > logs/20-diffconfig.txt
-
-      - name: Verify the requested packages survived defconfig
-        run: |
-          echo "package selection check:" | tee logs/21-packages.txt
-          miss=0
-          for p in $WANT_PACKAGES; do
-            if grep -q "^CONFIG_PACKAGE_${p}=y" .config; then
-              echo "  OK    $p" | tee -a logs/21-packages.txt
-            else
-              echo "  MISS  $p  (unknown symbol, dropped by defconfig, or a dependency conflict)" | tee -a logs/21-packages.txt
-              miss=$((miss+1))
-            fi
-          done
-          grep -E 'DEVICE_comfast_cf-wa350|CONFIG_LINUX_6_|TARGET_ROOTFS_INITRAMFS|CONFIG_CCACHE' .config | tee -a logs/21-packages.txt || true
-          echo "missing=$miss"
-
-      - name: Download sources
-        run: make -j"$(nproc)" download V=s 2>&1 | tail -30
-
-      - name: Build
-        run: |
-          set -o pipefail
-          ( time make -j"$(nproc)" world ) 2>&1 | tee logs/30-build.log | tail -150
-
-      - name: Verbose retry on failure
-        if: ${{ failure() && inputs.verbose_on_error == true }}
-        run: |
-          make V=s -j1 2>&1 | tee logs/31-build-verbose.log | tail -400 || true
-
-      - name: Verify the ar8216 guard reached the compiled kernel
-        if: ${{ always() }}
-        run: |
-          {
-            echo "## ar8216 guard (patch 731) verification"
-            echo
-            DTSF="target/linux/ath79/dts/qca9563_comfast_cf-wa350.dts"
-            if [ -f "$DTSF" ] && grep -q 'phy-mode = "internal"' "$DTSF"; then
-              REQ="**REQUIRED** - this DTS uses the switch's internal MDIO bus"
-            elif [ -f "$DTSF" ] && grep -q 'phy-handle' "$DTSF"; then
-              REQ="optional - this DTS declares the port PHYs on the external MDIO bus"
-            else
-              REQ="optional - legacy mapping (no phy-handle, no mdio child)"
-            fi
-            echo "- guard is: $REQ"
-            KD="$(ls -d build_dir/target-*/linux-ath79_generic 2>/dev/null | head -1)"
-            SRC="$(ls -d ${KD:-/nonexistent}/linux-* 2>/dev/null | head -1)"
-            echo "- kernel build dir: ${KD:-NOT FOUND}"
-            echo "- kernel source dir: ${SRC:-NOT FOUND}"
-            if [ -n "${SRC:-}" ] && [ -f "$SRC/drivers/net/phy/ar8216.c" ]; then
-              if grep -q "Never claim a PHY" "$SRC/drivers/net/phy/ar8216.c"; then
-                echo "- **RESULT: PASS** - the guard IS in the kernel source that was compiled"
-                echo
-                echo '```c'
-                grep -n -B2 -A14 "Never claim a PHY" "$SRC/drivers/net/phy/ar8216.c" | head -24
-                echo '```'
+          set +e
+          PD=target/linux/ath79/patches-6.18
+          : > logs/patches-injected.txt
+          case "$V" in
+            EXTERNAL-MDIO)
+              [ -s "$PD/730-ar8216-make-reg-access-atomic.patch" ] || { echo "::error::730 missing in tree"; exit 1; }
+              echo "730 present in tree (not re-injected)" >> logs/patches-injected.txt ;;
+            INTERNAL-LEGACY)
+              cp /tmp/assets/731-*.patch "$PD/" && echo "731 injected (regression witness; legacy needs no guard)" >> logs/patches-injected.txt ;;
+            INTERNAL-EXPLICIT)
+              cp /tmp/assets/731-*.patch "$PD/" && echo "731 injected (required)" >> logs/patches-injected.txt
+              if ls target/linux/generic/backport-6.18/439-* >/dev/null 2>&1; then
+                echo "740 SKIPPED: base carries 439 (duplicate would break refresh)" >> logs/patches-injected.txt
               else
-                echo "- **RESULT: NOT PRESENT** - patch 731 was not applied to this kernel"
-              fi
-            else
-              echo "- RESULT: UNKNOWN - kernel source not found (build failed early?)"
-            fi
-            echo
-            echo "### ar8216 patches present in the tree"
-            echo '```'
-            ls -1 target/linux/ath79/patches-*/ 2>/dev/null | grep -i ar8216 || echo "(none)"
-            echo '```'
-            echo
-            echo "### CONFIG_AR8216_PHY in the built kernel .config"
-            echo '```'
-            grep -H "CONFIG_AR8216_PHY\|CONFIG_SWCONFIG" "${SRC:-/nonexistent}/.config" 2>/dev/null || echo "(kernel .config not found)"
-            echo '```'
-          } | tee -a "$GITHUB_STEP_SUMMARY" logs/22-ar8216-guard.txt
+                cp /tmp/assets/740-*.patch "$PD/" && echo "740 injected (base lacks 439)" >> logs/patches-injected.txt
+              fi ;;
+          esac
+          cat logs/patches-injected.txt
+          exit 0
 
-      - name: Collect artifacts (images, kernel, dtb, injected files, logs)
-        if: ${{ always() }}
+      - name: Config from root .config + defconfig + proofs
         run: |
-          set -u
-          rm -rf out
-          mkdir -p out/images out/kernel out/dtb out/injected out/logs
+          set +e
+          cp /tmp/assets/.config .config
+          ./scripts/feeds update -a >/dev/null 2>&1
+          ./scripts/feeds install -a >/dev/null 2>&1
+          make defconfig || exit 1
+          grep -E '^CONFIG_TARGET_PROFILE=|^CONFIG_PACKAGE_kmod-dsa-qca8k=|^CONFIG_TARGET_ROOTFS_INITRAMFS=|^CONFIG_GCC_VERSION=' .config | tee logs/config-proof.txt
+          exit 0
 
-          echo "=== images ==="
-          cp -v bin/targets/ath79/generic/*cf-wa350*            out/images/ 2>/dev/null || true
-          cp -v bin/targets/ath79/generic/sha256sums            out/images/ 2>/dev/null || true
-          cp -v bin/targets/ath79/generic/*.manifest            out/images/ 2>/dev/null || true
-          cp -v bin/targets/ath79/generic/config.buildinfo      out/images/ 2>/dev/null || true
-          cp -v bin/targets/ath79/generic/feeds.buildinfo       out/images/ 2>/dev/null || true
-          cp -v bin/targets/ath79/generic/version.buildinfo     out/images/ 2>/dev/null || true
+      - name: Build (sysupgrade + initramfs)
+        run: |
+          set +e
+          make -j"$(nproc)" V=s 2>&1 | tee logs/build.log
+          rc=${PIPESTATUS[0]}
+          ls -l bin/targets/ath79/generic/ | tee logs/bin-list.txt
+          sha256sum bin/targets/ath79/generic/*cf-wa350* 2>/dev/null | tee logs/images.sha256
+          exit "$rc"
 
-          KD="$(ls -d build_dir/target-*/linux-ath79_generic 2>/dev/null | head -1)"
-          echo "=== kernel dir: ${KD:-none} ==="
-          if [ -n "${KD:-}" ]; then
-            for f in vmlinux vmlinuz vmlinux.elf vmlinuz.elf System.map; do
-              [ -e "$KD/$f" ] && cp -v "$KD/$f" out/kernel/ || true
-            done
-            [ -e "$KD/.config" ] && cp -v "$KD/.config" out/kernel/kernel-dot-config || true
-            gzip -9f out/kernel/vmlinux 2>/dev/null || true
-            find build_dir/target-*/ -maxdepth 4 -name '*kernel*.bin' -exec cp -v {} out/kernel/ \; 2>/dev/null || true
-            find "$KD" -name '*cf-wa350*.dtb'  -exec cp -v {} out/dtb/ \; 2>/dev/null || true
-            find "$KD" -name '*cf-wa350*.dts*' -exec cp -v {} out/dtb/ \; 2>/dev/null || true
-            mkdir -p out/dtb/all-built
-            find "$KD" -name '*.dtb' -exec cp {} out/dtb/all-built/ \; 2>/dev/null || true
-          fi
+      - name: Identity card
+        if: always()
+        run: |
+          set +e
+          {
+            echo "commit = ${{ inputs.openwrt_commit }}"
+            cat logs/variant.txt 2>/dev/null
+            sed 's/^/patch  = /' logs/patches-injected.txt 2>/dev/null
+            echo "kernel = 6.18$(grep -m1 'LINUX_VERSION-6.18' target/linux/generic/kernel-6.18 2>/dev/null | sed 's/.*= //')"
+            echo "date   = $(date -u +%FT%TZ)"
+            echo "runner = $RUNNER_NAME"
+          } > logs/00-identity.txt
+          cat logs/00-identity.txt
+          exit 0
 
-          echo "=== injected / device files as they ended up in the tree ==="
-          cp -v target/linux/ath79/dts/qca9563_comfast_cf-wa350.dts              out/injected/ 2>/dev/null || true
-          cp -v target/linux/ath79/generic/base-files/etc/board.d/01_leds        out/injected/ 2>/dev/null || true
-          cp -v target/linux/ath79/generic/base-files/etc/board.d/02_network     out/injected/ 2>/dev/null || true
-          cp -v target/linux/ath79/image/generic.mk                              out/injected/ 2>/dev/null || true
-          cp -v target/linux/ath79/patches-*/*ar8216*.patch                      out/injected/ 2>/dev/null || true
-          cp -v .config                                                          out/injected/dot-config 2>/dev/null || true
-          [ -e patch_openwrt.py ] && cp -v patch_openwrt.py out/injected/ || true
-          [ -d dts ]      && cp -rv dts      out/injected/dts-src      || true
-          [ -d patches ]  && cp -rv patches  out/injected/patches-src  || true
-          [ -d package/utils/cfw-leds ] && cp -rv package/utils/cfw-leds out/injected/cfw-leds || true
-
-          cp -v logs/* out/logs/ 2>/dev/null || true
-          sha256sum bin/targets/ath79/generic/*cf-wa350* > out/logs/40-sha256.txt 2>/dev/null || true
-
-          echo "=== uImage kernel size (bytes 12..15, big endian) ==="
-          for img in out/images/*cf-wa350-squashfs-sysupgrade.bin; do
-            [ -e "$img" ] || continue
-            printf '%s: ' "$(basename "$img")"
-            od -A d -t u4 -j 12 -N 4 --endian=big "$img" | head -1
-          done | tee -a out/logs/00-commit.txt
-
-          echo "=== bundle contents ==="
-          find out -type f | sort | sed 's|^|  |' | tee out/logs/50-bundle-list.txt
-          du -sh out/* 2>/dev/null | tee -a out/logs/50-bundle-list.txt
-
-      - name: Upload images
-        if: ${{ always() }}
+      - name: Upload artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: cf-wa350-${{ steps.sr.outputs.short }}-images
-          path: out/images/
-          if-no-files-found: warn
-          retention-days: 30
-
-      - name: Upload kernel, dtb, injected files and logs
-        if: ${{ always() }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: cf-wa350-${{ steps.sr.outputs.short }}-bundle
+          name: cf-wa350-v2-${{ inputs.dts_file }}-${{ github.run_number }}
           path: |
-            out/kernel/
-            out/dtb/
-            out/injected/
-            out/logs/
-          if-no-files-found: warn
+            logs/
+            bin/targets/ath79/generic/*cf-wa350*
           retention-days: 30
