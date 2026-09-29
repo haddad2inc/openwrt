@@ -49,7 +49,7 @@ jobs:
           mkdir -p logs /tmp/assets
           for f in "dts/${{ inputs.dts_file }}" ".config" \
                    "patches/731-ar8216-skip-phys-on-switch-internal-mdio-bus.patch" \
-                   "patches/740-mtd-spi-nor-macronix-restore-mx25l12805d-name-size.patch"; do
+                   "patches/740-mtd-spi-nor-macronix-restore-mx25l12805d-name.patch"; do
             git show "origin/ci-wa350:$f" > "/tmp/assets/$(basename "$f")" || exit 1
           done
           sha256sum /tmp/assets/* | tee logs/assets.sha256
