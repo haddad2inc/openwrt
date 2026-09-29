@@ -53,7 +53,9 @@ jobs:
           MM=6.18
           V="${{ inputs.kernel_ver }}"
           if [ -z "$V" ]; then
-            V="$MM$(grep -m1 "^LINUX_VERSION-$MM" "include/kernel-$MM" | sed 's/.*= *//')"
+            KF="target/linux/generic/kernel-$MM"
+            [ -f "$KF" ] || KF="include/kernel-$MM"
+            V="$MM$(grep -m1 "^LINUX_VERSION-$MM" "$KF" | sed 's/.*= *//')"
           fi
           if [ -z "$V" ] || [ "$V" = "$MM" ]; then
             echo "::error::cannot resolve kernel version from include/kernel-$MM"
