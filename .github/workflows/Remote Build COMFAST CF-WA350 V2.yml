@@ -76,17 +76,6 @@ on:
         default: false
         type: boolean
 
-      diag_kconfig:
-        description: 'Append diagnostic kernel config (LEDS_TRIGGER_PANIC, PANIC_TIMEOUT=10)'
-        required: false
-        default: false
-        type: boolean
-      inject_gcc_13:
-        description: 'Inject CONFIG_GCC_VERSION="13.4.0" into kernel config'
-        required: false
-        default: false
-        type: boolean
-
       import_cfw_leds:
         description: 'Import cfw-leds package into openwrt/package/utils/'
         required: false
@@ -139,8 +128,6 @@ jobs:
           echo "include_files : ${{ github.event.inputs.include_files }}"
           echo "patch_731     : ${{ github.event.inputs.patch_731 }}"
           echo "patch_740     : ${{ github.event.inputs.patch_740 }}"
-          echo "diag_kconfig  : ${{ github.event.inputs.diag_kconfig }}"
-          echo "inject_gcc_13 : ${{ github.event.inputs.inject_gcc_13 }}"
 
           if [ -n "$P1" ]; then
             LABEL1="${B1}-${P1}${SUFFIX_PART}"
@@ -305,8 +292,6 @@ jobs:
         echo "include_files         : ${{ github.event.inputs.include_files }}" >> "$LOGFILE"
         echo "patch_731 (input)     : ${{ github.event.inputs.patch_731 }}" >> "$LOGFILE"
         echo "patch_740 (input)     : ${{ github.event.inputs.patch_740 }}" >> "$LOGFILE"
-        echo "diag_kconfig (input)  : ${{ github.event.inputs.diag_kconfig }}" >> "$LOGFILE"
-        echo "inject_gcc_13 (input) : ${{ github.event.inputs.inject_gcc_13 }}" >> "$LOGFILE"
         echo "import_cfw_leds       : ${{ github.event.inputs.import_cfw_leds }}" >> "$LOGFILE"
         echo "attach_theme          : ${{ github.event.inputs.attach_theme }}" >> "$LOGFILE"
         echo "========================================" >> "$LOGFILE"
@@ -469,85 +454,6 @@ jobs:
         cd openwrt
         ./scripts/feeds update -a 2>&1 | tee -a "../$LOGFILE"
         ./scripts/feeds install -a 2>&1 | tee -a "../$LOGFILE"
-
-    # =====================================================================
-    # Append diagnostic kernel config (panic lamp)
-    # =====================================================================
-    - name: Append diagnostic kernel config (panic lamp)
-      if: ${{ github.event.inputs.diag_kconfig == 'true' }}
-      run: |
-        set -o pipefail
-        echo "=== Appending diagnostic kernel config (panic lamp) ===" | tee -a "$LOGFILE"
-
-        ATH79_DIR="openwrt/target/linux/ath79"
-        if [ ! -d "$ATH79_DIR" ]; then
-          echo "❌ ERROR: $ATH79_DIR not found" | tee -a "$LOGFILE"
-          exit 1
-        fi
-
-        KCFG=$(ls "$ATH79_DIR"/config-6.* 2>/dev/null | sort -V | tail -1)
-        if [ -z "$KCFG" ] || [ ! -f "$KCFG" ]; then
-          echo "❌ ERROR: no ath79 kernel config fragment (config-6.x) found" | tee -a "$LOGFILE"
-          ls -la "$ATH79_DIR" | tee -a "$LOGFILE"
-          exit 1
-        fi
-
-        echo "Target kernel config: $KCFG" | tee -a "$LOGFILE"
-
-        sed -i '/CONFIG_LEDS_TRIGGER_PANIC/d;/CONFIG_PANIC_TIMEOUT/d' "$KCFG"
-        printf 'CONFIG_LEDS_TRIGGER_PANIC=y\nCONFIG_PANIC_TIMEOUT=10\n' >> "$KCFG"
-
-        echo "=== Last 5 lines of $KCFG ===" | tee -a "$LOGFILE"
-        tail -5 "$KCFG" | tee -a "$LOGFILE"
-
-        echo "DIAG_KCONFIG=1 ($KCFG)" >> "$GITHUB_ENV"
-        echo "✅ Diagnostic kernel config appended." | tee -a "$LOGFILE"
-
-    - name: Skip diag_kconfig notice
-      if: ${{ github.event.inputs.diag_kconfig != 'true' }}
-      run: |
-        echo "=== diag_kconfig=false → skipping diagnostic kernel config ===" | tee -a "$LOGFILE"
-
-    # =====================================================================
-    # Inject CONFIG_GCC_VERSION="13.4.0"
-    # =====================================================================
-    - name: Inject GCC 13.4.0 version override
-      if: ${{ github.event.inputs.inject_gcc_13 == 'true' }}
-      run: |
-        set -o pipefail
-        echo "=== Injecting CONFIG_GCC_VERSION=\"13.4.0\" ===" | tee -a "$LOGFILE"
-
-        ATH79_DIR="openwrt/target/linux/ath79"
-        if [ ! -d "$ATH79_DIR" ]; then
-          echo "❌ ERROR: $ATH79_DIR not found" | tee -a "$LOGFILE"
-          exit 1
-        fi
-
-        KCFG=$(ls "$ATH79_DIR"/config-6.* 2>/dev/null | sort -V | tail -1)
-        if [ -z "$KCFG" ] || [ ! -f "$KCFG" ]; then
-          echo "❌ ERROR: no ath79 kernel config fragment (config-6.x) found" | tee -a "$LOGFILE"
-          ls -la "$ATH79_DIR" | tee -a "$LOGFILE"
-          exit 1
-        fi
-
-        echo "Target kernel config: $KCFG" | tee -a "$LOGFILE"
-
-        echo "--- Before modification ---" | tee -a "$LOGFILE"
-        grep -n "CONFIG_GCC_VERSION" "$KCFG" | tee -a "$LOGFILE" || echo "(CONFIG_GCC_VERSION not found — will be added)" | tee -a "$LOGFILE"
-
-        sed -i '/CONFIG_GCC_VERSION/d' "$KCFG"
-        printf 'CONFIG_GCC_VERSION="13.4.0"\n' >> "$KCFG"
-
-        echo "--- After modification ---" | tee -a "$LOGFILE"
-        grep -n "CONFIG_GCC_VERSION" "$KCFG" | tee -a "$LOGFILE"
-
-        echo "GCC_VERSION_INJECTED=1 ($KCFG)" >> "$GITHUB_ENV"
-        echo "✅ GCC version override injected." | tee -a "$LOGFILE"
-
-    - name: Skip inject_gcc_13 notice
-      if: ${{ github.event.inputs.inject_gcc_13 != 'true' }}
-      run: |
-        echo "=== inject_gcc_13=false → skipping GCC version override ===" | tee -a "$LOGFILE"
 
     # =====================================================================
     # Select DTS variant (with SHA preservation)
@@ -994,8 +900,6 @@ jobs:
         echo "DTS SHA        : ${SELECTED_DTS_SHA256:-<unknown>}" | tee -a "$LOGFILE"
         echo "Patch 731      : ${{ env.INCLUDE_731 }}" | tee -a "$LOGFILE"
         echo "Patch 740      : ${{ env.INCLUDE_740 }}" | tee -a "$LOGFILE"
-        echo "Diag kconfig   : ${{ github.event.inputs.diag_kconfig }}" | tee -a "$LOGFILE"
-        echo "GCC 13.4.0     : ${{ github.event.inputs.inject_gcc_13 }}" | tee -a "$LOGFILE"
         echo "Build started at: $(date)" | tee -a "$LOGFILE"
         cd openwrt
         make -j$(nproc) V=s 2>&1 | tee -a "../$LOGFILE"
@@ -1088,15 +992,6 @@ jobs:
         echo "patch_740 input: ${{ github.event.inputs.patch_740 }}" | tee -a out/logs/41-build-choices.txt
         echo "INCLUDE_731    : ${INCLUDE_731:-<unset>}" | tee -a out/logs/41-build-choices.txt
         echo "INCLUDE_740    : ${INCLUDE_740:-<unset>}" | tee -a out/logs/41-build-choices.txt
-        echo "diag_kconfig   : ${{ github.event.inputs.diag_kconfig }}" | tee -a out/logs/41-build-choices.txt
-        echo "inject_gcc_13  : ${{ github.event.inputs.inject_gcc_13 }}" | tee -a out/logs/41-build-choices.txt
-
-        echo "=== Verify panic lamp & GCC version in built kernel config ===" | tee -a out/logs/42-panic-lamp.txt
-        if [ -f out/kernel/kernel-dot-config ]; then
-          grep -E 'CONFIG_LEDS_TRIGGER_PANIC|CONFIG_PANIC_TIMEOUT|CONFIG_GCC_VERSION' out/kernel/kernel-dot-config | tee -a out/logs/42-panic-lamp.txt || echo "(no matching entries)" | tee -a out/logs/42-panic-lamp.txt
-        else
-          echo "(kernel .config not collected)" | tee -a out/logs/42-panic-lamp.txt
-        fi
 
         echo "=== uImage kernel size (bytes 12..15, big endian) ===" | tee -a "../$LOGFILE"
         for img in out/images/*cf-wa350-squashfs-sysupgrade.bin; do
