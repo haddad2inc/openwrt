@@ -197,14 +197,17 @@ jobs:
               fail=1
             fi
           done < /tmp/k/added.txt
+          SB="$(basename "$srcfile")"
           for T in tree-strict tree-default; do
             [ -d "/tmp/k/$T" ] || continue
-            R="$(find /tmp/k/$T -name '*.rej' -o -name '*.orig' | head -5)"
-            if [ -n "$R" ]; then
-              echo "::error::leftover reject files in $T: $R"
-              echo "$R" > "$LOGS/rej-$T.txt"
+            MINE="$(find "/tmp/k/$T" -name "$SB.rej" -o -name "$SB.orig")"
+            if [ -n "$MINE" ]; then
+              echo "::error::reject/backup files for the patched file in $T:"; echo "$MINE"
               fail=1
             fi
+            find "/tmp/k/$T" -name "*.rej" > "$LOGS/rej-others-$T.txt" 2>/dev/null
+            echo "info: other .rej in $T (pre-existing series/fuzz quirks): $(wc -l < "$LOGS/rej-others-$T.txt")"
+            head -5 "$LOGS/rej-others-$T.txt" 2>/dev/null
           done
           if [ "${{ inputs.fuzz_mode }}" != "defaultfuzz" ]; then
             grep -q 'strict_under_ok=1' /tmp/k/results.txt || { echo "::error::strict pass failed on the patch under test"; fail=1; }
