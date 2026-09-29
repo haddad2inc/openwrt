@@ -1,7 +1,8 @@
-# patch-apply-check.yml â€” v2
-# Ø¨ÙˆØ§Ø¨Ø© ØªØ·Ø¨ÙŠÙ‚ Ø±Ù‚Ø¹Ø© Ù†ÙˆØ§Ø© Ø¯Ø§Ø®Ù„ Ø§Ù„Ø³Ù„Ø³Ù„Ø© Ø§Ù„ÙƒØ§Ù…Ù„Ø©ØŒ Ø¨Ù„Ø§ toolchain ÙˆØ¨Ù„Ø§ ØµÙˆØ±.
-# v2: ÙƒÙ„ Ø®Ø·ÙˆØ© ØªØ¨Ø¯Ø£ Ø¨Ù€ set +e ÙˆØªØ®ØªÙ… Ø¨Ù€ exit ØµØ±ÙŠØ­ (GitHub ÙŠØ´ØºÙ‘Ù„ bash -eo pipefail)ØŒ
-#     ÙˆØ¥ØµØ¯Ø§Ø± Ø§Ù„Ù†ÙˆØ§Ø© ÙŠÙÙ‚Ø±Ø£ Ù…Ù† include/kernel-6.18 Ù…Ø¨Ø§Ø´Ø±Ø© Ø¨Ù„Ø§ Ø£Ù†Ø§Ø¨ÙŠØ¨ Ù‡Ø´Ù‘Ø©.
+# patch-apply-check.yml - v2
+# Kernel patch series apply gate: no toolchain, no images, logs as artifacts.
+# v2: every step starts with set +e and ends with an explicit exit, because
+#     GitHub runs run-steps with bash -eo pipefail; the kernel version is read
+#     straight from include/kernel-6.18 with no fragile pipes.
 name: patch-apply-check
 
 on:
@@ -87,7 +88,7 @@ jobs:
                    "https://sourcescdn.openwrt.org/linux-$V.tar.xz"; do
             if curl -fsSL --retry 3 --connect-timeout 20 -o linux.tar.xz "$U"; then ok=1; break; fi
           done
-          if [ "$ok" != 1 ]; then echo "::error::all kernel mirrors failed for $V"; exit 1; fi
+          if [ "$ok" != 1 ]; then { echo "::error::all kernel mirrors failed for $V"; exit 1; }; fi
           sha256sum linux.tar.xz | tee "$GITHUB_WORKSPACE/logs/kernel-tarball.sha256"
           exit 0
 
@@ -166,4 +167,91 @@ jobs:
             n=$((n+1))
             if patch -p1 -f -s -i "$GITHUB_WORKSPACE/$p" >> "$LOGS/apply-default.log" 2>&1; then
               echo "OK   $n/$total $p" >> "$LOGS/apply-default-summary.txt"
-            elif [ "$(basename "$p")" = "$UNDER tìÑ¡•¸(€€€€€€€€€€€€€€•¡¼€‰%0€‘¸¼‘Ñ½Ñ…°€‘À€€ð´´AQ U9HQMPˆ€øø€ˆ‘1=L½…ÁÁ±äµ‘•™…Õ±ÐµÍÕµµ…Éä¹ÑáÐˆ(€€€€€€€€€€€€€¡…ÉôÀ(€€€€€€€€€€€•±Í”(€€€€€€€€€€€€€•¡¼€‰M-%@€‘¸¼‘Ñ½Ñ…°€‘À€¡ÁÉ”µ•á¥ÍÑ¥¹œÍ•É¥•Ì½™Õéè¥ÍÍÕ”°¹½ÐÑ¡”Á…Ñ Õ¹‘•ÈÑ•ÍÐ¤ˆ€øø€ˆ‘1=L½…ÁÁ±äµ‘•™…Õ±ÐµÍÕµµ…Éä¹ÑáÐˆ(€€€€€€€€€€€™¤(€€€€€€€€€‘½¹”€ð€½ÑµÀ½¬½Í•É¥•Ì¹ÑáÐ(€€€€€€€€€•¡¼€‰‘•™…Õ±Ñ}Õ¹‘•É}½¬ô‘¡…Éˆ€øø€½ÑµÀ½¬½É•ÍÕ±ÑÌ¹ÑáÐ(€€€€€€€€€Ñ…¥°€´Ì€ˆ‘1=L½…ÁÁ±äµ‘•™…Õ±ÐµÍÕµµ…Éä¹ÑáÐˆ(€€€€€€€€€•á¥Ð€À((€€€€€€´¹…µ”è…Ñ•Ì(€€€€€€€ÉÕ¸èð(€€€€€€€€€Í•Ð€­”(€€€€€€€€€1=Lôˆ‘%Q!U	}]=I-MA½±½Ìˆ(€€€€€€€€€U9I}AQ ôˆ‘íì¥¹ÁÕÑÌ¹Á…Ñ¡}Á…Ñ õôˆ(€€€€€€€€€™…¥°ôÀ(€€€€€€€€€ÍÉ™¥±”ôˆ¡É•À€µ´Ä€x¬¬¬ˆ¼œ€ˆ‘U9I}AQ ˆðÕÐ€µŒÜ´¤ˆ(€€€€€€€€€•¡¼€‰Á…Ñ¡•™¥±”€ô€‘ÍÉ™¥±”ˆðÑ•”€ˆ‘1=L½Á…Ñ¡•µ™¥±”¹ÑáÐˆ(€€€€€€€€€É•À€x¬œ€ˆ‘U9I}AQ ˆðÉ•À€µØ€x¬¬¬œðÍ•€Ì½x¬¼¼œðÉ•À€µØ€ymléÍÁ…”éut¨œ€ø€½ÑµÀ½¬½…‘‘•¹ÑáÐ(€€€€€€€€€Ý¡¥±”%LôÉ•…€µÈ°ì‘¼(€€€€€€€€€€€¥˜É•À€µÅ€ˆ‘°ˆ€ˆ½ÑµÀ½¬½ÑÉ•”µÍÑÉ¥Ð¼‘ÍÉ™¥±”ˆìÑ¡•¸(€€€€€€€€€€€€€•¡¼€‰ÁÉ•Í•¹Ðè€‘°ˆ(€€€€€€€€€€€•±Í”(€€€€€€€€€€€€€•¡¼€ˆèé•ÉÉ½Èèé…‘‘•±¥¹”µ¥ÍÍ¥¹œ…™Ñ•È…ÁÁ±äè€‘°ˆ(€€€€€€€€€€€€€™…¥°ôÄ(€€€€€€€€€€€™¤(€€€€€€€€€‘½¹”€ð€½ÑµÀ½¬½…‘‘•¹ÑáÐ(€€€€€€€€€™½ÈP¥¸ÑÉ•”µÍÑÉ¥ÐÑÉ•”µ‘•™…Õ±Ðì‘¼(€€€€€€€€€€€l€µ€ˆ½ÑµÀ½¬¼‘Pˆtñð½¹Ñ¥¹Õ”(€€€€€€€€€€€Hôˆ¡™¥¹€½ÑµÀ½¬¼‘P€µ¹…µ”€œ¨¹É•¨œ€µ¼€µ¹…µ”€œ¨¹½É¥œœð¡•…€´Ô¤ˆ(€€€€€€€€€€€¥˜l€µ¸€ˆ‘HˆtìÑ¡•¸(€€€€€€€€€€€€€•¡¼€ˆèé•ÉÉ½Èèé±•™Ñ½Ù•ÈÉ•©•Ð™¥±•Ì¥¸€‘Pè€‘Hˆ(€€€€€€€€€€€€€•¡¼€ˆ‘Hˆ€ø€ˆ‘1=L½É•¨´‘P¹ÑáÐˆ(€€€€€€€€€€€€€™…¥°ôÄ(€€€€€€€€€€€™¤(€€€€€€€€€‘½¹”(€€€€€€€€€¥˜l€ˆ‘íì¥¹ÁÕÑÌ¹™Õéé}µ½‘”õôˆ€„ô€‰‘•™…Õ±Ñ™ÕéèˆtìÑ¡•¸(€€€€€€€€€€€É•À€µÄ€ÍÑÉ¥Ñ}Õ¹‘•É}½¬ôÄœ€½ÑµÀ½¬½É•ÍÕ±ÑÌ¹ÑáÐñðì•¡¼€ˆèé•ÉÉ½ÈèéÍÑÉ¥ÐÁ…ÍÌ™…¥±•½¸Ñ¡”Á…Ñ Õ¹‘•ÈÑ•ÍÐˆì™…¥°ôÄìô(€€€€€€€€€™¤(€€€€€€€€€¥˜l€ˆ‘íì¥¹ÁÕÑÌ¹™Õéé}µ½‘”õôˆ€„ô€‰ÍÑÉ¥ÐˆtìÑ¡•¸(€€€€€€€€€€€É•À€µÄ€‘•™…Õ±Ñ}Õ¹‘•É}½¬ôÄœ€½ÑµÀ½¬½É•ÍÕ±ÑÌ¹ÑáÐñðì•¡¼€ˆèé•ÉÉ½Èèé‘•™…Õ±Ðµ™ÕéèÁ…ÍÌ™…¥±•½¸Ñ¡”Á…Ñ Õ¹‘•ÈÑ•ÍÐˆì™…¥°ôÄìô(€€
+            elif [ "$(basename "$p")" = "$UNDER" ]; then
+              echo "FAIL $n/$total $p  <-- PATCH UNDER TEST" >> "$LOGS/apply-default-summary.txt"
+              hard=0
+            else
+              echo "SKIP $n/$total $p (pre-existing series/fuzz issue, not the patch under test)" >> "$LOGS/apply-default-summary.txt"
+            fi
+          done < /tmp/k/series.txt
+          echo "default_under_ok=$hard" >> /tmp/k/results.txt
+          tail -3 "$LOGS/apply-default-summary.txt"
+          exit 0
+
+      - name: Gates
+        run: |
+          set +e
+          LOGS="$GITHUB_WORKSPACE/logs"
+          UNDER_PATH="${{ inputs.patch_path }}"
+          fail=0
+          srcfile="$(grep -m1 '^+++ b/' "$UNDER_PATH" | cut -c7-)"
+          echo "patched file = $srcfile" | tee "$LOGS/patched-file.txt"
+          grep '^+' "$UNDER_PATH" | grep -v '^+++' | sed 's/^+//' | grep -v '^[[:space:]]*$' > /tmp/k/added.txt
+          while IFS= read -r l; do
+            if grep -qF "$l" "/tmp/k/tree-strict/$srcfile"; then
+              echo "present: $l"
+            else
+              echo "::error::added line missing after apply: $l"
+              fail=1
+            fi
+          done < /tmp/k/added.txt
+          for T in tree-strict tree-default; do
+            [ -d "/tmp/k/$T" ] || continue
+            R="$(find /tmp/k/$T -name '*.rej' -o -name '*.orig' | head -5)"
+            if [ -n "$R" ]; then
+              echo "::error::leftover reject files in $T: $R"
+              echo "$R" > "$LOGS/rej-$T.txt"
+              fail=1
+            fi
+          done
+          if [ "${{ inputs.fuzz_mode }}" != "defaultfuzz" ]; then
+            grep -q 'strict_under_ok=1' /tmp/k/results.txt || { echo "::error::strict pass failed on the patch under test"; fail=1; }
+          fi
+          if [ "${{ inputs.fuzz_mode }}" != "strict" ]; then
+            grep -q 'default_under_ok=1' /tmp/k/results.txt || { echo "::error::default-fuzz pass failed on the patch under test"; fail=1; }
+          fi
+          if [ -f /tmp/k/tree-strict/drivers/mtd/spi-nor/macronix.c ]; then
+            awk '/MX25L12805D/{f=1} f{print} f&&/^\t}, \{/{exit}' \
+              /tmp/k/tree-strict/drivers/mtd/spi-nor/macronix.c > "$LOGS/entry-after-strict.txt"
+            cat "$LOGS/entry-after-strict.txt"
+            for k in '.name = "mx25l12805d",' '.size = SZ_16M,' '.no_sfdp_flags = SECT_4K,'; do
+              c="$(grep -cF "$k" "$LOGS/entry-after-strict.txt")"
+              echo "count[$k] = $c (must be 1)"
+              [ "$c" = "1" ] || { echo "::error::duplicate or missing field: $k"; fail=1; }
+            done
+          fi
+          echo "gate_fail=$fail" >> /tmp/k/results.txt
+          exit "$fail"
+
+      - name: Step summary
+        if: always()
+        run: |
+          set +e
+          {
+            echo "## patch-apply-check"
+            echo '```'
+            cat logs/00-identity.txt 2>/dev/null
+            echo '```'
+            echo
+            echo "| mode | patch under test |"
+            echo "|---|---|"
+            grep -h 'under_ok' /tmp/k/results.txt 2>/dev/null | sed 's/_under_ok=/ -> /;s/1/OK/;s/0/FAIL/' | sed 's/^/| /;s/$/ |/'
+            echo
+            echo "Position in series:"
+            echo '```'
+            cat logs/patch-position.txt 2>/dev/null
+            echo '```'
+            echo "Entry after strict apply:"
+            echo '```c'
+            cat logs/entry-after-strict.txt 2>/dev/null
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: patch-apply-check-run-${{ github.run_number }}
+          path: logs/
+          retention-days: 30
