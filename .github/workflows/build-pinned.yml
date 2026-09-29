@@ -6,7 +6,7 @@ on:
       openwrt_commit:
         description: Exact SHA to build from haddad2inc/openwrt (hard-verified)
         required: false
-        default: 3ecebea434
+        default: 3ecebea4349ae036a23bcc79dd291f25f0a1cd87
         type: string
       dts_file:
         description: DTS variant from root dts/ folder on ci-wa350
