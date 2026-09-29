@@ -1,20 +1,20 @@
-=== BUILD LOG (primary) - Wed Sep 30 01:46:30 +03 2026 ===
+=== BUILD LOG (primary) - Wed Sep 30 02:16:31 +03 2026 ===
 Matrix slot           : primary
-Matrix label          : snapshot-latest-1st-no-cfw
+Matrix label          : snapshot-latest-files-theme
 Workflow triggered by : workflow_dispatch
 Repository            : haddad2inc/openwrt
-Commit                : d9cf9384e13f082ce5eb8ca14d35117595fb0569
+Commit                : 803252599c4570f45392ef347cedcb90b37d164d
 OpenWrt branch input  : snapshot
 OpenWrt git branch    : master
 OpenWrt tag           : <none>
 Patch version input   : <empty>
-Output suffix         : '1st-no-cfw'
+Output suffix         : 'files+theme'
 DTS choice            : qca9563_comfast_cf-wa350.dts
-include_files         : false
+include_files         : true
 patch_731 (input)     : true
 patch_740 (input)     : true
 import_cfw_leds       : false
-attach_theme          : false
+attach_theme          : true
 ========================================
-Build started at: Wed Sep 30 01:46:30 +03 2026
+Build started at: Wed Sep 30 02:16:31 +03 2026
 ========================================
