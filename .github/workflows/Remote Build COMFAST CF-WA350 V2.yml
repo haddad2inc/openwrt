@@ -1,0 +1,1177 @@
+name: Remote Build COMFAST CF-WA350 V2
+
+on:
+  workflow_dispatch:
+    inputs:
+      # ==============================================================
+      # Output suffix (TOP — applied to ALL artifact names)
+      # ==============================================================
+      output_suffix:
+        description: 'Optional suffix appended to all artifact names (e.g. "test1")'
+        required: false
+        default: ''
+        type: string
+
+      enable_matrix:
+        description: '⚡ Matrix Mode: build TWO versions in parallel'
+        required: false
+        default: false
+        type: boolean
+
+      openwrt_branch:
+        description: 'Primary: OpenWrt branch'
+        required: true
+        default: 'snapshot'
+        type: choice
+        options:
+          - 'snapshot'
+          - '24.10'
+          - '25.12'
+      patch_version:
+        description: 'Primary: Patch version ("4" or "25.12.4" or empty for latest)'
+        required: false
+        default: ''
+        type: string
+
+      openwrt_branch_2:
+        description: 'Secondary: OpenWrt branch'
+        required: false
+        default: '25.12'
+        type: choice
+        options:
+          - 'snapshot'
+          - '24.10'
+          - '25.12'
+      patch_version_2:
+        description: 'Secondary: Patch version (used only if Matrix Mode ON)'
+        required: false
+        default: ''
+        type: string
+
+      dts_choice:
+        description: 'DTS variant to use for CF-WA350'
+        required: true
+        default: 'qca9563_comfast_cf-wa350.dts'
+        type: choice
+        options:
+          - 'qca9563_comfast_cf-wa350.dts'
+          - 'qca9563_comfast_cf-wa350-internal-mdio.dts'
+          - 'qca9563_comfast_cf-wa350-explicit-mdio.dts'
+          - 'qca9563_comfast_cf-wa350-external.dts'
+
+      include_files:
+        description: 'Inject custom files from "files" directory (building-helper)'
+        required: false
+        default: false
+        type: boolean
+
+      patch_731:
+        description: 'Include patch 731 (ar8216-skip-phys-on-switch-internal-mdio-bus)'
+        required: false
+        default: false
+        type: boolean
+      patch_740:
+        description: 'Include patch 740 (mtd-spi-nor-macronix-restore-mx25l12805d-name-size)'
+        required: false
+        default: false
+        type: boolean
+
+      diag_kconfig:
+        description: 'Append diagnostic kernel config (LEDS_TRIGGER_PANIC, PANIC_TIMEOUT=10)'
+        required: false
+        default: false
+        type: boolean
+      inject_gcc_13:
+        description: 'Inject CONFIG_GCC_VERSION="13.4.0" into kernel config'
+        required: false
+        default: false
+        type: boolean
+
+      import_cfw_leds:
+        description: 'Import cfw-leds package into openwrt/package/utils/'
+        required: false
+        default: true
+        type: boolean
+      attach_theme:
+        description: 'Import luci-theme-enan-dashboard package and enable it in .config'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  REPO_URL: https://git.openwrt.org/openwrt/openwrt.git
+  BUILDING_HELPER_REPO: https://github.com/haddad2inc/building-helper.git
+  TZ: Asia/Riyadh
+
+jobs:
+  prepare:
+    runs-on: ubuntu-22.04
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Generate build matrix
+        id: set-matrix
+        run: |
+          ENABLE_MATRIX="${{ github.event.inputs.enable_matrix }}"
+          B1="${{ github.event.inputs.openwrt_branch }}"
+          P1="${{ github.event.inputs.patch_version }}"
+          B2="${{ github.event.inputs.openwrt_branch_2 }}"
+          P2="${{ github.event.inputs.patch_version_2 }}"
+          SUFFIX_RAW="${{ github.event.inputs.output_suffix }}"
+
+          [ -z "$P1" ] && P1=""
+          [ -z "$P2" ] && P2=""
+
+          # Sanitize suffix: allow only A-Z a-z 0-9 . _ -
+          SUFFIX=$(echo "$SUFFIX_RAW" | sed 's/[^A-Za-z0-9._-]/-/g' | sed 's/^-\+//;s/-\+$//')
+          if [ -n "$SUFFIX" ]; then
+            SUFFIX_PART="-${SUFFIX}"
+          else
+            SUFFIX_PART=""
+          fi
+
+          echo "=== Matrix input summary ==="
+          echo "enable_matrix : $ENABLE_MATRIX"
+          echo "output_suffix : '${SUFFIX_RAW}' (sanitized: '${SUFFIX}')"
+          echo "Primary       : branch='$B1' patch='$P1'"
+          echo "Secondary     : branch='$B2' patch='$P2'"
+          echo "dts_choice    : ${{ github.event.inputs.dts_choice }}"
+          echo "include_files : ${{ github.event.inputs.include_files }}"
+          echo "patch_731     : ${{ github.event.inputs.patch_731 }}"
+          echo "patch_740     : ${{ github.event.inputs.patch_740 }}"
+          echo "diag_kconfig  : ${{ github.event.inputs.diag_kconfig }}"
+          echo "inject_gcc_13 : ${{ github.event.inputs.inject_gcc_13 }}"
+
+          if [ -n "$P1" ]; then
+            LABEL1="${B1}-${P1}${SUFFIX_PART}"
+          else
+            LABEL1="${B1}-latest${SUFFIX_PART}"
+          fi
+
+          if [ "$ENABLE_MATRIX" = "true" ]; then
+            if [ -n "$P2" ]; then
+              LABEL2="${B2}-${P2}${SUFFIX_PART}"
+            else
+              LABEL2="${B2}-latest${SUFFIX_PART}"
+            fi
+
+            MATRIX=$(jq -n \
+              --arg b1 "$B1" --arg p1 "$P1" --arg l1 "$LABEL1" \
+              --arg b2 "$B2" --arg p2 "$P2" --arg l2 "$LABEL2" \
+              '{include:[
+                {slot:"primary",branch:$b1,patch:$p1,label:$l1},
+                {slot:"secondary",branch:$b2,patch:$p2,label:$l2}
+              ]}')
+          else
+            MATRIX=$(jq -n \
+              --arg b1 "$B1" --arg p1 "$P1" --arg l1 "$LABEL1" \
+              '{include:[
+                {slot:"primary",branch:$b1,patch:$p1,label:$l1}
+              ]}')
+          fi
+
+          echo "=== Generated matrix ==="
+          echo "$MATRIX" | jq .
+
+          {
+            echo "matrix<<EOF_MATRIX"
+            echo "$MATRIX"
+            echo "EOF_MATRIX"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    permissions:
+      contents: write
+    env:
+      LOGFILE: build-${{ matrix.slot }}.log
+
+    steps:
+    - name: Checkout your repo
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Check disk space before build
+      run: |
+        echo "=== Disk space before build (${{ matrix.slot }}) ==="
+        df -h
+        du -sh . 2>/dev/null || true
+
+    - name: Resolve OpenWrt branch and version
+      run: |
+        BRANCH_INPUT="${{ matrix.branch }}"
+        PATCH_INPUT="${{ matrix.patch }}"
+
+        case "$BRANCH_INPUT" in
+          snapshot)
+            REF="master"
+            SERIES=""
+            ;;
+          24.10)
+            REF="openwrt-24.10"
+            SERIES="24.10"
+            ;;
+          25.12)
+            REF="openwrt-25.12"
+            SERIES="25.12"
+            ;;
+          *)
+            echo "❌ ERROR: Unknown branch '$BRANCH_INPUT'"
+            exit 1
+            ;;
+        esac
+
+        echo "=== Resolved branch selection (slot: ${{ matrix.slot }}) ==="
+        echo "Branch input    : $BRANCH_INPUT"
+        echo "Git branch      : $REF"
+        echo "Branch series   : ${SERIES:-<none>}"
+        echo "Patch input     : ${PATCH_INPUT:-<empty>}"
+
+        if [ "$BRANCH_INPUT" = "snapshot" ]; then
+          if [ -n "$PATCH_INPUT" ]; then
+            echo "⚠️ WARNING: patch_version provided but branch is 'snapshot' → ignoring."
+          fi
+          TAG=""
+          echo "✅ Snapshot branch → using latest commit from '$REF' (no tag)."
+        else
+          if [ -n "$PATCH_INPUT" ]; then
+            if echo "$PATCH_INPUT" | grep -q '\.'; then
+              TAG="v${PATCH_INPUT}"
+              echo "Patch input contains dots → using as full version: $TAG"
+            elif [ -n "$SERIES" ]; then
+              TAG="v${SERIES}.${PATCH_INPUT}"
+              echo "Patch input is a number → combined with series: $TAG"
+            else
+              echo "❌ ERROR: Cannot combine patch '$PATCH_INPUT' with branch '$BRANCH_INPUT'"
+              exit 1
+            fi
+          else
+            echo "No patch version specified, looking for latest tag in series '$SERIES'..."
+            LATEST_TAG=$(git ls-remote --tags "$REPO_URL" "v${SERIES}.*" 2>/dev/null \
+              | awk -F'refs/tags/' '{print $2}' \
+              | grep -v '\^{}' \
+              | grep -E "^v${SERIES}\.[0-9]+$" \
+              | sort -V \
+              | tail -n1)
+            if [ -z "$LATEST_TAG" ]; then
+              echo "❌ ERROR: Could not find any tag for series '$SERIES'"
+              exit 1
+            fi
+            TAG="$LATEST_TAG"
+            echo "Auto-detected latest tag: $TAG"
+          fi
+
+          if ! git ls-remote --tags "$REPO_URL" "$TAG" | grep -q "refs/tags/$TAG"; then
+            echo "❌ ERROR: Tag '$TAG' does not exist on $REPO_URL"
+            echo "--- Last 15 tags available on remote ---"
+            git ls-remote --tags "$REPO_URL" 2>&1 \
+              | awk -F'refs/tags/' '{print $2}' \
+              | grep -v '\^{}' \
+              | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+              | sort -V \
+              | tail -15
+            exit 1
+          fi
+
+          echo "✅ Using tag: $TAG"
+        fi
+
+        echo "OPENWRT_REF=$REF" >> "$GITHUB_ENV"
+        echo "OPENWRT_TAG=$TAG" >> "$GITHUB_ENV"
+        echo "OPENWRT_BRANCH_INPUT=$BRANCH_INPUT" >> "$GITHUB_ENV"
+        echo "OPENWRT_PATCH_INPUT=$PATCH_INPUT" >> "$GITHUB_ENV"
+        echo "OPENWRT_LABEL=${{ matrix.label }}" >> "$GITHUB_ENV"
+        echo "OUTPUT_SUFFIX=${{ github.event.inputs.output_suffix }}" >> "$GITHUB_ENV"
+
+    - name: Initialize build log
+      run: |
+        echo "=== BUILD LOG (${{ matrix.slot }}) - $(date) ===" > "$LOGFILE"
+        echo "Matrix slot           : ${{ matrix.slot }}" >> "$LOGFILE"
+        echo "Matrix label          : ${{ matrix.label }}" >> "$LOGFILE"
+        echo "Workflow triggered by : ${{ github.event_name }}" >> "$LOGFILE"
+        echo "Repository            : ${{ github.repository }}" >> "$LOGFILE"
+        echo "Commit                : ${{ github.sha }}" >> "$LOGFILE"
+        echo "OpenWrt branch input  : $OPENWRT_BRANCH_INPUT" >> "$LOGFILE"
+        echo "OpenWrt git branch    : $OPENWRT_REF" >> "$LOGFILE"
+        echo "OpenWrt tag           : ${OPENWRT_TAG:-<none>}" >> "$LOGFILE"
+        echo "Patch version input   : ${OPENWRT_PATCH_INPUT:-<empty>}" >> "$LOGFILE"
+        echo "Output suffix         : '${OUTPUT_SUFFIX:-<empty>}'" >> "$LOGFILE"
+        echo "DTS choice            : ${{ github.event.inputs.dts_choice }}" >> "$LOGFILE"
+        echo "include_files         : ${{ github.event.inputs.include_files }}" >> "$LOGFILE"
+        echo "patch_731 (input)     : ${{ github.event.inputs.patch_731 }}" >> "$LOGFILE"
+        echo "patch_740 (input)     : ${{ github.event.inputs.patch_740 }}" >> "$LOGFILE"
+        echo "diag_kconfig (input)  : ${{ github.event.inputs.diag_kconfig }}" >> "$LOGFILE"
+        echo "inject_gcc_13 (input) : ${{ github.event.inputs.inject_gcc_13 }}" >> "$LOGFILE"
+        echo "import_cfw_leds       : ${{ github.event.inputs.import_cfw_leds }}" >> "$LOGFILE"
+        echo "attach_theme          : ${{ github.event.inputs.attach_theme }}" >> "$LOGFILE"
+        echo "========================================" >> "$LOGFILE"
+        echo "Build started at: $(date)" >> "$LOGFILE"
+        echo "========================================" >> "$LOGFILE"
+
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+        git add "$LOGFILE"
+        git commit -m "Init ${{ matrix.slot }} log for run ${{ github.run_id }}" || true
+
+        for attempt in 1 2 3 4 5; do
+          git pull --rebase origin main 2>/dev/null || true
+          if git push origin main 2>/dev/null; then
+            echo "✅ Log pushed (attempt $attempt)"
+            break
+          fi
+          echo "Push attempt $attempt failed, retrying in 5s..."
+          sleep 5
+        done
+
+    - name: Import building-helper repository (all files/folders)
+      run: |
+        set -o pipefail
+        echo "=== Importing building-helper repository ===" | tee -a "$LOGFILE"
+        BUILD_HELPER_DIR="/tmp/building-helper"
+
+        rm -rf "$BUILD_HELPER_DIR"
+        if git clone --depth 1 "$BUILDING_HELPER_REPO" "$BUILD_HELPER_DIR" 2>&1 | tee -a "$LOGFILE"; then
+          echo "✅ building-helper clone succeeded." | tee -a "$LOGFILE"
+        else
+          echo "❌ building-helper clone FAILED." | tee -a "$LOGFILE"
+          exit 1
+        fi
+
+        rm -rf "$BUILD_HELPER_DIR/.git"
+
+        echo "=== Contents of building-helper (top-level) ===" | tee -a "$LOGFILE"
+        ls -la "$BUILD_HELPER_DIR" | tee -a "$LOGFILE"
+
+        if [ -f "$BUILD_HELPER_DIR/.config" ]; then
+          cp -v "$BUILD_HELPER_DIR/.config" . 2>&1 | tee -a "$LOGFILE"
+          echo "✅ .config copied to repo root." | tee -a "$LOGFILE"
+        else
+          echo "❌ ERROR: .config not found in building-helper." | tee -a "$LOGFILE"
+          exit 1
+        fi
+
+        if [ -f "$BUILD_HELPER_DIR/apply_patches.py" ]; then
+          cp -v "$BUILD_HELPER_DIR/apply_patches.py" . 2>&1 | tee -a "$LOGFILE"
+          echo "✅ apply_patches.py copied to repo root." | tee -a "$LOGFILE"
+        else
+          echo "❌ ERROR: apply_patches.py not found in building-helper." | tee -a "$LOGFILE"
+          exit 1
+        fi
+
+        if [ -d "$BUILD_HELPER_DIR/dts" ]; then
+          rm -rf dts
+          cp -rv "$BUILD_HELPER_DIR/dts" . 2>&1 | tee -a "$LOGFILE"
+          echo "✅ dts/ copied to repo root." | tee -a "$LOGFILE"
+          echo "--- Available DTS files ---" | tee -a "$LOGFILE"
+          ls -la dts/ | tee -a "$LOGFILE"
+        else
+          echo "❌ ERROR: dts/ not found in building-helper." | tee -a "$LOGFILE"
+          exit 1
+        fi
+
+        if [ -d "$BUILD_HELPER_DIR/patches" ]; then
+          rm -rf patches
+          cp -rv "$BUILD_HELPER_DIR/patches" . 2>&1 | tee -a "$LOGFILE"
+          echo "✅ patches/ copied to repo root (will be filtered later)." | tee -a "$LOGFILE"
+          echo "--- Available patches ---" | tee -a "$LOGFILE"
+          ls -la patches/ | tee -a "$LOGFILE"
+        else
+          echo "ℹ️ patches/ not found in building-helper (creating empty)." | tee -a "$LOGFILE"
+          mkdir -p patches
+        fi
+
+        if [ -d "$BUILD_HELPER_DIR/files" ]; then
+          rm -rf files
+          cp -rv "$BUILD_HELPER_DIR/files" . 2>&1 | tee -a "$LOGFILE"
+          echo "✅ files/ copied to repo root." | tee -a "$LOGFILE"
+        else
+          echo "ℹ️ files/ not found in building-helper (skipping)." | tee -a "$LOGFILE"
+        fi
+
+        echo "=== Copying any remaining top-level files ===" | tee -a "$LOGFILE"
+        for item in "$BUILD_HELPER_DIR"/*; do
+          [ -e "$item" ] || continue
+          base="$(basename "$item")"
+          case "$base" in
+            .config|apply_patches.py|dts|patches|files|cfw-leds|luci-theme-enan-dashboard)
+              echo "  (handled separately): $base" | tee -a "$LOGFILE"
+              ;;
+            *)
+              echo "  Copying extra file: $base" | tee -a "$LOGFILE"
+              cp -rv "$item" . 2>&1 | tee -a "$LOGFILE" || true
+              ;;
+          esac
+        done
+
+        echo "✅ building-helper import completed." | tee -a "$LOGFILE"
+
+    - name: Check if .config exists in repo root
+      run: |
+        echo "=== Checking for .config file ===" | tee -a "$LOGFILE"
+        if [ -f .config ]; then
+          echo "✅ .config file found in repository root." | tee -a "$LOGFILE"
+        else
+          echo "❌ ERROR: .config file not found in repository root!" | tee -a "$LOGFILE"
+          exit 1
+        fi
+
+    - name: Install CA certificates
+      run: |
+        echo "=== Installing CA certificates ===" | tee -a "$LOGFILE"
+        sudo apt-get update -qq
+        sudo apt-get install -y --no-install-recommends ca-certificates
+        sudo update-ca-certificates --fresh || true
+        echo "=== CA certificates installed ===" | tee -a "$LOGFILE"
+
+    - name: Initialize environment
+      run: |
+        echo "=== Initializing environment ===" | tee -a "$LOGFILE"
+        sudo apt update 2>&1 | tee -a "$LOGFILE"
+        sudo apt install -y build-essential clang flex bison g++ gawk \
+          gcc-multilib g++-multilib gettext libncurses5-dev libssl-dev \
+          python3-distutils rsync unzip zlib1g-dev file wget curl \
+          libelf-dev autoconf automake libtool binutils bzip2 \
+          diffutils patch perl sed xz-utils coreutils findutils bash 2>&1 | tee -a "$LOGFILE"
+        sudo apt clean 2>&1 | tee -a "$LOGFILE"
+        sudo rm -rf /var/lib/apt/lists/* 2>&1 | tee -a "$LOGFILE"
+
+    - name: Clone OpenWrt source
+      run: |
+        echo "=== Cloning OpenWrt source ===" | tee -a "$LOGFILE"
+        echo "Git branch : $OPENWRT_REF" | tee -a "$LOGFILE"
+        echo "Git tag    : ${OPENWRT_TAG:-<none - using latest commit>}" | tee -a "$LOGFILE"
+
+        git clone --depth 1 --branch "$OPENWRT_REF" "$REPO_URL" openwrt 2>&1 | tee -a "$LOGFILE"
+        cd openwrt
+
+        if [ -n "$OPENWRT_TAG" ]; then
+          echo "--- Fetching tag $OPENWRT_TAG ---" | tee -a "../$LOGFILE"
+          git fetch --depth 1 origin "refs/tags/$OPENWRT_TAG:refs/tags/$OPENWRT_TAG" 2>&1 | tee -a "../$LOGFILE"
+          git checkout "tags/$OPENWRT_TAG" 2>&1 | tee -a "../$LOGFILE"
+        else
+          echo "--- Snapshot mode: keeping latest commit from '$OPENWRT_REF' ---" | tee -a "../$LOGFILE"
+        fi
+
+        echo "=== Actual checked-out commit ===" | tee -a "../$LOGFILE"
+        git log -1 --oneline | tee -a "../$LOGFILE"
+
+        cd ..
+        rm -rf openwrt/.git 2>&1 | tee -a "$LOGFILE"
+
+    - name: Update & Install feeds
+      run: |
+        echo "=== Updating and installing feeds ===" | tee -a "$LOGFILE"
+        cd openwrt
+        ./scripts/feeds update -a 2>&1 | tee -a "../$LOGFILE"
+        ./scripts/feeds install -a 2>&1 | tee -a "../$LOGFILE"
+
+    # =====================================================================
+    # Append diagnostic kernel config (panic lamp)
+    # =====================================================================
+    - name: Append diagnostic kernel config (panic lamp)
+      if: ${{ github.event.inputs.diag_kconfig == 'true' }}
+      run: |
+        set -o pipefail
+        echo "=== Appending diagnostic kernel config (panic lamp) ===" | tee -a "$LOGFILE"
+
+        ATH79_DIR="openwrt/target/linux/ath79"
+        if [ ! -d "$ATH79_DIR" ]; then
+          echo "❌ ERROR: $ATH79_DIR not found" | tee -a "$LOGFILE"
+          exit 1
+        fi
+
+        KCFG=$(ls "$ATH79_DIR"/config-6.* 2>/dev/null | sort -V | tail -1)
+        if [ -z "$KCFG" ] || [ ! -f "$KCFG" ]; then
+          echo "❌ ERROR: no ath79 kernel config fragment (config-6.x) found" | tee -a "$LOGFILE"
+          ls -la "$ATH79_DIR" | tee -a "$LOGFILE"
+          exit 1
+        fi
+
+        echo "Target kernel config: $KCFG" | tee -a "$LOGFILE"
+
+        sed -i '/CONFIG_LEDS_TRIGGER_PANIC/d;/CONFIG_PANIC_TIMEOUT/d' "$KCFG"
+        printf 'CONFIG_LEDS_TRIGGER_PANIC=y\nCONFIG_PANIC_TIMEOUT=10\n' >> "$KCFG"
+
+        echo "=== Last 5 lines of $KCFG ===" | tee -a "$LOGFILE"
+        tail -5 "$KCFG" | tee -a "$LOGFILE"
+
+        echo "DIAG_KCONFIG=1 ($KCFG)" >> "$GITHUB_ENV"
+        echo "✅ Diagnostic kernel config appended." | tee -a "$LOGFILE"
+
+    - name: Skip diag_kconfig notice
+      if: ${{ github.event.inputs.diag_kconfig != 'true' }}
+      run: |
+        echo "=== diag_kconfig=false → skipping diagnostic kernel config ===" | tee -a "$LOGFILE"
+
+    # =====================================================================
+    # Inject CONFIG_GCC_VERSION="13.4.0"
+    # =====================================================================
+    - name: Inject GCC 13.4.0 version override
+      if: ${{ github.event.inputs.inject_gcc_13 == 'true' }}
+      run: |
+        set -o pipefail
+        echo "=== Injecting CONFIG_GCC_VERSION=\"13.4.0\" ===" | tee -a "$LOGFILE"
+
+        ATH79_DIR="openwrt/target/linux/ath79"
+        if [ ! -d "$ATH79_DIR" ]; then
+          echo "❌ ERROR: $ATH79_DIR not found" | tee -a "$LOGFILE"
+          exit 1
+        fi
+
+        KCFG=$(ls "$ATH79_DIR"/config-6.* 2>/dev/null | sort -V | tail -1)
+        if [ -z "$KCFG" ] || [ ! -f "$KCFG" ]; then
+          echo "❌ ERROR: no ath79 kernel config fragment (config-6.x) found" | tee -a "$LOGFILE"
+          ls -la "$ATH79_DIR" | tee -a "$LOGFILE"
+          exit 1
+        fi
+
+        echo "Target kernel config: $KCFG" | tee -a "$LOGFILE"
+
+        echo "--- Before modification ---" | tee -a "$LOGFILE"
+        grep -n "CONFIG_GCC_VERSION" "$KCFG" | tee -a "$LOGFILE" || echo "(CONFIG_GCC_VERSION not found — will be added)" | tee -a "$LOGFILE"
+
+        sed -i '/CONFIG_GCC_VERSION/d' "$KCFG"
+        printf 'CONFIG_GCC_VERSION="13.4.0"\n' >> "$KCFG"
+
+        echo "--- After modification ---" | tee -a "$LOGFILE"
+        grep -n "CONFIG_GCC_VERSION" "$KCFG" | tee -a "$LOGFILE"
+
+        echo "GCC_VERSION_INJECTED=1 ($KCFG)" >> "$GITHUB_ENV"
+        echo "✅ GCC version override injected." | tee -a "$LOGFILE"
+
+    - name: Skip inject_gcc_13 notice
+      if: ${{ github.event.inputs.inject_gcc_13 != 'true' }}
+      run: |
+        echo "=== inject_gcc_13=false → skipping GCC version override ===" | tee -a "$LOGFILE"
+
+    # =====================================================================
+    # Select DTS variant (with SHA preservation)
+    # =====================================================================
+    - name: Select DTS variant (with SHA preservation)
+      run: |
+        set -o pipefail
+        DTS_CHOICE="${{ github.event.inputs.dts_choice }}"
+        echo "=== Selecting DTS variant: $DTS_CHOICE ===" | tee -a "$LOGFILE"
+
+        SRC_DTS="dts/${DTS_CHOICE}"
+        DST_DTS="dts/qca9563_comfast_cf-wa350.dts"
+
+        if [ ! -f "$SRC_DTS" ]; then
+          echo "❌ ERROR: selected DTS '$SRC_DTS' not found." | tee -a "$LOGFILE"
+          ls -la dts/ | tee -a "$LOGFILE"
+          exit 1
+        fi
+
+        if [ "$SRC_DTS" = "$DST_DTS" ]; then
+          echo "✅ Selected DTS is the default one; nothing to replace." | tee -a "$LOGFILE"
+          DST_SHA=$(sha256sum "$DST_DTS" | awk '{print $1}')
+          echo "   SHA256 of $DST_DTS: $DST_SHA" | tee -a "$LOGFILE"
+        else
+          SRC_SHA=$(sha256sum "$SRC_DTS" | awk '{print $1}')
+          echo "   Selected source : $SRC_DTS" | tee -a "$LOGFILE"
+          echo "   Source SHA256   : $SRC_SHA" | tee -a "$LOGFILE"
+
+          echo "--- Removing any existing target file ---" | tee -a "$LOGFILE"
+          rm -fv "$DST_DTS" 2>&1 | tee -a "$LOGFILE" || true
+
+          echo "--- Copying selected file (preserving attributes) ---" | tee -a "$LOGFILE"
+          cp -pv "$SRC_DTS" "$DST_DTS" 2>&1 | tee -a "$LOGFILE"
+
+          DST_SHA=$(sha256sum "$DST_DTS" | awk '{print $1}')
+          echo "   Target SHA256   : $DST_SHA" | tee -a "$LOGFILE"
+
+          if [ "$SRC_SHA" = "$DST_SHA" ]; then
+            echo "✅ SHA256 preserved correctly ($DST_SHA)." | tee -a "$LOGFILE"
+          else
+            echo "❌ ERROR: SHA256 mismatch!" | tee -a "$LOGFILE"
+            echo "    Source: $SRC_SHA" | tee -a "$LOGFILE"
+            echo "    Target: $DST_SHA" | tee -a "$LOGFILE"
+            exit 1
+          fi
+        fi
+
+        # Also clean any leftover target in the OpenWrt tree (apply_patches.py overwrites it anyway)
+        if [ -f "openwrt/target/linux/ath79/dts/qca9563_comfast_cf-wa350.dts" ]; then
+          echo "--- Removing stale DTS from OpenWrt tree ---" | tee -a "$LOGFILE"
+          rm -fv "openwrt/target/linux/ath79/dts/qca9563_comfast_cf-wa350.dts" | tee -a "$LOGFILE" || true
+        fi
+
+        echo "--- dts/qca9563_comfast_cf-wa350.dts (first 20 lines) ---" | tee -a "$LOGFILE"
+        head -n 20 "$DST_DTS" | tee -a "$LOGFILE"
+
+        echo "SELECTED_DTS=$DTS_CHOICE" >> "$GITHUB_ENV"
+        echo "SELECTED_DTS_SHA256=$DST_SHA" >> "$GITHUB_ENV"
+
+    - name: Select patches to include
+      run: |
+        set -o pipefail
+        echo "=== Filtering patches ===" | tee -a "$LOGFILE"
+
+        DTS_CHOICE="${{ github.event.inputs.dts_choice }}"
+        PATCH_731_INPUT="${{ github.event.inputs.patch_731 }}"
+        PATCH_740_INPUT="${{ github.event.inputs.patch_740 }}"
+
+        INCLUDE_731="false"
+        if [ "$PATCH_731_INPUT" = "true" ]; then
+          INCLUDE_731="true"
+          echo "ℹ️ patch_731 = true (user requested manually)" | tee -a "$LOGFILE"
+        fi
+        if [ "$DTS_CHOICE" = "qca9563_comfast_cf-wa350-explicit-mdio.dts" ] || \
+           [ "$DTS_CHOICE" = "qca9563_comfast_cf-wa350-external.dts" ]; then
+          INCLUDE_731="true"
+          echo "ℹ️ patch_731 auto-enabled because DTS is '$DTS_CHOICE'" | tee -a "$LOGFILE"
+        fi
+
+        INCLUDE_740="false"
+        if [ "$PATCH_740_INPUT" = "true" ]; then
+          INCLUDE_740="true"
+          echo "ℹ️ patch_740 = true (user requested)" | tee -a "$LOGFILE"
+        fi
+
+        echo "=== Include decisions ===" | tee -a "$LOGFILE"
+        echo "INCLUDE_731 = $INCLUDE_731" | tee -a "$LOGFILE"
+        echo "INCLUDE_740 = $INCLUDE_740" | tee -a "$LOGFILE"
+
+        mkdir -p /tmp/patch-skip
+        rm -f /tmp/patch-skip/* 2>/dev/null || true
+
+        echo "=== Available patches before filtering ===" | tee -a "$LOGFILE"
+        ls -la patches/ | tee -a "$LOGFILE"
+
+        shopt -s nullglob
+        for p in patches/*.patch; do
+          base="$(basename "$p")"
+          KEEP="false"
+          if echo "$base" | grep -q "^731-" && [ "$INCLUDE_731" = "true" ]; then
+            KEEP="true"
+          fi
+          if echo "$base" | grep -q "^740-" && [ "$INCLUDE_740" = "true" ]; then
+            KEEP="true"
+          fi
+          if [ "$KEEP" = "true" ]; then
+            echo "✅ Keeping: $base" | tee -a "$LOGFILE"
+          else
+            echo "⏭️ Skipping: $base" | tee -a "$LOGFILE"
+            mv "$p" /tmp/patch-skip/
+          fi
+        done
+        shopt -u nullglob
+
+        echo "=== Patches after filtering ===" | tee -a "$LOGFILE"
+        if ls patches/*.patch >/dev/null 2>&1; then
+          ls -la patches/ | tee -a "$LOGFILE"
+        else
+          echo "(no patches selected — patches/ is empty)" | tee -a "$LOGFILE"
+        fi
+
+        echo "INCLUDE_731=$INCLUDE_731" >> "$GITHUB_ENV"
+        echo "INCLUDE_740=$INCLUDE_740" >> "$GITHUB_ENV"
+
+    - name: Apply patches via Python script
+      run: |
+        set -o pipefail
+        echo "=== Applying patches via apply_patches.py ===" | tee -a "$LOGFILE"
+
+        python3 apply_patches.py 2>&1 | tee -a "$LOGFILE"
+
+        echo "=== Verifying kernel patch installation ===" | tee -a "$LOGFILE"
+        if [ -d openwrt/target/linux/ath79 ]; then
+          echo "--- Directories matching patches-6.* ---" | tee -a "$LOGFILE"
+          find openwrt/target/linux/ath79 -maxdepth 1 -type d -name 'patches-6.*' | tee -a "$LOGFILE" || true
+          echo "--- Patch files under patches-6.* ---" | tee -a "$LOGFILE"
+          find openwrt/target/linux/ath79 -maxdepth 2 -path '*/patches-6.*/*.patch' -exec ls -lh {} \; | tee -a "$LOGFILE" || true
+        fi
+
+        # Verify the DTS SHA after apply_patches.py copies it into the OpenWrt tree
+        echo "=== Verifying DTS SHA in OpenWrt tree ===" | tee -a "$LOGFILE"
+        DTS_IN_TREE="openwrt/target/linux/ath79/dts/qca9563_comfast_cf-wa350.dts"
+        if [ -f "$DTS_IN_TREE" ]; then
+          TREE_SHA=$(sha256sum "$DTS_IN_TREE" | awk '{print $1}')
+          SRC_SHA=$(sha256sum "dts/qca9563_comfast_cf-wa350.dts" | awk '{print $1}')
+          echo "   Repo root SHA : $SRC_SHA" | tee -a "$LOGFILE"
+          echo "   OpenWrt tree  : $TREE_SHA" | tee -a "$LOGFILE"
+          if [ "$SRC_SHA" = "$TREE_SHA" ]; then
+            echo "✅ DTS SHA matches between repo root and OpenWrt tree." | tee -a "$LOGFILE"
+          else
+            echo "⚠️ WARNING: DTS SHA differs (this may be expected if apply_patches.py modifies it)." | tee -a "$LOGFILE"
+          fi
+        else
+          echo "❌ ERROR: DTS not found in OpenWrt tree!" | tee -a "$LOGFILE"
+          exit 1
+        fi
+
+        echo "✅ apply_patches.py completed." | tee -a "$LOGFILE"
+
+    - name: Enforce patches-6.18+ location
+      run: |
+        set -o pipefail
+        REPO_ROOT="$(pwd)"
+        LOG="$REPO_ROOT/$LOGFILE"
+
+        echo "=== Enforcing patches-6.18+ location ===" | tee -a "$LOG"
+
+        ATH79="$REPO_ROOT/openwrt/target/linux/ath79"
+        if [ ! -d "$ATH79" ]; then
+          echo "❌ ERROR: $ATH79 not found." | tee -a "$LOG"
+          exit 1
+        fi
+
+        TARGET=""
+        HIGHEST=17
+        shopt -s nullglob
+        for d in "$ATH79"/patches-6.*/; do
+          [ -d "$d" ] || continue
+          d="${d%/}"
+          v="${d##*patches-6.}"
+          if [ "$v" -ge 18 ] 2>/dev/null && [ "$v" -gt "$HIGHEST" ]; then
+            HIGHEST="$v"
+            TARGET="$d"
+          fi
+        done
+        shopt -u nullglob
+
+        if [ -z "$TARGET" ]; then
+          TARGET="$ATH79/patches-6.18"
+          mkdir -p "$TARGET"
+          echo "ℹ️ No patches-6.18+ found; created '$TARGET'" | tee -a "$LOG"
+        fi
+
+        echo "Target patch directory: $TARGET" | tee -a "$LOG"
+
+        shopt -s nullglob
+        for d in "$ATH79"/patches-6.*/; do
+          [ -d "$d" ] || continue
+          d="${d%/}"
+          [ "$d" = "$TARGET" ] && continue
+          v="${d##*patches-6.}"
+          if [ "$v" -lt 18 ] 2>/dev/null; then
+            for p in "$d"/731-*.patch "$d"/740-*.patch; do
+              [ -f "$p" ] || continue
+              b=$(basename "$p")
+              echo "Moving $p → $TARGET/$b" | tee -a "$LOG"
+              mv "$p" "$TARGET/$b"
+            done
+          fi
+        done
+        shopt -u nullglob
+
+        echo "=== Final state of patches-6.* directories ===" | tee -a "$LOG"
+        shopt -s nullglob
+        for d in "$ATH79"/patches-6.*/; do
+          [ -d "$d" ] || continue
+          d="${d%/}"
+          echo "--- $d ---" | tee -a "$LOG"
+          found=0
+          for pat in "$d"/731-*.patch "$d"/740-*.patch; do
+            if [ -f "$pat" ]; then
+              ls -la "$pat" | tee -a "$LOG"
+              found=1
+            fi
+          done
+          [ "$found" -eq 0 ] && echo "(no 731/740 patches here)" | tee -a "$LOG"
+        done
+        shopt -u nullglob
+
+        echo "✅ Patch location enforcement complete." | tee -a "$LOG"
+
+    - name: Inject custom files
+      if: ${{ github.event.inputs.include_files == 'true' }}
+      run: |
+        set -o pipefail
+        echo "=== Injecting custom files (include_files=true) ===" | tee -a "$LOGFILE"
+        if [ -d files ]; then
+          mkdir -p openwrt/files
+          cp -rv files/* openwrt/files/ 2>&1 | tee -a "$LOGFILE"
+          echo "✅ Custom files injected." | tee -a "$LOGFILE"
+        else
+          echo "❌ ERROR: files/ not found at repo root." | tee -a "$LOGFILE"
+          exit 1
+        fi
+
+    - name: Skip files notice
+      if: ${{ github.event.inputs.include_files != 'true' }}
+      run: |
+        echo "=== include_files=false → skipping custom files injection ===" | tee -a "$LOGFILE"
+
+    - name: Import cfw-leds package into openwrt/package/utils/
+      if: ${{ github.event.inputs.import_cfw_leds != 'false' }}
+      run: |
+        set -o pipefail
+        echo "=== Importing cfw-leds package from building-helper ===" | tee -a "$LOGFILE"
+        SRC_DIR="/tmp/building-helper/cfw-leds"
+        TARGET_PARENT="openwrt/package/utils"
+        TARGET_DIR="$TARGET_PARENT/cfw-leds"
+
+        if [ ! -d "$SRC_DIR" ]; then
+          echo "❌ ERROR: '$SRC_DIR' not found in building-helper." | tee -a "$LOGFILE"
+          ls -la /tmp/building-helper | tee -a "$LOGFILE"
+          exit 1
+        fi
+
+        mkdir -p "$TARGET_PARENT"
+        rm -rf "$TARGET_DIR"
+        cp -rv "$SRC_DIR" "$TARGET_PARENT"/ 2>&1 | tee -a "$LOGFILE"
+
+        chmod -R u+rwX,go+rX "$TARGET_DIR" 2>&1 | tee -a "$LOGFILE"
+        find "$TARGET_DIR" -type f -name "*.sh" -exec chmod +x {} \; 2>&1 | tee -a "$LOGFILE"
+        find "$TARGET_DIR" -type f -name "Makefile" -exec chmod 644 {} \; 2>&1 | tee -a "$LOGFILE"
+        find "$TARGET_DIR/files" -type f -exec chmod +x {} \; 2>/dev/null || true
+
+        if [ -f "$TARGET_DIR/Makefile" ]; then
+          echo "✅ Makefile found at $TARGET_DIR/Makefile" | tee -a "$LOGFILE"
+          head -n 20 "$TARGET_DIR/Makefile" | tee -a "$LOGFILE"
+        else
+          echo "❌ ERROR: Makefile NOT found in $TARGET_DIR" | tee -a "$LOGFILE"
+          exit 1
+        fi
+
+        echo "✅ cfw-leds package import completed." | tee -a "$LOGFILE"
+
+    - name: Import luci-theme-enan-dashboard package into openwrt/package/
+      if: ${{ github.event.inputs.attach_theme == 'true' }}
+      run: |
+        set -o pipefail
+        echo "=== Importing luci-theme-enan-dashboard package from building-helper ===" | tee -a "$LOGFILE"
+        SRC_DIR="/tmp/building-helper/luci-theme-enan-dashboard"
+        TARGET_PARENT="openwrt/package"
+        TARGET_DIR="$TARGET_PARENT/luci-theme-enan-dashboard"
+
+        if [ ! -d "$SRC_DIR" ]; then
+          echo "❌ ERROR: '$SRC_DIR' not found in building-helper." | tee -a "$LOGFILE"
+          ls -la /tmp/building-helper | tee -a "$LOGFILE"
+          exit 1
+        fi
+
+        mkdir -p "$TARGET_PARENT"
+        rm -rf "$TARGET_DIR"
+        cp -rv "$SRC_DIR" "$TARGET_PARENT"/ 2>&1 | tee -a "$LOGFILE"
+
+        chmod -R u+rwX,go+rX "$TARGET_DIR" 2>&1 | tee -a "$LOGFILE"
+        find "$TARGET_DIR" -type f -name "*.sh" -exec chmod +x {} \; 2>&1 | tee -a "$LOGFILE"
+        find "$TARGET_DIR" -type f -name "Makefile" -exec chmod 644 {} \; 2>&1 | tee -a "$LOGFILE"
+        find "$TARGET_DIR/files" -type f -exec chmod +x {} \; 2>/dev/null || true
+
+        if [ -f "$TARGET_DIR/Makefile" ]; then
+          echo "✅ Makefile found at $TARGET_DIR/Makefile" | tee -a "$LOGFILE"
+          head -n 20 "$TARGET_DIR/Makefile" | tee -a "$LOGFILE"
+        else
+          echo "❌ ERROR: Makefile NOT found in $TARGET_DIR" | tee -a "$LOGFILE"
+          exit 1
+        fi
+
+        echo "✅ luci-theme-enan-dashboard package import completed." | tee -a "$LOGFILE"
+
+    # =====================================================================
+    # .config handling — defconfig-based (avoids olddefconfig "out of sync")
+    # =====================================================================
+    - name: Copy .config and verify active options
+      run: |
+        set -o pipefail
+        echo "=== Copying .config from repository root to openwrt/ ===" | tee -a "$LOGFILE"
+        cp -v .config openwrt/.config 2>&1 | tee -a "$LOGFILE"
+
+        cd openwrt
+        cp .config config-before.txt
+
+        echo "=== STEP 1: Removing stale tmp/ ===" | tee -a "../$LOGFILE"
+        rm -rf tmp
+
+        echo "=== STEP 1: make defconfig (expand base config) ===" | tee -a "../$LOGFILE"
+        if ! make defconfig 2>&1 | tee -a "../$LOGFILE"; then
+          echo "⚠️ First defconfig failed. Retrying with KCONFIG_OVERWRITECONFIG=1 ..." | tee -a "../$LOGFILE"
+          KCONFIG_OVERWRITECONFIG=1 make defconfig 2>&1 | tee -a "../$LOGFILE"
+        fi
+
+        echo "=== Active options AFTER base defconfig ===" | tee -a "../$LOGFILE"
+        grep -E '^CONFIG_.*=[ym]' .config | wc -l | tee -a "../$LOGFILE"
+
+        echo "=== STEP 2: Injecting custom options ===" | tee -a "../$LOGFILE"
+
+        if [ "${{ github.event.inputs.attach_theme }}" = "true" ]; then
+          echo "--- Injecting CONFIG_PACKAGE_luci-theme-enan-dashboard=y ---" | tee -a "../$LOGFILE"
+          sed -i '/^CONFIG_PACKAGE_luci-theme-enan-dashboard=/d' .config
+          sed -i '/^# CONFIG_PACKAGE_luci-theme-enan-dashboard is not set/d' .config
+          echo "CONFIG_PACKAGE_luci-theme-enan-dashboard=y" >> .config
+          echo "✅ Theme option injected." | tee -a "../$LOGFILE"
+        fi
+
+        if [ "${{ github.event.inputs.import_cfw_leds }}" = "false" ]; then
+          echo "--- Force-disabling CONFIG_PACKAGE_cfw-leds ---" | tee -a "../$LOGFILE"
+          sed -i '/^CONFIG_PACKAGE_cfw-leds=/d' .config
+          sed -i '/^# CONFIG_PACKAGE_cfw-leds is not set/d' .config
+          echo "# CONFIG_PACKAGE_cfw-leds is not set" >> .config
+          echo "✅ cfw-leds force-disabled." | tee -a "../$LOGFILE"
+        else
+          echo "=== cfw-leds import is enabled → leaving .config untouched ===" | tee -a "../$LOGFILE"
+        fi
+
+        if ! grep -q "CONFIG_TARGET_ath79_generic_DEVICE_comfast_cf-wa350=y" .config; then
+          echo "--- Target device missing → re-adding ---" | tee -a "../$LOGFILE"
+          echo "CONFIG_TARGET_ath79=y" >> .config
+          echo "CONFIG_TARGET_ath79_generic=y" >> .config
+          echo "CONFIG_TARGET_ath79_generic_DEVICE_comfast_cf-wa350=y" >> .config
+        else
+          echo "✅ Target device is set." | tee -a "../$LOGFILE"
+        fi
+
+        echo "=== STEP 3: make defconfig (merge custom options) ===" | tee -a "../$LOGFILE"
+        if ! KCONFIG_OVERWRITECONFIG=1 make defconfig 2>&1 | tee -a "../$LOGFILE"; then
+          echo "⚠️ merge defconfig failed. Retrying without KCONFIG_OVERWRITECONFIG ..." | tee -a "../$LOGFILE"
+          make defconfig 2>&1 | tee -a "../$LOGFILE"
+        fi
+
+        cp .config config-after.txt
+
+        echo "=== Verifying target device AFTER defconfig ===" | tee -a "../$LOGFILE"
+        if grep -q "CONFIG_TARGET_ath79_generic_DEVICE_comfast_cf-wa350=y" .config; then
+          echo "✅ Target device still correctly set." | tee -a "../$LOGFILE"
+        else
+          echo "⚠️ Target device lost after defconfig → re-adding..." | tee -a "../$LOGFILE"
+          echo "CONFIG_TARGET_ath79=y" >> .config
+          echo "CONFIG_TARGET_ath79_generic=y" >> .config
+          echo "CONFIG_TARGET_ath79_generic_DEVICE_comfast_cf-wa350=y" >> .config
+          KCONFIG_OVERWRITECONFIG=1 make defconfig 2>&1 | tee -a "../$LOGFILE"
+          cp .config config-after.txt
+        fi
+
+        if [ "${{ github.event.inputs.import_cfw_leds }}" = "false" ]; then
+          if grep -qE '^CONFIG_PACKAGE_cfw-leds=y' .config; then
+            echo "⚠️ cfw-leds re-enabled → forcing it back" | tee -a "../$LOGFILE"
+            sed -i '/^CONFIG_PACKAGE_cfw-leds=/d' .config
+            sed -i '/^# CONFIG_PACKAGE_cfw-leds is not set/d' .config
+            echo "# CONFIG_PACKAGE_cfw-leds is not set" >> .config
+          fi
+        fi
+
+        echo "=== Active options AFTER full processing ===" | tee -a "../$LOGFILE"
+        grep -E '^CONFIG_.*=[ym]' .config | wc -l | tee -a "../$LOGFILE"
+
+        echo "=== Diff before/after ===" | tee -a "../$LOGFILE"
+        diff -u <(grep -v '^#' config-before.txt | grep -v '^$' | sort) \
+               <(grep -v '^#' config-after.txt | grep -v '^$' | sort) 2>&1 | tee -a "../$LOGFILE" || true
+
+        echo "✅ .config verification completed." | tee -a "../$LOGFILE"
+
+    - name: Upload config snapshots (before/after)
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: config-snapshots-${{ matrix.label }}
+        path: |
+          openwrt/config-before.txt
+          openwrt/config-after.txt
+        if-no-files-found: warn
+
+    - name: Download package sources
+      run: |
+        echo "=== Downloading package sources ===" | tee -a "$LOGFILE"
+        cd openwrt
+        make download -j$(nproc) 2>&1 | tee -a "../$LOGFILE"
+        find dl -size -1024c -exec rm -f {} \; 2>&1 | tee -a "../$LOGFILE"
+        rm -rf dl/*.tmp 2>&1 | tee -a "../$LOGFILE"
+
+    - name: Clean previous build artifacts (if any)
+      run: |
+        echo "=== Cleaning previous build artifacts ===" | tee -a "$LOGFILE"
+        cd openwrt
+        rm -rf build_dir staging_dir 2>&1 | tee -a "../$LOGFILE"
+
+    - name: Build OpenWrt (using all available cores)
+      run: |
+        echo "=== Building OpenWrt ===" | tee -a "$LOGFILE"
+        echo "Slot           : ${{ matrix.slot }}" | tee -a "$LOGFILE"
+        echo "Label          : ${{ matrix.label }}" | tee -a "$LOGFILE"
+        echo "Output suffix  : '${OUTPUT_SUFFIX:-<empty>}'" | tee -a "$LOGFILE"
+        echo "Branch input   : $OPENWRT_BRANCH_INPUT" | tee -a "$LOGFILE"
+        echo "Git branch     : $OPENWRT_REF" | tee -a "$LOGFILE"
+        echo "Git tag        : ${OPENWRT_TAG:-<none - snapshot>}" | tee -a "$LOGFILE"
+        echo "DTS choice     : ${{ github.event.inputs.dts_choice }}" | tee -a "$LOGFILE"
+        echo "DTS SHA        : ${SELECTED_DTS_SHA256:-<unknown>}" | tee -a "$LOGFILE"
+        echo "Patch 731      : ${{ env.INCLUDE_731 }}" | tee -a "$LOGFILE"
+        echo "Patch 740      : ${{ env.INCLUDE_740 }}" | tee -a "$LOGFILE"
+        echo "Diag kconfig   : ${{ github.event.inputs.diag_kconfig }}" | tee -a "$LOGFILE"
+        echo "GCC 13.4.0     : ${{ github.event.inputs.inject_gcc_13 }}" | tee -a "$LOGFILE"
+        echo "Build started at: $(date)" | tee -a "$LOGFILE"
+        cd openwrt
+        make -j$(nproc) V=s 2>&1 | tee -a "../$LOGFILE"
+        echo "Build finished at: $(date)" | tee -a "$LOGFILE"
+      timeout-minutes: 360
+
+    - name: List all files in bin/targets/ath79/generic/
+      if: always()
+      run: |
+        echo "=== Contents of bin/targets/ath79/generic/ ===" | tee -a "$LOGFILE"
+        cd openwrt
+        if [ -d bin/targets/ath79/generic/ ]; then
+          ls -la bin/targets/ath79/generic/ 2>&1 | tee -a "../$LOGFILE"
+          find bin/targets/ath79/generic/ -type f -exec ls -lh {} \; 2>&1 | tee -a "../$LOGFILE"
+        else
+          echo "❌ Directory bin/targets/ath79/generic/ does not exist!" | tee -a "../$LOGFILE"
+        fi
+
+    - name: Collect artifacts (images, kernel, dtb, injected files, logs)
+      if: always()
+      run: |
+        set -u
+        echo "=== Collecting artifacts ===" | tee -a "$LOGFILE"
+
+        cd openwrt
+        rm -rf out
+        mkdir -p out/images out/kernel out/dtb out/injected out/logs
+
+        echo "=== images ===" | tee -a "../$LOGFILE"
+        cp -v bin/targets/ath79/generic/*cf-wa350*         out/images/ 2>/dev/null || true
+        cp -v bin/targets/ath79/generic/sha256sums         out/images/ 2>/dev/null || true
+        cp -v bin/targets/ath79/generic/*.manifest         out/images/ 2>/dev/null || true
+        cp -v bin/targets/ath79/generic/config.buildinfo   out/images/ 2>/dev/null || true
+        cp -v bin/targets/ath79/generic/feeds.buildinfo    out/images/ 2>/dev/null || true
+        cp -v bin/targets/ath79/generic/version.buildinfo  out/images/ 2>/dev/null || true
+
+        KD="$(ls -d build_dir/target-*/linux-ath79_generic 2>/dev/null | head -1)"
+        echo "=== kernel dir: ${KD:-none} ===" | tee -a "../$LOGFILE"
+        if [ -n "${KD:-}" ]; then
+          for f in vmlinux vmlinuz vmlinux.elf vmlinuz.elf System.map; do
+            [ -e "$KD/$f" ] && cp -v "$KD/$f" out/kernel/ || true
+          done
+          [ -e "$KD/.config" ] && cp -v "$KD/.config" out/kernel/kernel-dot-config || true
+          gzip -9f out/kernel/vmlinux 2>/dev/null || true
+          find build_dir/target-*/ -maxdepth 4 -name '*kernel*.bin' -exec cp -v {} out/kernel/ \; 2>/dev/null || true
+          find "$KD" -name '*cf-wa350*.dtb'  -exec cp -v {} out/dtb/ \; 2>/dev/null || true
+          find "$KD" -name '*cf-wa350*.dts*' -exec cp -v {} out/dtb/ \; 2>/dev/null || true
+          mkdir -p out/dtb/all-built
+          find "$KD" -name '*.dtb' -exec cp {} out/dtb/all-built/ \; 2>/dev/null || true
+        fi
+
+        echo "=== injected / device files as they ended up in the tree ===" | tee -a "../$LOGFILE"
+        cp -v target/linux/ath79/dts/qca9563_comfast_cf-wa350.dts               out/injected/ 2>/dev/null || true
+        cp -v target/linux/ath79/generic/base-files/etc/board.d/01_leds         out/injected/ 2>/dev/null || true
+        cp -v target/linux/ath79/generic/base-files/etc/board.d/02_network      out/injected/ 2>/dev/null || true
+        cp -v target/linux/ath79/image/generic.mk                               out/injected/ 2>/dev/null || true
+        cp -v .config                                                           out/injected/dot-config 2>/dev/null || true
+        [ -e apply_patches.py ] && cp -v apply_patches.py out/injected/ || true
+        [ -d dts ]      && cp -rv dts      out/injected/dts-src      || true
+        [ -d patches ]  && cp -rv patches  out/injected/patches-src  || true
+        [ -d package/utils/cfw-leds ] && cp -rv package/utils/cfw-leds out/injected/cfw-leds || true
+        [ -d package/luci-theme-enan-dashboard ] && cp -rv package/luci-theme-enan-dashboard out/injected/luci-theme-enan-dashboard || true
+
+        mkdir -p out/injected/kernel-patches
+        find target/linux/ath79 -maxdepth 2 -path '*/patches-6.*/*.patch' -exec cp -v {} out/injected/kernel-patches/ \; 2>/dev/null || true
+
+        mkdir -p out/injected/kernel-config
+        for kc in target/linux/ath79/config-6.*; do
+          [ -f "$kc" ] && cp -v "$kc" out/injected/kernel-config/ || true
+        done
+
+        cp -v "../$LOGFILE" out/logs/ 2>/dev/null || true
+        sha256sum bin/targets/ath79/generic/*cf-wa350* > out/logs/40-sha256.txt 2>/dev/null || true
+
+        # DTS SHA record
+        echo "=== DTS SHA256 record ===" > out/logs/43-dts-sha.txt
+        if [ -f target/linux/ath79/dts/qca9563_comfast_cf-wa350.dts ]; then
+          sha256sum target/linux/ath79/dts/qca9563_comfast_cf-wa350.dts | tee -a out/logs/43-dts-sha.txt
+        fi
+        if [ -f "../dts/qca9563_comfast_cf-wa350.dts" ]; then
+          sha256sum "../dts/qca9563_comfast_cf-wa350.dts" | tee -a out/logs/43-dts-sha.txt
+        fi
+
+        echo "=== Selected DTS / patch / build decisions ===" | tee out/logs/41-build-choices.txt
+        echo "Output suffix  : '${OUTPUT_SUFFIX:-<empty>}'" | tee -a out/logs/41-build-choices.txt
+        echo "DTS choice     : ${{ github.event.inputs.dts_choice }}" | tee -a out/logs/41-build-choices.txt
+        echo "DTS SHA256     : ${SELECTED_DTS_SHA256:-<unset>}" | tee -a out/logs/41-build-choices.txt
+        echo "include_files  : ${{ github.event.inputs.include_files }}" | tee -a out/logs/41-build-choices.txt
+        echo "patch_731 input: ${{ github.event.inputs.patch_731 }}" | tee -a out/logs/41-build-choices.txt
+        echo "patch_740 input: ${{ github.event.inputs.patch_740 }}" | tee -a out/logs/41-build-choices.txt
+        echo "INCLUDE_731    : ${INCLUDE_731:-<unset>}" | tee -a out/logs/41-build-choices.txt
+        echo "INCLUDE_740    : ${INCLUDE_740:-<unset>}" | tee -a out/logs/41-build-choices.txt
+        echo "diag_kconfig   : ${{ github.event.inputs.diag_kconfig }}" | tee -a out/logs/41-build-choices.txt
+        echo "inject_gcc_13  : ${{ github.event.inputs.inject_gcc_13 }}" | tee -a out/logs/41-build-choices.txt
+
+        echo "=== Verify panic lamp & GCC version in built kernel config ===" | tee -a out/logs/42-panic-lamp.txt
+        if [ -f out/kernel/kernel-dot-config ]; then
+          grep -E 'CONFIG_LEDS_TRIGGER_PANIC|CONFIG_PANIC_TIMEOUT|CONFIG_GCC_VERSION' out/kernel/kernel-dot-config | tee -a out/logs/42-panic-lamp.txt || echo "(no matching entries)" | tee -a out/logs/42-panic-lamp.txt
+        else
+          echo "(kernel .config not collected)" | tee -a out/logs/42-panic-lamp.txt
+        fi
+
+        echo "=== uImage kernel size (bytes 12..15, big endian) ===" | tee -a "../$LOGFILE"
+        for img in out/images/*cf-wa350-squashfs-sysupgrade.bin; do
+          [ -e "$img" ] || continue
+          printf '%s: ' "$(basename "$img")"
+          od -A d -t u4 -j 12 -N 4 --endian=big "$img" | head -1
+        done | tee out/logs/00-commit.txt
+
+        echo "=== bundle contents ===" | tee -a "../$LOGFILE"
+        find out -type f | sort | sed 's|^|  |' | tee out/logs/50-bundle-list.txt
+        du -sh out/* 2>/dev/null | tee -a out/logs/50-bundle-list.txt
+
+        echo "✅ Artifacts collected into openwrt/out/" | tee -a "../$LOGFILE"
+
+    - name: Clean temporary build directories (free space for packaging)
+      if: always()
+      run: |
+        echo "=== Cleaning build_dir and staging_dir ===" | tee -a "$LOGFILE"
+        cd openwrt
+        rm -rf build_dir staging_dir 2>&1 | tee -a "../$LOGFILE"
+
+    - name: Check disk space after build
+      if: always()
+      run: |
+        echo "=== Disk space after build ===" | tee -a "$LOGFILE"
+        df -h 2>&1 | tee -a "$LOGFILE"
+        du -sh openwrt 2>&1 | tee -a "$LOGFILE" || true
+
+    - name: Upload log to repository (always)
+      if: always()
+      run: |
+        echo "=== Uploading log to repository ===" >> "$LOGFILE"
+        echo "=== BUILD LOG END - $(date) ===" >> "$LOGFILE"
+        echo "Build completed with status: ${{ job.status }}" >> "$LOGFILE"
+        echo "Slot: ${{ matrix.slot }} | Label: ${{ matrix.label }}" >> "$LOGFILE"
+
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+        git add "$LOGFILE"
+        git commit -m "Update ${{ matrix.slot }} log for run ${{ github.run_id }}" || true
+
+        for attempt in 1 2 3 4 5; do
+          git pull --rebase origin main 2>/dev/null || true
+          if git push origin main 2>/dev/null; then
+            echo "✅ Log pushed (attempt $attempt)"
+            break
+          fi
+          echo "Push attempt $attempt failed, retrying in 5s..."
+          sleep 5
+        done
+
+    - name: Upload full log as artifact (always)
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: full-build-log-${{ matrix.label }}
+        path: ${{ env.LOGFILE }}
+        if-no-files-found: error
+
+    - name: Upload collected artifact bundle (out/)
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: cf-wa350-bundle-${{ matrix.label }}-${{ github.sha }}
+        path: openwrt/out/
+        if-no-files-found: warn
+
+    - name: Upload firmware and all build artifacts
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: cf-wa350-${{ matrix.label }}-${{ github.sha }}
+        path: |
+          openwrt/bin/targets/ath79/generic/openwrt-*comfast_cf-wa350*
+          openwrt/bin/targets/ath79/generic/sha256sums
+          openwrt/bin/targets/ath79/generic/BUILD-INFO.txt
+          openwrt/bin/targets/ath79/generic/config.buildinfo
+        if-no-files-found: warn
