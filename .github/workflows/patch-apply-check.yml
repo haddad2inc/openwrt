@@ -1,0 +1,218 @@
+name: patch-apply-check
+
+on:
+  workflow_dispatch:
+    inputs:
+      patch_ref:
+        description: Ref (branch or sha) carrying the series plus the patch under test
+        required: false
+        default: ath79-mtd-mx25l12805d-restore-name
+        type: string
+      patch_path:
+        description: Repo-relative path of the patch under test
+        required: false
+        default: target/linux/ath79/patches-6.18/740-mtd-spi-nor-macronix-restore-mx25l12805d-name.patch
+        type: string
+      kernel_ver:
+        description: Kernel version override (empty = read include/kernel-6.18)
+        required: false
+        default: ""
+        type: string
+      fuzz_mode:
+        description: strict = fuzz 0 only, defaultfuzz = GNU default only, both = two trees
+        required: false
+        default: both
+        type: choice
+        options:
+          - strict
+          - defaultfuzz
+          - both
+
+jobs:
+  apply-check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Checkout ref under test
+        uses: actions/checkout@v4
+        with:
+          repository: haddad2inc/openwrt
+          ref: ${{ inputs.patch_ref }}
+          fetch-depth: 1
+
+      - name: Identity card
+        id: id
+        run: |
+          mkdir -p logs
+          V="${{ inputs.kernel_ver }}"
+          if [ -z "$V" ]; then
+            KF="$(ls include/ | grep -m1 '^kernel-6\.')"
+            MM="$(echo "$KF" | cut -d- -f2)"
+            V="$MM$(grep -m1 "^LINUX_VERSION-$MM" "include/$KF" | sed 's/.*= *//')"
+          fi
+          {
+            echo "ref        = ${{ inputs.patch_ref }}"
+            echo "ref_sha    = $(git rev-parse HEAD)"
+            echo "kernel     = $V"
+            echo "patch_path = ${{ inputs.patch_path }}"
+            echo "patch_sha  = $(sha256sum "${{ inputs.patch_path }}" | cut -d' ' -f1)"
+            echo "fuzz_mode  = ${{ inputs.fuzz_mode }}"
+            echo "date       = $(date -u +%FT%TZ)"
+            echo "runner     = $RUNNER_NAME"
+          } | tee logs/00-identity.txt
+          echo "ver=$V" >> "$GITHUB_OUTPUT"
+
+      - name: Download pristine kernel source
+        run: |
+          V="${{ steps.id.outputs.ver }}"
+          mkdir -p /tmp/k && cd /tmp/k
+          ok=0
+          for U in "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-$V.tar.xz" \
+                   "https://mirrors.edge.kernel.org/pub/linux/kernel/v6.x/linux-$V.tar.xz" \
+                   "https://sourcescdn.openwrt.org/linux-$V.tar.xz"; do
+            if curl -fsSL --retry 3 --connect-timeout 20 -o linux.tar.xz "$U"; then ok=1; break; fi
+          done
+          [ "$ok" = 1 ] || { echo "::error::all kernel mirrors failed for $V"; exit 1; }
+          sha256sum linux.tar.xz | tee logs/kernel-tarball.sha256
+
+      - name: Extract tree(s)
+        run: |
+          cd /tmp/k
+          tar -xJf linux.tar.xz
+          mv linux-"${{ steps.id.outputs.ver }}" tree-strict
+          if [ "${{ inputs.fuzz_mode }}" = "both" ] || [ "${{ inputs.fuzz_mode }}" = "defaultfuzz" ]; then
+            cp -a tree-strict tree-default
+          fi
+
+      - name: Build the ordered series list (OpenWrt kernel patch order)
+        run: |
+          MM="$(echo '${{ steps.id.outputs.ver }}' | cut -d. -f1-2)"
+          : > /tmp/k/series.txt
+          for D in \
+            "target/linux/generic/hack-$MM"     "target/linux/generic/hack" \
+            "target/linux/generic/backport-$MM" "target/linux/generic/backport" \
+            "target/linux/generic/pending-$MM"  "target/linux/generic/pending" \
+            "target/linux/ath79/hack-$MM"       "target/linux/ath79/hack" \
+            "target/linux/ath79/backport-$MM"   "target/linux/ath79/backport" \
+            "target/linux/ath79/pending-$MM"    "target/linux/ath79/pending" \
+            "target/linux/ath79/patches-$MM"    "target/linux/ath79/patches" ; do
+            [ -d "$D" ] || continue
+            ls "$D" 2>/dev/null | LC_ALL=C sort | grep '\.patch$' | sed "s|^|$D/|" >> /tmp/k/series.txt
+          done
+          cp /tmp/k/series.txt logs/series.txt
+          echo "series count: $(wc -l < /tmp/k/series.txt)"
+          grep -n "$(basename '${{ inputs.patch_path }}')$" /tmp/k/series.txt | tee logs/patch-position.txt
+
+      - name: Apply series - strict (fuzz 0)
+        if: inputs.fuzz_mode == 'strict' || inputs.fuzz_mode == 'both'
+        run: |
+          LOGS="$GITHUB_WORKSPACE/logs"
+          UNDER="$(basename '${{ inputs.patch_path }}')"
+          cd /tmp/k/tree-strict
+          : > "$LOGS/apply-strict.log"; : > "$LOGS/apply-strict-summary.txt"
+          n=0; total=$(wc -l < /tmp/k/series.txt); hard=1
+          while IFS= read -r p; do
+            n=$((n+1))
+            if patch -p1 -f -s --fuzz=0 -i "$GITHUB_WORKSPACE/$p" >> "$LOGS/apply-strict.log" 2>&1; then
+              echo "OK   $n/$total $p" >> "$LOGS/apply-strict-summary.txt"
+            elif [ "$(basename "$p")" = "$UNDER" ]; then
+              echo "FAIL $n/$total $p  <-- PATCH UNDER TEST" >> "$LOGS/apply-strict-summary.txt"
+              hard=0
+            else
+              echo "SKIP $n/$total $p (pre-existing series/fuzz issue, not the patch under test)" >> "$LOGS/apply-strict-summary.txt"
+            fi
+          done < /tmp/k/series.txt
+          echo "strict_under_ok=$hard" >> /tmp/k/results.txt
+          tail -2 "$LOGS/apply-strict-summary.txt"
+
+      - name: Apply series - GNU default fuzz
+        if: inputs.fuzz_mode == 'defaultfuzz' || inputs.fuzz_mode == 'both'
+        run: |
+          LOGS="$GITHUB_WORKSPACE/logs"
+          UNDER="$(basename '${{ inputs.patch_path }}')"
+          cd /tmp/k/tree-default
+          : > "$LOGS/apply-default.log"; : > "$LOGS/apply-default-summary.txt"
+          n=0; total=$(wc -l < /tmp/k/series.txt); hard=1
+          while IFS= read -r p; do
+            n=$((n+1))
+            if patch -p1 -f -s -i "$GITHUB_WORKSPACE/$p" >> "$LOGS/apply-default.log" 2>&1; then
+              echo "OK   $n/$total $p" >> "$LOGS/apply-default-summary.txt"
+            elif [ "$(basename "$p")" = "$UNDER" ]; then
+              echo "FAIL $n/$total $p  <-- PATCH UNDER TEST" >> "$LOGS/apply-default-summary.txt"
+              hard=0
+            else
+              echo "SKIP $n/$total $p (pre-existing series/fuzz issue, not the patch under test)" >> "$LOGS/apply-default-summary.txt"
+            fi
+          done < /tmp/k/series.txt
+          echo "default_under_ok=$hard" >> /tmp/k/results.txt
+          tail -2 "$LOGS/apply-default-summary.txt"
+
+      - name: Gates
+        run: |
+          LOGS="$GITHUB_WORKSPACE/logs"
+          UNDER_PATH="${{ inputs.patch_path }}"
+          fail=0
+          srcfile="$(grep -m1 '^+++ b/' "$UNDER_PATH" | cut -c7-)"
+          echo "patched file = $srcfile" | tee "$LOGS/patched-file.txt"
+          grep '^+' "$UNDER_PATH" | grep -v '^+++' | sed 's/^+//' > /tmp/k/added.txt
+          while IFS= read -r l; do
+            [ -z "$l" ] && continue
+            if grep -qF "$l" "/tmp/k/tree-strict/$srcfile"; then
+              echo "present: $l"
+            else
+              echo "::error::added line missing after apply: $l"; fail=1
+            fi
+          done < /tmp/k/added.txt
+          for T in tree-strict tree-default; do
+            [ -d "/tmp/k/$T" ] || continue
+            R="$(find /tmp/k/$T -name '*.rej' -o -name '*.orig' | head -5)"
+            if [ -n "$R" ]; then echo "::error::$R"; echo "$R" > "$LOGS/rej-$T.txt"; fail=1; fi
+          done
+          if [ "${{ inputs.fuzz_mode }}" != "defaultfuzz" ]; then
+            grep -q 'strict_under_ok=1' /tmp/k/results.txt || { echo "::error::strict pass failed on the patch under test"; fail=1; }
+          fi
+          if [ "${{ inputs.fuzz_mode }}" != "strict" ]; then
+            grep -q 'default_under_ok=1' /tmp/k/results.txt || { echo "::error::default-fuzz pass failed on the patch under test"; fail=1; }
+          fi
+          if [ -f /tmp/k/tree-strict/drivers/mtd/spi-nor/macronix.c ]; then
+            awk '/MX25L12805D/{f=1} f{print} f&&/^\t}, \{/{exit}' \
+              /tmp/k/tree-strict/drivers/mtd/spi-nor/macronix.c > "$LOGS/entry-after-strict.txt" || true
+            cat "$LOGS/entry-after-strict.txt"
+            for k in '.name = "mx25l12805d",' '.size = SZ_16M,' '.no_sfdp_flags = SECT_4K,'; do
+              c="$(grep -cF "$k" "$LOGS/entry-after-strict.txt" || true)"
+              echo "count[$k] = $c (must be 1)"
+              [ "$c" = "1" ] || { echo "::error::duplicate or missing field: $k"; fail=1; }
+            done
+          fi
+          exit "$fail"
+
+      - name: Step summary
+        if: always()
+        run: |
+          {
+            echo "## patch-apply-check"
+            echo '```'
+            cat logs/00-identity.txt 2>/dev/null
+            echo '```'
+            echo
+            echo "| mode | patch under test |"
+            echo "|---|---|"
+            grep -h 'under_ok' /tmp/k/results.txt 2>/dev/null | sed 's/_under_ok=/ -> /;s/1/OK/;s/0/FAIL/' | sed 's/^/| /;s/$/ |/'
+            echo
+            echo "Position in series:"
+            echo '```'
+            cat logs/patch-position.txt 2>/dev/null
+            echo '```'
+            echo "Entry after strict apply:"
+            echo '```c'
+            cat logs/entry-after-strict.txt 2>/dev/null
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: patch-apply-check-run-${{ github.run_number }}
+          path: logs/
+          retention-days: 30
