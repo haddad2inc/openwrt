@@ -21,7 +21,7 @@ Signed-off-by: Salah Ahmed <haddad2inc@gmail.com>
 ---
 --- a/drivers/net/dsa/qca/qca8k.h
 +++ b/drivers/net/dsa/qca/qca8k.h
-@@ -443,6 +443,15 @@ struct qca8k_led {
+@@ -442,6 +442,15 @@
  };
  
  struct qca8k_priv {
@@ -37,7 +37,7 @@ Signed-off-by: Salah Ahmed <haddad2inc@gmail.com>
  	u8 switch_id;
  	u8 switch_revision;
  	u8 mirror_rx;
-@@ -513,6 +522,11 @@ int qca8k_rmw(struct qca8k_priv *priv, u
+@@ -512,6 +521,11 @@
  /* Common ops function */
  void qca8k_fdb_flush(struct qca8k_priv *priv);
  
@@ -51,7 +51,7 @@ Signed-off-by: Salah Ahmed <haddad2inc@gmail.com>
  void qca8k_get_ethtool_stats(struct dsa_switch *ds, int port,
 --- a/drivers/net/dsa/qca/qca8k-common.c
 +++ b/drivers/net/dsa/qca/qca8k-common.c
-@@ -553,6 +553,82 @@ void qca8k_get_ethtool_stats(struct dsa_
+@@ -523,6 +523,82 @@
  	}
  }
  
@@ -136,7 +136,7 @@ Signed-off-by: Salah Ahmed <haddad2inc@gmail.com>
  	struct qca8k_priv *priv = ds->priv;
 --- a/drivers/net/dsa/qca/qca8k-8xxx.c
 +++ b/drivers/net/dsa/qca/qca8k-8xxx.c
-@@ -1999,6 +1999,8 @@ qca8k_setup(struct dsa_switch *ds)
+@@ -1888,6 +1888,8 @@
  	if (ret)
  		dev_warn(priv->dev, "mib init failed");
  
@@ -145,7 +145,7 @@ Signed-off-by: Salah Ahmed <haddad2inc@gmail.com>
  	/* Initial setup of all ports */
  	dsa_switch_for_each_port(dp, ds) {
  		/* Disable forwarding by default on all ports */
-@@ -2125,6 +2127,7 @@ static const struct dsa_switch_ops qca8k
+@@ -2013,6 +2015,7 @@
  	.setup			= qca8k_setup,
  	.get_strings		= qca8k_get_strings,
  	.get_ethtool_stats	= qca8k_get_ethtool_stats,
@@ -153,7 +153,7 @@ Signed-off-by: Salah Ahmed <haddad2inc@gmail.com>
  	.get_sset_count		= qca8k_get_sset_count,
  	.set_ageing_time	= qca8k_set_ageing_time,
  	.support_eee		= dsa_supports_eee,
-@@ -2239,6 +2242,7 @@ qca8k_sw_remove(struct mdio_device *mdio
+@@ -2123,6 +2126,7 @@
  	for (i = 0; i < QCA8K_NUM_PORTS; i++)
  		qca8k_port_set_status(priv, i, 0);
  
