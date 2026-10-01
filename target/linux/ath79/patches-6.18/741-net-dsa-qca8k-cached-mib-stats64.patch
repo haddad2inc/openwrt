@@ -1,0 +1,160 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Salah Ahmed <haddad2inc@gmail.com>
+Date: Wed, 30 Sep 2026 12:00:00 +0000
+Subject: [PATCH] net: dsa: qca8k: expose cached per-port MIB counters via
+ get_stats64
+
+DSA user port netdev statistics currently count only CPU-seen traffic, so
+bridge-offloaded forwarding is invisible to /sys/class/net/<port>/statistics
+and to every kernel consumer of it (LED triggers, monitoring, qdiscs). The
+switch MIB counters see every frame crossing the port, but reading them
+sleeps on the regmap/MDIO bus while get_stats64() may not sleep.
+
+Follow the pattern established by the ar9331 driver in this same directory
+(cached rtnl_link_stats64 refreshed by a delayed work, served lock-protected
+from .get_stats64): poll RxGoodByte/TxByte per user port every 3 seconds and
+serve the cache. qca8k user ports then report the truth on the wire through
+the standard netdev statistics, without ethtool or userspace helpers.
+
+Signed-off-by: Salah Ahmed <haddad2inc@gmail.com>
+---
+--- a/drivers/net/dsa/qca/qca8k.h
++++ b/drivers/net/dsa/qca/qca8k.h
+@@ -468,6 +468,13 @@
+ 	struct qca8k_pcs pcs_port_6;
+ 	const struct qca8k_match_data *info;
+ 	struct qca8k_led ports_led[QCA8K_LED_COUNT];
++
++	/* Cached per-port wire statistics from the switch MIB, refreshed by
++	 * mib_poll_work so that .get_stats64 (atomic context) never sleeps.
++	 */
++	struct rtnl_link_stats64 port_stats[QCA8K_NUM_PORTS];
++	spinlock_t stats_lock;
++	struct delayed_work mib_poll_work;
+ };
+ 
+ struct qca8k_mib_desc {
+@@ -511,6 +518,11 @@
+ 
+ /* Common ops function */
+ void qca8k_fdb_flush(struct qca8k_priv *priv);
++
++/* Cached MIB statistics served from atomic context */
++void qca8k_get_stats64(struct dsa_switch *ds, int port, struct rtnl_link_stats64 *s);
++void qca8k_mib_poll_start(struct qca8k_priv *priv);
++void qca8k_mib_poll_stop(struct qca8k_priv *priv);
+ 
+ /* Common ethtool stats function */
+ void qca8k_get_strings(struct dsa_switch *ds, int port, u32 stringset, uint8_t *data);
+--- a/drivers/net/dsa/qca/qca8k-common.c
++++ b/drivers/net/dsa/qca/qca8k-common.c
+@@ -523,6 +523,82 @@
+ 	}
+ }
+ 
++#define QCA8K_MIB_POLL_INTERVAL	(3 * HZ)
++
++/* RxGoodByte / TxByte offsets in the per-port MIB block (64-bit counters) */
++#define QCA8K_MIB_RXGOODBYTE	0x3c
++#define QCA8K_MIB_TXBYTE	0x84
++
++static u64 qca8k_mib_read64(struct qca8k_priv *priv, int port, u32 off)
++{
++	u32 reg = QCA8K_PORT_MIB_COUNTER(port) + off, lo, hi;
++
++	if (qca8k_read(priv, reg, &lo))
++		return U64_MAX;
++	if (qca8k_read(priv, reg + 4, &hi))
++		return U64_MAX;
++
++	return lo | ((u64)hi << 32);
++}
++
++static void qca8k_mib_poll_work_fn(struct work_struct *work)
++{
++	struct qca8k_priv *priv = container_of(work, struct qca8k_priv,
++					       mib_poll_work.work);
++	struct dsa_switch *ds = priv->ds;
++	u64 rx, tx;
++	int port;
++
++	for (port = 0; port < QCA8K_NUM_PORTS; port++) {
++		if (!dsa_is_user_port(ds, port))
++			continue;
++
++		rx = qca8k_mib_read64(priv, port, QCA8K_MIB_RXGOODBYTE);
++		if (rx == U64_MAX)
++			continue;
++		tx = qca8k_mib_read64(priv, port, QCA8K_MIB_TXBYTE);
++		if (tx == U64_MAX)
++			continue;
++
++		spin_lock_bh(&priv->stats_lock);
++		priv->port_stats[port].rx_bytes = rx;
++		priv->port_stats[port].tx_bytes = tx;
++		spin_unlock_bh(&priv->stats_lock);
++	}
++
++	queue_delayed_work(system_power_efficient_wq, &priv->mib_poll_work,
++			   QCA8K_MIB_POLL_INTERVAL);
++}
++
++/* Serve the cached wire counters; called in atomic context, never sleeps.
++ * The MIB sees every frame crossing the port, including bridge-offloaded
++ * traffic that never reaches the CPU, so DSA user ports finally report the
++ * truth on the wire to every standard kernel consumer, without ethtool or
++ * userspace helpers.
++ */
++void qca8k_get_stats64(struct dsa_switch *ds, int port,
++		       struct rtnl_link_stats64 *s)
++{
++	struct qca8k_priv *priv = ds->priv;
++
++	spin_lock_bh(&priv->stats_lock);
++	*s = priv->port_stats[port];
++	spin_unlock_bh(&priv->stats_lock);
++}
++
++void qca8k_mib_poll_start(struct qca8k_priv *priv)
++{
++	spin_lock_init(&priv->stats_lock);
++	INIT_DELAYED_WORK(&priv->mib_poll_work, qca8k_mib_poll_work_fn);
++	queue_delayed_work(system_power_efficient_wq, &priv->mib_poll_work,
++			   QCA8K_MIB_POLL_INTERVAL);
++}
++
++void qca8k_mib_poll_stop(struct qca8k_priv *priv)
++{
++	cancel_delayed_work_sync(&priv->mib_poll_work);
++}
++
+ int qca8k_get_sset_count(struct dsa_switch *ds, int port, int sset)
+ {
+ 	struct qca8k_priv *priv = ds->priv;
+--- a/drivers/net/dsa/qca/qca8k-8xxx.c
++++ b/drivers/net/dsa/qca/qca8k-8xxx.c
+@@ -1888,6 +1888,8 @@
+ 	if (ret)
+ 		dev_warn(priv->dev, "mib init failed");
+ 
++	qca8k_mib_poll_start(priv);
++
+ 	/* Initial setup of all ports */
+ 	dsa_switch_for_each_port(dp, ds) {
+ 		/* Disable forwarding by default on all ports */
+@@ -2013,6 +2015,7 @@
+ 	.setup			= qca8k_setup,
+ 	.get_strings		= qca8k_get_strings,
+ 	.get_ethtool_stats	= qca8k_get_ethtool_stats,
++	.get_stats64		= qca8k_get_stats64,
+ 	.get_sset_count		= qca8k_get_sset_count,
+ 	.set_ageing_time	= qca8k_set_ageing_time,
+ 	.support_eee		= dsa_supports_eee,
+@@ -2123,6 +2126,7 @@
+ 	for (i = 0; i < QCA8K_NUM_PORTS; i++)
+ 		qca8k_port_set_status(priv, i, 0);
+ 
++	qca8k_mib_poll_stop(priv);
+ 	dsa_unregister_switch(priv->ds);
+ }
+ 
