@@ -30,19 +30,19 @@ Signed-off-by: Salah Ahmed <haddad2inc@gmail.com>
   *
   * Note: If the user selects a mode that is not supported by hw, default
   * behavior is to fall back to software control of the LED. However not every
-@@ -66,6 +71,11 @@
- 	char device_name[IFNAMSIZ];
+@@ -67,6 +72,11 @@ struct led_netdev_data {
  	atomic_t interval;
  	unsigned int last_activity;
-+
+ 
 +	/* rate mode: byte-rate threshold in KiB/s, 0 = disabled */
 +	u64 rate_bytes;
 +	unsigned long rate_jiffies;
 +	u64 rate_threshold_kbps;
- 
++
  	unsigned long mode;
  	int link_speed;
-@@ -475,7 +485,38 @@
+ 	__ETHTOOL_DECLARE_LINK_MODE_MASK(supported_link_modes);
+@@ -475,7 +485,38 @@ static ssize_t interval_store(struct dev
  	return size;
  }
  
@@ -81,7 +81,7 @@ Signed-off-by: Salah Ahmed <haddad2inc@gmail.com>
  
  static ssize_t offloaded_show(struct device *dev,
  			      struct device_attribute *attr, char *buf)
-@@ -551,6 +592,7 @@
+@@ -551,6 +592,7 @@ static struct attribute *netdev_trig_att
  	&dev_attr_rx_err.attr,
  	&dev_attr_tx_err.attr,
  	&dev_attr_interval.attr,
@@ -89,7 +89,7 @@ Signed-off-by: Salah Ahmed <haddad2inc@gmail.com>
  	&dev_attr_offloaded.attr,
  	NULL
  };
-@@ -632,11 +674,46 @@
+@@ -632,6 +674,9 @@ static void netdev_trig_work(struct work
  	unsigned int new_activity;
  	struct rtnl_link_stats64 temp;
  	unsigned long interval;
@@ -99,11 +99,10 @@ Signed-off-by: Salah Ahmed <haddad2inc@gmail.com>
  	int invert;
  
  	/* If we dont have a device, insure we are off */
- 	if (!trigger_data->net_dev) {
- 		led_set_brightness(trigger_data->led_cdev, LED_OFF);
-+		return;
-+	}
-+
+@@ -640,6 +685,38 @@ static void netdev_trig_work(struct work
+ 		return;
+ 	}
+ 
 +	/* Rate mode: threshold-based blinking on the byte rate, sampled once
 +	 * per second. Independent of the packet-mode bits so that interfaces
 +	 * whose packet counters miss offloaded traffic still show activity,
@@ -133,6 +132,9 @@ Signed-off-by: Salah Ahmed <haddad2inc@gmail.com>
 +			}
 +		}
 +		schedule_delayed_work(&trigger_data->work, HZ / 2);
- 		return;
- 	}
- 
++		return;
++	}
++
+ 	/* If we are not looking for RX/TX then return  */
+ 	if (!test_bit(TRIGGER_NETDEV_TX, &trigger_data->mode) &&
+ 	    !test_bit(TRIGGER_NETDEV_RX, &trigger_data->mode) &&
