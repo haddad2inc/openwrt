@@ -1,0 +1,138 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Salah Ahmed <haddad2inc@gmail.com>
+Date: Wed, 1 Oct 2026 00:00:00 +0000
+Subject: [PATCH] leds: trigger-netdev: add byte-rate threshold mode
+
+The tx/rx modes blink per packet counted by the netdev, which misses
+traffic forwarded in hardware (DSA bridge offload) and flickers on
+background broadcast noise. Add a rate_threshold attribute (KiB/s):
+when non-zero the trigger samples rx_bytes+tx_bytes once per second and
+blinks on a 50..150 ms ladder above the threshold, staying solid on
+link (or off without carrier) below it. Byte-rate mode also works for
+interfaces whose packet counters are blind to offloaded flows, once
+their drivers report wire bytes in stats (see the qca8k cached MIB
+patch), making standard kernel triggers sufficient for switch ports
+without userspace helpers.
+
+Signed-off-by: Salah Ahmed <haddad2inc@gmail.com>
+---
+--- a/drivers/leds/trigger/ledtrig-netdev.c
++++ b/drivers/leds/trigger/ledtrig-netdev.c
+@@ -41,6 +41,11 @@
+  * rx -  LED blinks on receive data
+  * tx_err -  LED blinks on transmit error
+  * rx_err -  LED blinks on receive error
++ * rate_threshold - KiB/s; when non-zero the trigger blinks according to
++ *         the interface byte rate (ladder 50..150 ms) instead of per-packet,
++ *         staying solid on link below the threshold. Byte-rate mode sees
++ *         traffic that packet counters miss once the driver reports wire
++ *         bytes in its stats (e.g. cached switch MIB on DSA ports).
+  *
+  * Note: If the user selects a mode that is not supported by hw, default
+  * behavior is to fall back to software control of the LED. However not every
+@@ -66,6 +71,11 @@
+ 	char device_name[IFNAMSIZ];
+ 	atomic_t interval;
+ 	unsigned int last_activity;
++
++	/* rate mode: byte-rate threshold in KiB/s, 0 = disabled */
++	u64 rate_bytes;
++	unsigned long rate_jiffies;
++	u64 rate_threshold_kbps;
+ 
+ 	unsigned long mode;
+ 	int link_speed;
+@@ -475,7 +485,38 @@
+ 	return size;
+ }
+ 
++static ssize_t rate_threshold_show(struct device *dev,
++			     struct device_attribute *attr, char *buf)
++{
++	struct led_netdev_data *trigger_data = led_trigger_get_drvdata(dev);
++
++	return sprintf(buf, "%llu\n", trigger_data->rate_threshold_kbps);
++}
++
++static ssize_t rate_threshold_store(struct device *dev,
++			      struct device_attribute *attr, const char *buf,
++			      size_t size)
++{
++	struct led_netdev_data *trigger_data = led_trigger_get_drvdata(dev);
++	u64 value;
++	int ret;
++
++	if (trigger_data->hw_control)
++		return -EINVAL;
++
++	ret = kstrtou64(buf, 0, &value);
++	if (ret)
++		return ret;
++
++	trigger_data->rate_threshold_kbps = value;
++	trigger_data->rate_jiffies = 0;
++	schedule_delayed_work(&trigger_data->work, 0);
++
++	return size;
++}
++
+ static DEVICE_ATTR_RW(interval);
++static DEVICE_ATTR_RW(rate_threshold);
+ 
+ static ssize_t offloaded_show(struct device *dev,
+ 			      struct device_attribute *attr, char *buf)
+@@ -551,6 +592,7 @@
+ 	&dev_attr_rx_err.attr,
+ 	&dev_attr_tx_err.attr,
+ 	&dev_attr_interval.attr,
++	&dev_attr_rate_threshold.attr,
+ 	&dev_attr_offloaded.attr,
+ 	NULL
+ };
+@@ -632,11 +674,46 @@
+ 	unsigned int new_activity;
+ 	struct rtnl_link_stats64 temp;
+ 	unsigned long interval;
++	unsigned long now, ms;
++	u64 bytes, rate;
++	unsigned int elapsed;
+ 	int invert;
+ 
+ 	/* If we dont have a device, insure we are off */
+ 	if (!trigger_data->net_dev) {
+ 		led_set_brightness(trigger_data->led_cdev, LED_OFF);
++		return;
++	}
++
++	/* Rate mode: threshold-based blinking on the byte rate, sampled once
++	 * per second. Independent of the packet-mode bits so that interfaces
++	 * whose packet counters miss offloaded traffic still show activity,
++	 * and so that sub-threshold background noise stays solid on link.
++	 */
++	if (trigger_data->rate_threshold_kbps) {
++		dev_stats = dev_get_stats(trigger_data->net_dev, &temp);
++		bytes = dev_stats->rx_bytes + dev_stats->tx_bytes;
++		now = jiffies;
++		if (!trigger_data->rate_jiffies) {
++			trigger_data->rate_bytes = bytes;
++			trigger_data->rate_jiffies = now;
++		} else if (time_after(now, trigger_data->rate_jiffies + HZ)) {
++			elapsed = jiffies_to_msecs(now - trigger_data->rate_jiffies);
++			rate = (bytes - trigger_data->rate_bytes) * 1000 /
++			       ((u64)elapsed * 1024);
++			trigger_data->rate_bytes = bytes;
++			trigger_data->rate_jiffies = now;
++			led_stop_software_blink(trigger_data->led_cdev);
++			if (rate >= trigger_data->rate_threshold_kbps) {
++				ms = rate >= 4096 ? 50 : rate >= 1024 ? 60 :
++				     rate >= 256 ? 80 : rate >= 32 ? 100 : 150;
++				led_blink_set(trigger_data->led_cdev, &ms, &ms);
++			} else {
++				led_set_brightness(trigger_data->led_cdev,
++					trigger_data->carrier_link_up ? LED_ON : LED_OFF);
++			}
++		}
++		schedule_delayed_work(&trigger_data->work, HZ / 2);
+ 		return;
+ 	}
+ 
