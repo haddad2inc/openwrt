@@ -14,11 +14,22 @@ their drivers report wire bytes in stats (see the qca8k cached MIB
 patch), making standard kernel triggers sufficient for switch ports
 without userspace helpers.
 
+Use div_u64() for the rate computation so that 32-bit architectures
+link without __udivdi3/__aeabi_uldivmod.
+
 Signed-off-by: Salah Ahmed <haddad2inc@gmail.com>
 ---
 --- a/drivers/leds/trigger/ledtrig-netdev.c
 +++ b/drivers/leds/trigger/ledtrig-netdev.c
-@@ -41,6 +41,11 @@
+@@ -20,6 +20,7 @@
+ #include <linux/leds.h>
+ #include <linux/linkmode.h>
+ #include <linux/list.h>
++#include <linux/math64.h>
+ #include <linux/module.h>
+ #include <linux/netdevice.h>
+ #include <linux/mutex.h>
+@@ -41,6 +42,11 @@
   * rx -  LED blinks on receive data
   * tx_err -  LED blinks on transmit error
   * rx_err -  LED blinks on receive error
@@ -30,7 +41,7 @@ Signed-off-by: Salah Ahmed <haddad2inc@gmail.com>
   *
   * Note: If the user selects a mode that is not supported by hw, default
   * behavior is to fall back to software control of the LED. However not every
-@@ -67,6 +72,11 @@ struct led_netdev_data {
+@@ -67,6 +73,11 @@ struct led_netdev_data {
  	atomic_t interval;
  	unsigned int last_activity;
  
@@ -42,7 +53,7 @@ Signed-off-by: Salah Ahmed <haddad2inc@gmail.com>
  	unsigned long mode;
  	int link_speed;
  	__ETHTOOL_DECLARE_LINK_MODE_MASK(supported_link_modes);
-@@ -475,7 +485,38 @@ static ssize_t interval_store(struct dev
+@@ -475,7 +486,38 @@ static ssize_t interval_store(struct dev
  	return size;
  }
  
@@ -81,7 +92,7 @@ Signed-off-by: Salah Ahmed <haddad2inc@gmail.com>
  
  static ssize_t offloaded_show(struct device *dev,
  			      struct device_attribute *attr, char *buf)
-@@ -551,6 +592,7 @@ static struct attribute *netdev_trig_att
+@@ -551,6 +593,7 @@ static struct attribute *netdev_trig_att
  	&dev_attr_rx_err.attr,
  	&dev_attr_tx_err.attr,
  	&dev_attr_interval.attr,
@@ -89,7 +100,7 @@ Signed-off-by: Salah Ahmed <haddad2inc@gmail.com>
  	&dev_attr_offloaded.attr,
  	NULL
  };
-@@ -632,6 +674,9 @@ static void netdev_trig_work(struct work
+@@ -632,6 +675,9 @@ static void netdev_trig_work(struct work
  	unsigned int new_activity;
  	struct rtnl_link_stats64 temp;
  	unsigned long interval;
@@ -99,7 +110,7 @@ Signed-off-by: Salah Ahmed <haddad2inc@gmail.com>
  	int invert;
  
  	/* If we dont have a device, insure we are off */
-@@ -640,6 +685,38 @@ static void netdev_trig_work(struct work
+@@ -640,6 +686,38 @@ static void netdev_trig_work(struct work
  		return;
  	}
  
@@ -117,8 +128,8 @@ Signed-off-by: Salah Ahmed <haddad2inc@gmail.com>
 +			trigger_data->rate_jiffies = now;
 +		} else if (time_after(now, trigger_data->rate_jiffies + HZ)) {
 +			elapsed = jiffies_to_msecs(now - trigger_data->rate_jiffies);
-+			rate = (bytes - trigger_data->rate_bytes) * 1000 /
-+			       ((u64)elapsed * 1024);
++			rate = div_u64((bytes - trigger_data->rate_bytes) * 1000,
++				     elapsed * 1024);
 +			trigger_data->rate_bytes = bytes;
 +			trigger_data->rate_jiffies = now;
 +			led_stop_software_blink(trigger_data->led_cdev);
