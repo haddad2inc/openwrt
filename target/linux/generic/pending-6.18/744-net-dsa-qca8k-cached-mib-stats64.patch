@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Salah Ahmed <haddad2inc@gmail.com>
-Date: Wed, 30 Sep 2026 12:00:00 +0000
+Date: Wed, 1 Oct 2026 12:00:00 +0000
 Subject: [PATCH] net: dsa: qca8k: expose cached per-port MIB counters via
  get_stats64
 
@@ -13,28 +13,31 @@ sleeps on the regmap/MDIO bus while get_stats64() may not sleep.
 Follow the pattern established by the ar9331 driver in this same directory
 (cached rtnl_link_stats64 refreshed by a delayed work, served lock-protected
 from .get_stats64): poll RxGoodByte/TxByte per user port every 3 seconds and
-serve the cache. qca8k user ports then report the truth on the wire through
-the standard netdev statistics, without ethtool or userspace helpers.
+serve the cache. The cache fields sit at the top of struct qca8k_priv to stay
+clear of target-specific patches that extend its tail, such as the ipq40xx
+IPQ4019 built-in switch support.
 
 Signed-off-by: Salah Ahmed <haddad2inc@gmail.com>
 ---
 --- a/drivers/net/dsa/qca/qca8k.h
 +++ b/drivers/net/dsa/qca/qca8k.h
-@@ -469,6 +469,13 @@ struct qca8k_priv {
- 	struct qca8k_pcs pcs_port_6;
- 	const struct qca8k_match_data *info;
- 	struct qca8k_led ports_led[QCA8K_LED_COUNT];
-+
+@@ -443,6 +443,15 @@ struct qca8k_led {
+ };
+ 
+ struct qca8k_priv {
 +	/* Cached per-port wire statistics from the switch MIB, refreshed by
 +	 * mib_poll_work so that .get_stats64 (atomic context) never sleeps.
++	 * Placed at the top of the struct to stay clear of target-specific
++	 * patches that extend its tail (e.g. ipq40xx IPQ4019 support).
 +	 */
 +	struct rtnl_link_stats64 port_stats[QCA8K_NUM_PORTS];
 +	spinlock_t stats_lock;
 +	struct delayed_work mib_poll_work;
- };
- 
- struct qca8k_mib_desc {
-@@ -513,6 +520,11 @@ int qca8k_rmw(struct qca8k_priv *priv, u
++
+ 	u8 switch_id;
+ 	u8 switch_revision;
+ 	u8 mirror_rx;
+@@ -513,6 +522,11 @@ int qca8k_rmw(struct qca8k_priv *priv, u
  /* Common ops function */
  void qca8k_fdb_flush(struct qca8k_priv *priv);
  
