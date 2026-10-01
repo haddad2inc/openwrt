@@ -1,22 +1,22 @@
-=== BUILD LOG (primary) - Thu Oct  1 19:23:56 +03 2026 ===
+=== BUILD LOG (primary) - Thu Oct  1 20:21:06 +03 2026 ===
 Matrix slot           : primary
-Matrix label          : snapshot-latest
+Matrix label          : snapshot-latest-without-740
 Workflow triggered by : workflow_dispatch
 Repository            : haddad2inc/openwrt
-Commit                : b2517ebb8b3377dab3ecf3e3fd11e2c49088db66
+Commit                : 8b2111913590af4c4ae1b0bdcca0d827f17bf3fa
 OpenWrt branch input  : snapshot
 OpenWrt git branch    : master
 OpenWrt tag           : <none>
 Patch version input   : <empty>
-Output suffix         : '<empty>'
+Output suffix         : 'without-740'
 DTS choice            : qca9563_comfast_cf-wa350.dts
 include_files         : true
 patch_731 (input)     : true
-patch_740 (input)     : true
+patch_740 (input)     : false
 patch_744 (input)     : true
 patch_745 (input)     : true
 import_cfw_leds       : false
 attach_theme          : false
 ========================================
-Build started at: Thu Oct  1 19:23:56 +03 2026
+Build started at: Thu Oct  1 20:21:06 +03 2026
 ========================================
