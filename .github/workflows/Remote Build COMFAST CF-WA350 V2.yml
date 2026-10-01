@@ -75,6 +75,16 @@ on:
         required: false
         default: false
         type: boolean
+      patch_741:
+        description: 'Include patch 741 (net-dsa-qca8k-cached-mib-stats64) → target/linux/ath79/patches-6.18/'
+        required: false
+        default: false
+        type: boolean
+      patch_742:
+        description: 'Include patch 742 (leds-trigger-netdev-add-rate-threshold-mode) → target/linux/generic/pending-6.18/'
+        required: false
+        default: false
+        type: boolean
 
       import_cfw_leds:
         description: 'Import cfw-leds package into openwrt/package/utils/'
@@ -128,6 +138,8 @@ jobs:
           echo "include_files : ${{ github.event.inputs.include_files }}"
           echo "patch_731     : ${{ github.event.inputs.patch_731 }}"
           echo "patch_740     : ${{ github.event.inputs.patch_740 }}"
+          echo "patch_741     : ${{ github.event.inputs.patch_741 }}"
+          echo "patch_742     : ${{ github.event.inputs.patch_742 }}"
 
           if [ -n "$P1" ]; then
             LABEL1="${B1}-${P1}${SUFFIX_PART}"
@@ -292,6 +304,8 @@ jobs:
         echo "include_files         : ${{ github.event.inputs.include_files }}" >> "$LOGFILE"
         echo "patch_731 (input)     : ${{ github.event.inputs.patch_731 }}" >> "$LOGFILE"
         echo "patch_740 (input)     : ${{ github.event.inputs.patch_740 }}" >> "$LOGFILE"
+        echo "patch_741 (input)     : ${{ github.event.inputs.patch_741 }}" >> "$LOGFILE"
+        echo "patch_742 (input)     : ${{ github.event.inputs.patch_742 }}" >> "$LOGFILE"
         echo "import_cfw_leds       : ${{ github.event.inputs.import_cfw_leds }}" >> "$LOGFILE"
         echo "attach_theme          : ${{ github.event.inputs.attach_theme }}" >> "$LOGFILE"
         echo "========================================" >> "$LOGFILE"
@@ -521,6 +535,8 @@ jobs:
         DTS_CHOICE="${{ github.event.inputs.dts_choice }}"
         PATCH_731_INPUT="${{ github.event.inputs.patch_731 }}"
         PATCH_740_INPUT="${{ github.event.inputs.patch_740 }}"
+        PATCH_741_INPUT="${{ github.event.inputs.patch_741 }}"
+        PATCH_742_INPUT="${{ github.event.inputs.patch_742 }}"
 
         INCLUDE_731="false"
         if [ "$PATCH_731_INPUT" = "true" ]; then
@@ -539,9 +555,23 @@ jobs:
           echo "ℹ️ patch_740 = true (user requested)" | tee -a "$LOGFILE"
         fi
 
+        INCLUDE_741="false"
+        if [ "$PATCH_741_INPUT" = "true" ]; then
+          INCLUDE_741="true"
+          echo "ℹ️ patch_741 = true (user requested)" | tee -a "$LOGFILE"
+        fi
+
+        INCLUDE_742="false"
+        if [ "$PATCH_742_INPUT" = "true" ]; then
+          INCLUDE_742="true"
+          echo "ℹ️ patch_742 = true (user requested)" | tee -a "$LOGFILE"
+        fi
+
         echo "=== Include decisions ===" | tee -a "$LOGFILE"
         echo "INCLUDE_731 = $INCLUDE_731" | tee -a "$LOGFILE"
         echo "INCLUDE_740 = $INCLUDE_740" | tee -a "$LOGFILE"
+        echo "INCLUDE_741 = $INCLUDE_741" | tee -a "$LOGFILE"
+        echo "INCLUDE_742 = $INCLUDE_742" | tee -a "$LOGFILE"
 
         mkdir -p /tmp/patch-skip
         rm -f /tmp/patch-skip/* 2>/dev/null || true
@@ -557,6 +587,12 @@ jobs:
             KEEP="true"
           fi
           if echo "$base" | grep -q "^740-" && [ "$INCLUDE_740" = "true" ]; then
+            KEEP="true"
+          fi
+          if echo "$base" | grep -q "^741-" && [ "$INCLUDE_741" = "true" ]; then
+            KEEP="true"
+          fi
+          if echo "$base" | grep -q "^742-" && [ "$INCLUDE_742" = "true" ]; then
             KEEP="true"
           fi
           if [ "$KEEP" = "true" ]; then
@@ -577,6 +613,8 @@ jobs:
 
         echo "INCLUDE_731=$INCLUDE_731" >> "$GITHUB_ENV"
         echo "INCLUDE_740=$INCLUDE_740" >> "$GITHUB_ENV"
+        echo "INCLUDE_741=$INCLUDE_741" >> "$GITHUB_ENV"
+        echo "INCLUDE_742=$INCLUDE_742" >> "$GITHUB_ENV"
 
     - name: Apply patches via Python script
       run: |
@@ -684,6 +722,55 @@ jobs:
         shopt -u nullglob
 
         echo "✅ Patch location enforcement complete." | tee -a "$LOG"
+
+    # =====================================================================
+    # Attach patch 741 / 742 to their dedicated destinations
+    # =====================================================================
+    - name: Attach patch 741 / 742 to their dedicated destinations
+      run: |
+        set -o pipefail
+        echo "=== Attaching patch 741 / 742 to their dedicated destinations ===" | tee -a "$LOGFILE"
+
+        INCLUDE_741="${{ github.event.inputs.patch_741 }}"
+        INCLUDE_742="${{ github.event.inputs.patch_742 }}"
+
+        # ------- Patch 741 → openwrt/target/linux/ath79/patches-6.18/ -------
+        if [ "$INCLUDE_741" = "true" ]; then
+          SRC_741=$(ls patches/741-*.patch 2>/dev/null | head -n1)
+          if [ -n "$SRC_741" ] && [ -f "$SRC_741" ]; then
+            DEST_DIR_741="openwrt/target/linux/ath79/patches-6.18"
+            mkdir -p "$DEST_DIR_741"
+            cp -v "$SRC_741" "$DEST_DIR_741/" 2>&1 | tee -a "$LOGFILE"
+            echo "✅ 741 patch attached → $DEST_DIR_741/$(basename "$SRC_741")" | tee -a "$LOGFILE"
+          else
+            echo "❌ ERROR: patch_741 = true but no 'patches/741-*.patch' found." | tee -a "$LOGFILE"
+            ls -la patches/ | tee -a "$LOGFILE"
+            exit 1
+          fi
+        else
+          echo "ℹ️ patch_741 not selected → skipping." | tee -a "$LOGFILE"
+        fi
+
+        # ------- Patch 742 → openwrt/target/linux/generic/pending-6.18/ -------
+        if [ "$INCLUDE_742" = "true" ]; then
+          SRC_742=$(ls patches/742-*.patch 2>/dev/null | head -n1)
+          if [ -n "$SRC_742" ] && [ -f "$SRC_742" ]; then
+            DEST_DIR_742="openwrt/target/linux/generic/pending-6.18"
+            mkdir -p "$DEST_DIR_742"
+            cp -v "$SRC_742" "$DEST_DIR_742/" 2>&1 | tee -a "$LOGFILE"
+            echo "✅ 742 patch attached → $DEST_DIR_742/$(basename "$SRC_742")" | tee -a "$LOGFILE"
+          else
+            echo "❌ ERROR: patch_742 = true but no 'patches/742-*.patch' found." | tee -a "$LOGFILE"
+            ls -la patches/ | tee -a "$LOGFILE"
+            exit 1
+          fi
+        else
+          echo "ℹ️ patch_742 not selected → skipping." | tee -a "$LOGFILE"
+        fi
+
+        echo "=== Final check for 741/742 in OpenWrt tree ===" | tee -a "$LOGFILE"
+        find openwrt/target/linux -maxdepth 4 \( -name '741-*.patch' -o -name '742-*.patch' \) 2>/dev/null | tee -a "$LOGFILE" || true
+        echo "✅ 741/742 attachment step complete." | tee -a "$LOGFILE"
 
     - name: Inject custom files
       if: ${{ github.event.inputs.include_files == 'true' }}
@@ -900,6 +987,8 @@ jobs:
         echo "DTS SHA        : ${SELECTED_DTS_SHA256:-<unknown>}" | tee -a "$LOGFILE"
         echo "Patch 731      : ${{ env.INCLUDE_731 }}" | tee -a "$LOGFILE"
         echo "Patch 740      : ${{ env.INCLUDE_740 }}" | tee -a "$LOGFILE"
+        echo "Patch 741      : ${{ env.INCLUDE_741 }}" | tee -a "$LOGFILE"
+        echo "Patch 742      : ${{ env.INCLUDE_742 }}" | tee -a "$LOGFILE"
         echo "Build started at: $(date)" | tee -a "$LOGFILE"
         cd openwrt
         make -j$(nproc) V=s 2>&1 | tee -a "../$LOGFILE"
@@ -965,6 +1054,8 @@ jobs:
 
         mkdir -p out/injected/kernel-patches
         find target/linux/ath79 -maxdepth 2 -path '*/patches-6.*/*.patch' -exec cp -v {} out/injected/kernel-patches/ \; 2>/dev/null || true
+        # also collect any 741/742 in generic tree
+        find target/linux/generic -maxdepth 2 -path '*/pending-6.*/*.patch' -name '74[12]-*.patch' -exec cp -v {} out/injected/kernel-patches/ \; 2>/dev/null || true
 
         mkdir -p out/injected/kernel-config
         for kc in target/linux/ath79/config-6.*; do
@@ -990,8 +1081,12 @@ jobs:
         echo "include_files  : ${{ github.event.inputs.include_files }}" | tee -a out/logs/41-build-choices.txt
         echo "patch_731 input: ${{ github.event.inputs.patch_731 }}" | tee -a out/logs/41-build-choices.txt
         echo "patch_740 input: ${{ github.event.inputs.patch_740 }}" | tee -a out/logs/41-build-choices.txt
+        echo "patch_741 input: ${{ github.event.inputs.patch_741 }}" | tee -a out/logs/41-build-choices.txt
+        echo "patch_742 input: ${{ github.event.inputs.patch_742 }}" | tee -a out/logs/41-build-choices.txt
         echo "INCLUDE_731    : ${INCLUDE_731:-<unset>}" | tee -a out/logs/41-build-choices.txt
         echo "INCLUDE_740    : ${INCLUDE_740:-<unset>}" | tee -a out/logs/41-build-choices.txt
+        echo "INCLUDE_741    : ${INCLUDE_741:-<unset>}" | tee -a out/logs/41-build-choices.txt
+        echo "INCLUDE_742    : ${INCLUDE_742:-<unset>}" | tee -a out/logs/41-build-choices.txt
 
         echo "=== uImage kernel size (bytes 12..15, big endian) ===" | tee -a "../$LOGFILE"
         for img in out/images/*cf-wa350-squashfs-sysupgrade.bin; do
