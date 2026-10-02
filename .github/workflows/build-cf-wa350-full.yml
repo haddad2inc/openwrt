@@ -1,0 +1,166 @@
+name: build-cf-wa350-full
+
+# Builds one CF-WA350 image that combines every piece of the project:
+#   base branch  : kernel patches (744 qca8k stats64, 745 netdev rate_threshold, 706 refresh)
+#   + PR #25474  : 740 macronix name restore            (cherry-pick, optional)
+#   + PR #25477  : 731 ar8216 guard                     (cherry-pick, optional, explicit-mdio only)
+#   + PR #25040  : device commit                        (cherry-pick, optional)
+#   + ci-wa350   : DTS variant (sha-gated) and .config asset
+# Every picked sha and every gate result is printed on the identity card so the
+# artifact link and the flashed image can always be matched.
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_branch:
+        description: Branch carrying the kernel patches (744/745/706-refresh)
+        required: false
+        default: k1-qca8k-stats
+        type: string
+      include_pr25474:
+        description: Cherry-pick PR #25474 (patch 740 macronix .name restore)
+        required: false
+        default: true
+        type: boolean
+      include_pr25477:
+        description: Cherry-pick PR #25477 (patch 731 ar8216 guard; required for
+          explicit-mdio DTS, harmless regression witness on legacy mapping)
+        required: false
+        default: true
+        type: boolean
+      include_pr25040:
+        description: Cherry-pick PR #25040 (device commit; 01_leds/DTS/generic.mk)
+        required: false
+        default: true
+        type: boolean
+      dts_file:
+        description: DTS variant from root dts/ folder on ci-wa350
+        required: false
+        default: qca9563_comfast_cf-wa350.dts
+        type: choice
+        options:
+          - qca9563_comfast_cf-wa350.dts
+          - qca9563_comfast_cf-wa350-internal-mdio.dts
+          - qca9563_comfast_cf-wa350-explicit-mdio.dts
+          - qca9563_comfast_cf-wa350-external.dts
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Checkout kernel branch
+        uses: actions/checkout@v4
+        with:
+          repository: haddad2inc/openwrt
+          ref: ${{ inputs.kernel_branch }}
+          fetch-depth: 0
+
+      - name: Fetch our PR branches
+        run: |
+          set +e
+          mkdir -p logs
+          git fetch origin comfast-cf-wa350-support \
+                        ath79-mtd-mx25l12805d-restore-name \
+                        ath79-ar8216-internal-mdio || { echo "::error::fetch PR branches failed"; exit 1; }
+          git log --oneline -1 origin/comfast-cf-wa350-support | tee logs/heads.txt
+          git log --oneline -1 origin/ath79-mtd-mx25l12805d-restore-name | tee -a logs/heads.txt
+          git log --oneline -1 origin/ath79-ar8216-internal-mdio | tee -a logs/heads.txt
+          exit 0
+
+      - name: Cherry-pick our PRs
+        run: |
+          set +e
+          : > logs/picks.txt
+          pick() {
+            sha="$(git rev-parse "$1")"
+            if git cherry-pick -x "$sha" >>logs/picks.txt 2>&1; then
+              echo "PICKED $2 $sha" | tee -a logs/picks.txt
+            else
+              echo "::error::cherry-pick conflict in $2 ($sha)"
+              git cherry-pick --abort
+              exit 1
+            fi
+          }
+          [ "${{ inputs.include_pr25474 }}" = "true" ] && pick origin/ath79-mtd-mx25l12805d-restore-name PR-25474
+          [ "${{ inputs.include_pr25477 }}" = "true" ] && pick origin/ath79-ar8216-internal-mdio PR-25477
+          [ "${{ inputs.include_pr25040 }}" = "true" ] && pick origin/comfast-cf-wa350-support PR-25040
+          git log --oneline ${{ inputs.kernel_branch }}..HEAD | tee -a logs/picks.txt
+          exit 0
+
+      - name: Pull root assets from ci-wa350
+        run: |
+          set +e
+          git fetch --depth 1 origin ci-wa350 || exit 1
+          mkdir -p /tmp/assets
+          git show "origin/ci-wa350:dts/${{ inputs.dts_file }}" > "/tmp/assets/dts" || exit 1
+          git show "origin/ci-wa350:.config" > "/tmp/assets/.config" || exit 1
+          sha256sum /tmp/assets/* | tee logs/assets.sha256
+          exit 0
+
+      - name: Inject DTS + classify variant + sha gate
+        run: |
+          set +e
+          D=target/linux/ath79/dts/qca9563_comfast_cf-wa350.dts
+          cp /tmp/assets/dts "$D"
+          S="$(sha256sum "$D" | cut -d' ' -f1)"
+          case "${{ inputs.dts_file }}" in
+            *external*) V=EXTERNAL-MDIO;     E=c7cd13705d797229600a2d85f180fdb6736f39b493a7205c0211c746aaf015ca ;;
+            *explicit*) V=INTERNAL-EXPLICIT; E=a755306340109abe2c63c47adb4144131011e12913f7ee3781c095be1dbe637e ;;
+            *)          V=INTERNAL-LEGACY;   E=1544a5482fabf497479b6acb6d21ec68ab450a7f253239b84ff61fd843c9bb30 ;;
+          esac
+          { echo "variant    = $V"; echo "dts_file   = ${{ inputs.dts_file }}"; echo "dts_sha256 = $S"; } | tee logs/variant.txt
+          [ "$S" = "$E" ] || { echo "::error::DTS sha mismatch"; exit 1; }
+          echo "V=$V" >> "$GITHUB_ENV"
+          exit 0
+
+      - name: Config from root .config + luci/ethtool + defconfig + proofs
+        run: |
+          set +e
+          cp /tmp/assets/.config .config
+          # the ci-wa350 .config asset disables the LuCI meta package and ethtool;
+          # validation images must ship both (web UI + LED MIB probe tooling)
+          sed -i 's/^# CONFIG_PACKAGE_luci is not set/CONFIG_PACKAGE_luci=y/' .config
+          grep -q '^CONFIG_PACKAGE_ethtool=y' .config || echo 'CONFIG_PACKAGE_ethtool=y' >> .config
+          ./scripts/feeds update -a >/dev/null 2>&1
+          ./scripts/feeds install -a >/dev/null 2>&1
+          make defconfig || exit 1
+          grep -E '^CONFIG_TARGET_PROFILE=|^CONFIG_PACKAGE_kmod-dsa-qca8k=|^CONFIG_TARGET_ROOTFS_INITRAMFS=|^CONFIG_GCC_VERSION=|^CONFIG_PACKAGE_luci=|^CONFIG_PACKAGE_ethtool=' .config | tee logs/config-proof.txt
+          grep -q '^CONFIG_PACKAGE_luci=y' .config || { echo "::error::luci missing after defconfig"; exit 1; }
+          exit 0
+
+      - name: Build (sysupgrade + initramfs)
+        run: |
+          set +e
+          make -j"$(nproc)" V=s 2>&1 | tee logs/build.log
+          rc=${PIPESTATUS[0]}
+          ls -l bin/targets/ath79/generic/ | tee logs/bin-list.txt
+          sha256sum bin/targets/ath79/generic/*cf-wa350* 2>/dev/null | tee logs/images.sha256
+          exit "$rc"
+
+      - name: Identity card
+        if: always()
+        run: |
+          set +e
+          {
+            echo "kernel_branch = ${{ inputs.kernel_branch }} ($(git rev-parse ${{ inputs.kernel_branch }}))"
+            echo "picked:"
+            cat logs/picks.txt 2>/dev/null | grep PICKED
+            cat logs/variant.txt 2>/dev/null
+            echo "config_proof:"; cat logs/config-proof.txt 2>/dev/null
+            echo "kernel = 6.18$(grep -m1 'LINUX_VERSION-6.18' target/linux/generic/kernel-6.18 2>/dev/null | sed 's/.*= //')"
+            echo "date   = $(date -u +%FT%TZ)"
+            echo "runner = $RUNNER_NAME"
+          } > logs/00-identity.txt
+          cat logs/00-identity.txt
+          exit 0
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cf-wa350-full-${{ inputs.dts_file }}-${{ github.run_number }}
+          path: |
+            logs/
+            bin/targets/ath79/generic/*cf-wa350*
+          retention-days: 30
