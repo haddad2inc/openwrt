@@ -1,22 +1,50 @@
 name: build-cf-wa350-full
 
 # Builds one CF-WA350 image that combines every piece of the project:
-#   base branch  : kernel patches (744 qca8k stats64, 745 netdev rate_threshold, 706 refresh)
-#   + PR #25474  : 740 macronix name restore            (cherry-pick, optional)
+#   base branch  : comfast-cf-wa350-support = PR #25040 device commit (freshest, rebased on current main)
+#   + kernel_branch range : 744 qca8k cached stats64, 745 netdev rate_threshold, ipq40xx 706 refresh
+#   + PR #25474  : 740 macronix .name restore            (cherry-pick, optional)
 #   + PR #25477  : 731 ar8216 guard                     (cherry-pick, optional, explicit-mdio only)
-#   + PR #25040  : device commit                        (cherry-pick, optional)
+#   + PR #25040  : device commit                        (cherry-pick, optional; skipped when the base already carries it)
 #   + ci-wa350   : DTS variant (sha-gated) and .config asset
-# Every picked sha and every gate result is printed on the identity card so the
-# artifact link and the flashed image can always be matched.
+#
+# v5 (run 37005732172 post-mortem): the base is now the DEVICE branch and the kernel
+# commits are picked on top, because k1-qca8k-stats already contains the device tree
+# (it was grown from 4ca06c6439, the unsigned twin of the PR head d0361a04dc).
+# Picking d0361a04dc onto it yields an EMPTY commit, which git reports with a non-zero
+# exit status - the old pick() treated every non-zero status as "conflict" and aborted.
+# pick() now has five ordered gates:
+#   1 ALREADY-IN-BASE       merge-base --is-ancestor
+#   2 EQUIVALENT-IN-BASE    git cherry patch-id match (rebased / re-signed twin)
+#   3 TREE-ALREADY-IN-BASE  every blob the commit touches is byte-identical at HEAD
+#   4 EMPTY-AFTER-PICK      cherry-pick produced no diff -> --skip, still counted as applied
+#   5 real conflict         prints the conflicted paths, writes per-file diffs to
+#                           logs/conflict-<label>.txt (uploaded as artifact), then fails
+# Every gate result is printed on the identity card so the artifact link and the
+# flashed image can always be matched.
 
 on:
   workflow_dispatch:
     inputs:
+      base_branch:
+        description: "Base branch of the integration build (device commit = PR #25040 head)"
+        required: false
+        default: comfast-cf-wa350-support
+        type: choice
+        options:
+          - comfast-cf-wa350-support
+          - k1-qca8k-stats
+          - main
       kernel_branch:
-        description: Branch carrying the kernel patches (744/745/706-refresh)
+        description: "Branch carrying the kernel patches (744/745/706-refresh); commits above merge-base with the base branch are picked"
         required: false
         default: k1-qca8k-stats
         type: string
+      include_kernel_patches:
+        description: "Cherry-pick the kernel_branch commit range (744 stats64 + 745 rate_threshold + 706 refresh)"
+        required: false
+        default: true
+        type: boolean
       include_pr25474:
         description: "Cherry-pick PR #25474 (patch 740 macronix .name restore)"
         required: false
@@ -28,7 +56,7 @@ on:
         default: true
         type: boolean
       include_pr25040:
-        description: "Cherry-pick PR #25040 (device commit; 01_leds/DTS/generic.mk)"
+        description: "Cherry-pick PR #25040 (device commit; skipped automatically when the base already carries its content)"
         required: false
         default: true
         type: boolean
@@ -48,49 +76,142 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     steps:
-      - name: Checkout kernel branch
+      - name: Checkout base branch
         uses: actions/checkout@v4
         with:
           repository: haddad2inc/openwrt
-          ref: ${{ inputs.kernel_branch }}
+          ref: ${{ inputs.base_branch }}
           fetch-depth: 0
 
-      - name: Fetch our PR branches
+      - name: Fetch branches used by the gates
         run: |
           set +e
           mkdir -p logs
-          git fetch origin comfast-cf-wa350-support \
-                        ath79-mtd-mx25l12805d-restore-name \
-                        ath79-ar8216-internal-mdio || { echo "::error::fetch PR branches failed"; exit 1; }
-          git log --oneline -1 origin/comfast-cf-wa350-support | tee logs/heads.txt
-          git log --oneline -1 origin/ath79-mtd-mx25l12805d-restore-name | tee -a logs/heads.txt
-          git log --oneline -1 origin/ath79-ar8216-internal-mdio | tee -a logs/heads.txt
+          git fetch origin main \
+                           "${{ inputs.kernel_branch }}" \
+                           comfast-cf-wa350-support \
+                           ath79-mtd-mx25l12805d-restore-name \
+                           ath79-ar8216-internal-mdio || { echo "::error::fetch branches failed"; exit 1; }
+          {
+            echo "base_branch    = ${{ inputs.base_branch }} $(git rev-parse HEAD)"
+            echo "kernel_branch  = ${{ inputs.kernel_branch }} $(git rev-parse origin/${{ inputs.kernel_branch }} 2>/dev/null || git rev-parse ${{ inputs.kernel_branch }})"
+            echo "PR-25040 head  = $(git rev-parse origin/comfast-cf-wa350-support)"
+            echo "PR-25474 head  = $(git rev-parse origin/ath79-mtd-mx25l12805d-restore-name)"
+            echo "PR-25477 head  = $(git rev-parse origin/ath79-ar8216-internal-mdio)"
+            echo "fork main      = $(git rev-parse origin/main)"
+          } | tee logs/heads.txt
           exit 0
 
-      - name: Cherry-pick our PRs
+      - name: Cherry-pick kernel range + our PRs
         run: |
           set +e
           git config user.name "haddad2inc"
           git config user.email "haddad2inc@gmail.com"
           : > logs/picks.txt
+          BASE_SHA="$(git rev-parse HEAD)"
+
+          log() { echo "$1" | tee -a logs/picks.txt; }
+
+          # gate 3: blob-level state of everything the commit touches, versus HEAD.
+          # The raw diff gives the post-image blob sha of each path, so this compares
+          # CONTENT and not patch text: a rebased/reworded twin whose files already sit
+          # in the base is recognised even when its patch-id differs.
+          #   0 = every touched blob is already byte-identical at HEAD (nothing to apply)
+          #   1 = some blobs identical, some not (the pick will merge only the remainder)
+          #   2 = no blob identical (plain pick)
+          content_state() {
+            local m1 m2 s1 s2 st p1 p2 same=0 diff=0
+            while read -r m1 m2 s1 s2 st p1 p2; do
+              [ -n "$st" ] || continue
+              case "$st" in
+                D*) if git rev-parse -q --verify "HEAD:$p1" >/dev/null; then diff=$((diff+1)); else same=$((same+1)); fi ;;
+                *)  [ -n "$p2" ] || p2="$p1"
+                    if [ "$s2" != "0000000000000000000000000000000000000000" ] \
+                       && [ "$(git rev-parse -q --verify "HEAD:$p2" 2>/dev/null)" = "$s2" ]; then
+                      same=$((same+1))
+                    else
+                      diff=$((diff+1))
+                    fi ;;
+              esac
+            done < <(git show --no-color --no-abbrev --format= --raw -m --first-parent --find-renames "$1")
+            [ "$same" -gt 0 ] && [ "$diff" -eq 0 ] && return 0
+            [ "$same" -gt 0 ] && return 1
+            return 2
+          }
+
           pick() {
-            sha="$(git rev-parse "$1")"
+            local ref="$1" label="$2" sha
+            sha="$(git rev-parse "$ref")" || { echo "::error::$label: cannot resolve $ref"; exit 1; }
             if git merge-base --is-ancestor "$sha" HEAD; then
-              echo "ALREADY-IN-BASE $2 $sha" | tee -a logs/picks.txt
+              log "ALREADY-IN-BASE $label $sha"
               return 0
             fi
-            if git cherry-pick -x "$sha" >>logs/picks.txt 2>&1; then
-              echo "PICKED $2 $sha" | tee -a logs/picks.txt
-            else
-              echo "::error::cherry-pick conflict in $2 ($sha)"
-              git cherry-pick --abort
-              exit 1
+            if git cherry HEAD "$sha" 2>/dev/null | grep -q "^- $sha"; then
+              log "EQUIVALENT-IN-BASE $label $sha (patch-id match; rebased/re-signed twin)"
+              return 0
             fi
+            content_state "$sha"; cs=$?
+            if [ "$cs" -eq 0 ]; then
+              log "TREE-ALREADY-IN-BASE $label $sha (every touched blob identical at HEAD)"
+              return 0
+            fi
+            [ "$cs" -eq 1 ] && log "PARTIAL-CONTENT-IN-BASE $label $sha (some blobs already identical; picking the rest)"
+            local out rc cs
+            out="$(git cherry-pick -x "$sha" 2>&1)"
+            rc=$?
+            printf '%s\n' "$out" >> logs/picks.txt
+            if [ "$rc" -eq 0 ]; then
+              log "PICKED $label $sha"
+              return 0
+            fi
+            # gate 4: git refuses to create an empty commit and exits non-zero.
+            # Proof that this is "empty" and not "conflict": no CHERRY_PICK_HEAD was
+            # recorded and the index/worktree carry no change and no unmerged path.
+            if { printf '%s' "$out" | grep -qi 'now empty'; } \
+               || { ! git rev-parse -q --verify CHERRY_PICK_HEAD >/dev/null \
+                    && git diff-index --quiet HEAD -- 2>/dev/null \
+                    && [ -z "$(git diff --name-only --diff-filter=U)" ]; }; then
+              git cherry-pick --skip >/dev/null 2>&1 || git cherry-pick --quit >/dev/null 2>&1
+              log "EMPTY-AFTER-PICK $label $sha (change already present; skipped, nothing lost)"
+              return 0
+            fi
+            {
+              echo "=== $label $sha ==="
+              printf '%s\n' "$out"
+              echo "--- git status --porcelain ---"
+              git status --porcelain
+              echo "--- unmerged files ---"
+              git diff --name-only --diff-filter=U
+              for f in $(git diff --name-only --diff-filter=U); do
+                echo "--- diff HEAD..$sha -- $f ---"
+                git diff "HEAD..$sha" -- "$f"
+              done
+            } > "logs/conflict-$label.txt" 2>&1
+            echo "::error::cherry-pick conflict in $label ($sha) - see artifact logs/conflict-$label.txt"
+            cat "logs/conflict-$label.txt"
+            git cherry-pick --abort
+            exit 1
           }
+
+          if [ "${{ inputs.include_kernel_patches }}" = "true" ]; then
+            KB="${{ inputs.kernel_branch }}"
+            git rev-parse -q --verify "origin/$KB" >/dev/null && KB="origin/$KB"
+            MB="$(git merge-base "$KB" HEAD)"
+            N="$(git rev-list --count "$MB..$KB")"
+            log "KERNEL-RANGE $KB merge-base=$MB commits=$N"
+            if [ "$N" -gt 0 ]; then
+              for c in $(git rev-list --reverse "$MB..$KB"); do
+                pick "$c" "KERNEL-$(git log -1 --format=%h $c)"
+              done
+            else
+              log "KERNEL-RANGE-EMPTY $KB (nothing above merge-base)"
+            fi
+          fi
           [ "${{ inputs.include_pr25474 }}" = "true" ] && pick origin/ath79-mtd-mx25l12805d-restore-name PR-25474
           [ "${{ inputs.include_pr25477 }}" = "true" ] && pick origin/ath79-ar8216-internal-mdio PR-25477
           [ "${{ inputs.include_pr25040 }}" = "true" ] && pick origin/comfast-cf-wa350-support PR-25040
-          git log --oneline ${{ inputs.kernel_branch }}..HEAD | tee -a logs/picks.txt
+          log "HEAD-NOW $(git rev-parse HEAD) (base was $BASE_SHA)"
+          git log --oneline "$BASE_SHA..HEAD" | tee -a logs/picks.txt
           exit 0
 
       - name: Pull root assets from ci-wa350
@@ -148,9 +269,10 @@ jobs:
         run: |
           set +e
           {
-            echo "kernel_branch = ${{ inputs.kernel_branch }} ($(git rev-parse ${{ inputs.kernel_branch }}))"
-            echo "picked:"
-            cat logs/picks.txt 2>/dev/null | grep PICKED
+            echo "base_branch    = ${{ inputs.base_branch }} ($(git rev-parse ${{ inputs.base_branch }} 2>/dev/null || git rev-parse origin/${{ inputs.base_branch }}))"
+            echo "kernel_branch  = ${{ inputs.kernel_branch }} ($(git rev-parse ${{ inputs.kernel_branch }} 2>/dev/null || git rev-parse origin/${{ inputs.kernel_branch }}))"
+            echo "heads:"; cat logs/heads.txt 2>/dev/null
+            echo "gates:"; cat logs/picks.txt 2>/dev/null | grep -E 'ALREADY-IN-BASE|EQUIVALENT-IN-BASE|TREE-ALREADY-IN-BASE|EMPTY-AFTER-PICK|PICKED|KERNEL-RANGE|HEAD-NOW'
             cat logs/variant.txt 2>/dev/null
             echo "config_proof:"; cat logs/config-proof.txt 2>/dev/null
             echo "kernel = 6.18$(grep -m1 'LINUX_VERSION-6.18' target/linux/generic/kernel-6.18 2>/dev/null | sed 's/.*= //')"
