@@ -18,18 +18,17 @@ on:
         default: k1-qca8k-stats
         type: string
       include_pr25474:
-        description: Cherry-pick PR #25474 (patch 740 macronix .name restore)
+        description: "Cherry-pick PR #25474 (patch 740 macronix .name restore)"
         required: false
         default: true
         type: boolean
       include_pr25477:
-        description: Cherry-pick PR #25477 (patch 731 ar8216 guard; required for
-          explicit-mdio DTS, harmless regression witness on legacy mapping)
+        description: "Cherry-pick PR #25477 (patch 731 ar8216 guard; required for explicit-mdio DTS, harmless regression witness on legacy mapping)"
         required: false
         default: true
         type: boolean
       include_pr25040:
-        description: Cherry-pick PR #25040 (device commit; 01_leds/DTS/generic.mk)
+        description: "Cherry-pick PR #25040 (device commit; 01_leds/DTS/generic.mk)"
         required: false
         default: true
         type: boolean
@@ -71,6 +70,8 @@ jobs:
       - name: Cherry-pick our PRs
         run: |
           set +e
+          git config user.name "haddad2inc"
+          git config user.email "haddad2inc@gmail.com"
           : > logs/picks.txt
           pick() {
             sha="$(git rev-parse "$1")"
