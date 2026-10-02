@@ -75,6 +75,10 @@ jobs:
           : > logs/picks.txt
           pick() {
             sha="$(git rev-parse "$1")"
+            if git merge-base --is-ancestor "$sha" HEAD; then
+              echo "ALREADY-IN-BASE $2 $sha" | tee -a logs/picks.txt
+              return 0
+            fi
             if git cherry-pick -x "$sha" >>logs/picks.txt 2>&1; then
               echo "PICKED $2 $sha" | tee -a logs/picks.txt
             else
