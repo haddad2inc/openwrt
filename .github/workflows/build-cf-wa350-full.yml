@@ -38,7 +38,7 @@ on:
       kernel_branch:
         description: "Branch carrying the kernel patches (744/745/706-refresh); commits above merge-base with the base branch are picked"
         required: false
-        default: k1-qca8k-stats
+        default: k1-qca8k-v5
         type: string
       include_kernel_patches:
         description: "Cherry-pick the kernel_branch commit range (744 stats64 + 745 rate_threshold + 706 refresh)"
