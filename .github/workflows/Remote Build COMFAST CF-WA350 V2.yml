@@ -3,9 +3,6 @@ name: Remote Build COMFAST CF-WA350 V2
 on:
   workflow_dispatch:
     inputs:
-      # ==============================================================
-      # Output suffix (TOP — applied to ALL artifact names)
-      # ==============================================================
       output_suffix:
         description: 'Optional suffix appended to all artifact names (e.g. "test1")'
         required: false
@@ -85,6 +82,16 @@ on:
         required: false
         default: false
         type: boolean
+      patch_706:
+        description: 'Include patch 706 (net-dsa-qca8k-add-IPQ4019-built-in-switch-support) → target/linux/ipq40xx/patches-6.18/'
+        required: false
+        default: false
+        type: boolean
+      patch_440:
+        description: 'Include patch 440 (mtd-spi-nor-macronix-restore-mx25l12805d-part-name) → target/linux/generic/pending-6.18/'
+        required: false
+        default: false
+        type: boolean
 
       import_cfw_leds:
         description: 'Import cfw-leds package into openwrt/package/utils/'
@@ -121,7 +128,6 @@ jobs:
           [ -z "$P1" ] && P1=""
           [ -z "$P2" ] && P2=""
 
-          # Sanitize suffix: allow only A-Z a-z 0-9 . _ -
           SUFFIX=$(echo "$SUFFIX_RAW" | sed 's/[^A-Za-z0-9._-]/-/g' | sed 's/^-\+//;s/-\+$//')
           if [ -n "$SUFFIX" ]; then
             SUFFIX_PART="-${SUFFIX}"
@@ -139,7 +145,9 @@ jobs:
           echo "patch_731     : ${{ github.event.inputs.patch_731 }}"
           echo "patch_740     : ${{ github.event.inputs.patch_740 }}"
           echo "patch_744     : ${{ github.event.inputs.patch_744 }}"
-          echo "patch_744     : ${{ github.event.inputs.patch_745 }}"
+          echo "patch_745     : ${{ github.event.inputs.patch_745 }}"
+          echo "patch_706     : ${{ github.event.inputs.patch_706 }}"
+          echo "patch_440     : ${{ github.event.inputs.patch_440 }}"
 
           if [ -n "$P1" ]; then
             LABEL1="${B1}-${P1}${SUFFIX_PART}"
@@ -306,26 +314,15 @@ jobs:
         echo "patch_740 (input)     : ${{ github.event.inputs.patch_740 }}" >> "$LOGFILE"
         echo "patch_744 (input)     : ${{ github.event.inputs.patch_744 }}" >> "$LOGFILE"
         echo "patch_745 (input)     : ${{ github.event.inputs.patch_745 }}" >> "$LOGFILE"
+        echo "patch_706 (input)     : ${{ github.event.inputs.patch_706 }}" >> "$LOGFILE"
+        echo "patch_440 (input)     : ${{ github.event.inputs.patch_440 }}" >> "$LOGFILE"
         echo "import_cfw_leds       : ${{ github.event.inputs.import_cfw_leds }}" >> "$LOGFILE"
         echo "attach_theme          : ${{ github.event.inputs.attach_theme }}" >> "$LOGFILE"
         echo "========================================" >> "$LOGFILE"
         echo "Build started at: $(date)" >> "$LOGFILE"
         echo "========================================" >> "$LOGFILE"
-
-        git config user.name "github-actions[bot]"
-        git config user.email "github-actions[bot]@users.noreply.github.com"
-        git add "$LOGFILE"
-        git commit -m "Init ${{ matrix.slot }} log for run ${{ github.run_id }}" || true
-
-        for attempt in 1 2 3 4 5; do
-          git pull --rebase origin main 2>/dev/null || true
-          if git push origin main 2>/dev/null; then
-            echo "✅ Log pushed (attempt $attempt)"
-            break
-          fi
-          echo "Push attempt $attempt failed, retrying in 5s..."
-          sleep 5
-        done
+        # NOTE: we intentionally do NOT git-commit/push this log.
+        # The log is uploaded as an artifact at the end of the job.
 
     - name: Import building-helper repository (all files/folders)
       run: |
@@ -469,9 +466,6 @@ jobs:
         ./scripts/feeds update -a 2>&1 | tee -a "../$LOGFILE"
         ./scripts/feeds install -a 2>&1 | tee -a "../$LOGFILE"
 
-    # =====================================================================
-    # Select DTS variant (with SHA preservation)
-    # =====================================================================
     - name: Select DTS variant (with SHA preservation)
       run: |
         set -o pipefail
@@ -515,7 +509,6 @@ jobs:
           fi
         fi
 
-        # Also clean any leftover target in the OpenWrt tree (apply_patches.py overwrites it anyway)
         if [ -f "openwrt/target/linux/ath79/dts/qca9563_comfast_cf-wa350.dts" ]; then
           echo "--- Removing stale DTS from OpenWrt tree ---" | tee -a "$LOGFILE"
           rm -fv "openwrt/target/linux/ath79/dts/qca9563_comfast_cf-wa350.dts" | tee -a "$LOGFILE" || true
@@ -537,6 +530,8 @@ jobs:
         PATCH_740_INPUT="${{ github.event.inputs.patch_740 }}"
         PATCH_744_INPUT="${{ github.event.inputs.patch_744 }}"
         PATCH_745_INPUT="${{ github.event.inputs.patch_745 }}"
+        PATCH_706_INPUT="${{ github.event.inputs.patch_706 }}"
+        PATCH_440_INPUT="${{ github.event.inputs.patch_440 }}"
 
         INCLUDE_731="false"
         if [ "$PATCH_731_INPUT" = "true" ]; then
@@ -567,11 +562,25 @@ jobs:
           echo "ℹ️ patch_745 = true (user requested)" | tee -a "$LOGFILE"
         fi
 
+        INCLUDE_706="false"
+        if [ "$PATCH_706_INPUT" = "true" ]; then
+          INCLUDE_706="true"
+          echo "ℹ️ patch_706 = true (user requested)" | tee -a "$LOGFILE"
+        fi
+
+        INCLUDE_440="false"
+        if [ "$PATCH_440_INPUT" = "true" ]; then
+          INCLUDE_440="true"
+          echo "ℹ️ patch_440 = true (user requested)" | tee -a "$LOGFILE"
+        fi
+
         echo "=== Include decisions ===" | tee -a "$LOGFILE"
         echo "INCLUDE_731 = $INCLUDE_731" | tee -a "$LOGFILE"
         echo "INCLUDE_740 = $INCLUDE_740" | tee -a "$LOGFILE"
         echo "INCLUDE_744 = $INCLUDE_744" | tee -a "$LOGFILE"
         echo "INCLUDE_745 = $INCLUDE_745" | tee -a "$LOGFILE"
+        echo "INCLUDE_706 = $INCLUDE_706" | tee -a "$LOGFILE"
+        echo "INCLUDE_440 = $INCLUDE_440" | tee -a "$LOGFILE"
 
         mkdir -p /tmp/patch-skip
         rm -f /tmp/patch-skip/* 2>/dev/null || true
@@ -595,6 +604,12 @@ jobs:
           if echo "$base" | grep -q "^745-" && [ "$INCLUDE_745" = "true" ]; then
             KEEP="true"
           fi
+          if echo "$base" | grep -q "^706-" && [ "$INCLUDE_706" = "true" ]; then
+            KEEP="true"
+          fi
+          if echo "$base" | grep -q "^440-" && [ "$INCLUDE_440" = "true" ]; then
+            KEEP="true"
+          fi
           if [ "$KEEP" = "true" ]; then
             echo "✅ Keeping: $base" | tee -a "$LOGFILE"
           else
@@ -615,6 +630,8 @@ jobs:
         echo "INCLUDE_740=$INCLUDE_740" >> "$GITHUB_ENV"
         echo "INCLUDE_744=$INCLUDE_744" >> "$GITHUB_ENV"
         echo "INCLUDE_745=$INCLUDE_745" >> "$GITHUB_ENV"
+        echo "INCLUDE_706=$INCLUDE_706" >> "$GITHUB_ENV"
+        echo "INCLUDE_440=$INCLUDE_440" >> "$GITHUB_ENV"
 
     - name: Apply patches via Python script
       run: |
@@ -631,7 +648,6 @@ jobs:
           find openwrt/target/linux/ath79 -maxdepth 2 -path '*/patches-6.*/*.patch' -exec ls -lh {} \; | tee -a "$LOGFILE" || true
         fi
 
-        # Verify the DTS SHA after apply_patches.py copies it into the OpenWrt tree
         echo "=== Verifying DTS SHA in OpenWrt tree ===" | tee -a "$LOGFILE"
         DTS_IN_TREE="openwrt/target/linux/ath79/dts/qca9563_comfast_cf-wa350.dts"
         if [ -f "$DTS_IN_TREE" ]; then
@@ -724,44 +740,88 @@ jobs:
         echo "✅ Patch location enforcement complete." | tee -a "$LOG"
 
     # =====================================================================
-    # Attach patch 744 / 745 to their dedicated destinations
+    # Attach patch 440 to generic/pending-6.18
+    # =====================================================================
+    - name: Attach patch 440 to generic/pending-6.18
+      run: |
+        set -o pipefail
+        echo "=== Attaching patch 440 → target/linux/generic/pending-6.18/ ===" | tee -a "$LOGFILE"
+
+        INCLUDE_440="${{ github.event.inputs.patch_440 }}"
+
+        if [ "$INCLUDE_440" = "true" ]; then
+          SRC_440=$(ls patches/440-*.patch 2>/dev/null | head -n1)
+          if [ -z "$SRC_440" ] || [ ! -f "$SRC_440" ]; then
+            echo "❌ ERROR: patch_440 = true but no 'patches/440-*.patch' found." | tee -a "$LOGFILE"
+            ls -la patches/ | tee -a "$LOGFILE"
+            exit 1
+          fi
+
+          DEST_DIR_440="openwrt/target/linux/generic/pending-6.18"
+          mkdir -p "$DEST_DIR_440"
+          cp -v "$SRC_440" "$DEST_DIR_440/" 2>&1 | tee -a "$LOGFILE"
+
+          # Verify the file actually landed
+          if [ -f "$DEST_DIR_440/$(basename "$SRC_440")" ]; then
+            echo "✅ 440 patch attached → $DEST_DIR_440/$(basename "$SRC_440")" | tee -a "$LOGFILE"
+            ls -la "$DEST_DIR_440/$(basename "$SRC_440")" | tee -a "$LOGFILE"
+          else
+            echo "❌ ERROR: copy reported success but file not found at destination!" | tee -a "$LOGFILE"
+            exit 1
+          fi
+        else
+          echo "ℹ️ patch_440 not selected → skipping." | tee -a "$LOGFILE"
+        fi
+
+    # =====================================================================
+    # Attach patch 744 / 745 to generic/pending-6.18
     # =====================================================================
     - name: Attach patch 744 / 745 to their dedicated destinations
       run: |
         set -o pipefail
-        echo "=== Attaching patch 744 / 745 to their dedicated destinations ===" | tee -a "$LOGFILE"
+        echo "=== Attaching patch 744 / 745 → target/linux/generic/pending-6.18/ ===" | tee -a "$LOGFILE"
 
         INCLUDE_744="${{ github.event.inputs.patch_744 }}"
         INCLUDE_745="${{ github.event.inputs.patch_745 }}"
 
-        # ------- Patch 744 → openwrt/target/linux/generic/pending-6.18/ -------
+        # ------- Patch 744 -------
         if [ "$INCLUDE_744" = "true" ]; then
           SRC_744=$(ls patches/744-*.patch 2>/dev/null | head -n1)
-          if [ -n "$SRC_744" ] && [ -f "$SRC_744" ]; then
-            DEST_DIR_744="openwrt/target/linux/generic/pending-6.18"
-            mkdir -p "$DEST_DIR_744"
-            cp -v "$SRC_744" "$DEST_DIR_744/" 2>&1 | tee -a "$LOGFILE"
-            echo "✅ 744 patch attached → $DEST_DIR_744/$(basename "$SRC_744")" | tee -a "$LOGFILE"
-          else
+          if [ -z "$SRC_744" ] || [ ! -f "$SRC_744" ]; then
             echo "❌ ERROR: patch_744 = true but no 'patches/744-*.patch' found." | tee -a "$LOGFILE"
             ls -la patches/ | tee -a "$LOGFILE"
+            exit 1
+          fi
+          DEST_DIR_744="openwrt/target/linux/generic/pending-6.18"
+          mkdir -p "$DEST_DIR_744"
+          cp -v "$SRC_744" "$DEST_DIR_744/" 2>&1 | tee -a "$LOGFILE"
+          if [ -f "$DEST_DIR_744/$(basename "$SRC_744")" ]; then
+            echo "✅ 744 patch attached → $DEST_DIR_744/$(basename "$SRC_744")" | tee -a "$LOGFILE"
+            ls -la "$DEST_DIR_744/$(basename "$SRC_744")" | tee -a "$LOGFILE"
+          else
+            echo "❌ ERROR: 744 copy reported success but file not found!" | tee -a "$LOGFILE"
             exit 1
           fi
         else
           echo "ℹ️ patch_744 not selected → skipping." | tee -a "$LOGFILE"
         fi
 
-        # ------- Patch 745 → openwrt/target/linux/generic/pending-6.18/ -------
+        # ------- Patch 745 -------
         if [ "$INCLUDE_745" = "true" ]; then
           SRC_745=$(ls patches/745-*.patch 2>/dev/null | head -n1)
-          if [ -n "$SRC_745" ] && [ -f "$SRC_745" ]; then
-            DEST_DIR_745="openwrt/target/linux/generic/pending-6.18"
-            mkdir -p "$DEST_DIR_745"
-            cp -v "$SRC_745" "$DEST_DIR_745/" 2>&1 | tee -a "$LOGFILE"
-            echo "✅ 745 patch attached → $DEST_DIR_745/$(basename "$SRC_745")" | tee -a "$LOGFILE"
-          else
+          if [ -z "$SRC_745" ] || [ ! -f "$SRC_745" ]; then
             echo "❌ ERROR: patch_745 = true but no 'patches/745-*.patch' found." | tee -a "$LOGFILE"
             ls -la patches/ | tee -a "$LOGFILE"
+            exit 1
+          fi
+          DEST_DIR_745="openwrt/target/linux/generic/pending-6.18"
+          mkdir -p "$DEST_DIR_745"
+          cp -v "$SRC_745" "$DEST_DIR_745/" 2>&1 | tee -a "$LOGFILE"
+          if [ -f "$DEST_DIR_745/$(basename "$SRC_745")" ]; then
+            echo "✅ 745 patch attached → $DEST_DIR_745/$(basename "$SRC_745")" | tee -a "$LOGFILE"
+            ls -la "$DEST_DIR_745/$(basename "$SRC_745")" | tee -a "$LOGFILE"
+          else
+            echo "❌ ERROR: 745 copy reported success but file not found!" | tee -a "$LOGFILE"
             exit 1
           fi
         else
@@ -769,8 +829,42 @@ jobs:
         fi
 
         echo "=== Final check for 744/745 in OpenWrt tree ===" | tee -a "$LOGFILE"
-        find openwrt/target/linux -maxdepth 4 \( -name '744-*.patch' -o -name '745-*.patch' \) 2>/dev/null | tee -a "$LOGFILE" || true
-        echo "✅ 744/745 attachment step complete." | tee -a "$LOGFILE"
+        find openwrt/target/linux/generic/pending-6.18 -maxdepth 1 \( -name '744-*.patch' -o -name '745-*.patch' \) 2>/dev/null | tee -a "$LOGFILE" || true
+
+    # =====================================================================
+    # Attach patch 706 to ipq40xx/patches-6.18
+    # =====================================================================
+    - name: Attach patch 706 to ipq40xx/patches-6.18
+      run: |
+        set -o pipefail
+        echo "=== Attaching patch 706 → target/linux/ipq40xx/patches-6.18/ ===" | tee -a "$LOGFILE"
+
+        INCLUDE_706="${{ github.event.inputs.patch_706 }}"
+
+        if [ "$INCLUDE_706" = "true" ]; then
+          SRC_706=$(ls patches/706-*.patch 2>/dev/null | head -n1)
+          if [ -z "$SRC_706" ] || [ ! -f "$SRC_706" ]; then
+            echo "❌ ERROR: patch_706 = true but no 'patches/706-*.patch' found." | tee -a "$LOGFILE"
+            ls -la patches/ | tee -a "$LOGFILE"
+            exit 1
+          fi
+
+          DEST_DIR_706="openwrt/target/linux/ipq40xx/patches-6.18"
+          mkdir -p "$DEST_DIR_706"
+          cp -v "$SRC_706" "$DEST_DIR_706/" 2>&1 | tee -a "$LOGFILE"
+          if [ -f "$DEST_DIR_706/$(basename "$SRC_706")" ]; then
+            echo "✅ 706 patch attached → $DEST_DIR_706/$(basename "$SRC_706")" | tee -a "$LOGFILE"
+            ls -la "$DEST_DIR_706/$(basename "$SRC_706")" | tee -a "$LOGFILE"
+          else
+            echo "❌ ERROR: 706 copy reported success but file not found!" | tee -a "$LOGFILE"
+            exit 1
+          fi
+        else
+          echo "ℹ️ patch_706 not selected → skipping." | tee -a "$LOGFILE"
+        fi
+
+        echo "=== Final check for 706 in OpenWrt tree ===" | tee -a "$LOGFILE"
+        find openwrt/target/linux/ipq40xx -maxdepth 2 -name '706-*.patch' 2>/dev/null | tee -a "$LOGFILE" || true
 
     - name: Inject custom files
       if: ${{ github.event.inputs.include_files == 'true' }}
@@ -859,9 +953,6 @@ jobs:
 
         echo "✅ luci-theme-enan-dashboard package import completed." | tee -a "$LOGFILE"
 
-    # =====================================================================
-    # .config handling — defconfig-based (avoids olddefconfig "out of sync")
-    # =====================================================================
     - name: Copy .config and verify active options
       run: |
         set -o pipefail
@@ -974,6 +1065,59 @@ jobs:
         cd openwrt
         rm -rf build_dir staging_dir 2>&1 | tee -a "../$LOGFILE"
 
+    # =====================================================================
+    # FINAL patch presence check — right before the build
+    # =====================================================================
+    - name: Verify selected patches are present before build
+      run: |
+        set -o pipefail
+        echo "=== Verifying selected patches before build ===" | tee -a "$LOGFILE"
+
+        MISSING=0
+
+        verify_one() {
+          local include="$1"
+          local pattern="$2"
+          local search_dir="$3"
+          local label="$4"
+          if [ "$include" != "true" ]; then
+            return 0
+          fi
+          local found=""
+          if [ -d "$search_dir" ]; then
+            found=$(find "$search_dir" -maxdepth 1 -name "$pattern" 2>/dev/null | head -n1)
+          fi
+          if [ -n "$found" ]; then
+            echo "  ✅ $label → $found" | tee -a "$LOGFILE"
+          else
+            echo "  ❌ $label MISSING (pattern=$pattern in $search_dir)" | tee -a "$LOGFILE"
+            MISSING=$((MISSING+1))
+          fi
+        }
+
+        verify_one "${INCLUDE_731:-false}" "731-*.patch" "openwrt/target/linux/ath79/patches-6.18"    "patch 731"
+        verify_one "${INCLUDE_740:-false}" "740-*.patch" "openwrt/target/linux/ath79/patches-6.18"    "patch 740"
+        verify_one "${INCLUDE_440:-false}" "440-*.patch" "openwrt/target/linux/generic/pending-6.18" "patch 440"
+        verify_one "${INCLUDE_744:-false}" "744-*.patch" "openwrt/target/linux/generic/pending-6.18" "patch 744"
+        verify_one "${INCLUDE_745:-false}" "745-*.patch" "openwrt/target/linux/generic/pending-6.18" "patch 745"
+        verify_one "${INCLUDE_706:-false}" "706-*.patch" "openwrt/target/linux/ipq40xx/patches-6.18" "patch 706"
+
+        if [ "$MISSING" -gt 0 ]; then
+          echo "" | tee -a "$LOGFILE"
+          echo "❌ ERROR: $MISSING selected patch(es) MISSING from the OpenWrt source tree" | tee -a "$LOGFILE"
+          echo "--- Listing of relevant directories ---" | tee -a "$LOGFILE"
+          for d in \
+            "openwrt/target/linux/generic/pending-6.18" \
+            "openwrt/target/linux/ath79/patches-6.18" \
+            "openwrt/target/linux/ipq40xx/patches-6.18"; do
+            echo ">>> $d" | tee -a "$LOGFILE"
+            ls -la "$d" 2>&1 | tee -a "$LOGFILE" || true
+          done
+          exit 1
+        fi
+
+        echo "✅ All selected patches are present in the OpenWrt source tree." | tee -a "$LOGFILE"
+
     - name: Build OpenWrt (using all available cores)
       run: |
         echo "=== Building OpenWrt ===" | tee -a "$LOGFILE"
@@ -989,6 +1133,8 @@ jobs:
         echo "Patch 740      : ${{ env.INCLUDE_740 }}" | tee -a "$LOGFILE"
         echo "Patch 744      : ${{ env.INCLUDE_744 }}" | tee -a "$LOGFILE"
         echo "Patch 745      : ${{ env.INCLUDE_745 }}" | tee -a "$LOGFILE"
+        echo "Patch 706      : ${{ env.INCLUDE_706 }}" | tee -a "$LOGFILE"
+        echo "Patch 440      : ${{ env.INCLUDE_440 }}" | tee -a "$LOGFILE"
         echo "Build started at: $(date)" | tee -a "$LOGFILE"
         cd openwrt
         make -j$(nproc) V=s 2>&1 | tee -a "../$LOGFILE"
@@ -1052,10 +1198,33 @@ jobs:
         [ -d package/utils/cfw-leds ] && cp -rv package/utils/cfw-leds out/injected/cfw-leds || true
         [ -d package/luci-theme-enan-dashboard ] && cp -rv package/luci-theme-enan-dashboard out/injected/luci-theme-enan-dashboard || true
 
+        # -------------------------------------------------------------------
+        # Collect ALL relevant kernel patches (440/706/731/740/744/745)
+        # -------------------------------------------------------------------
         mkdir -p out/injected/kernel-patches
-        find target/linux/ath79 -maxdepth 2 -path '*/patches-6.*/*.patch' -exec cp -v {} out/injected/kernel-patches/ \; 2>/dev/null || true
-        # also collect any 744/745 in generic tree
-        find target/linux/generic -maxdepth 2 -path '*/pending-6.*/*.patch' -name '74[12]-*.patch' -exec cp -v {} out/injected/kernel-patches/ \; 2>/dev/null || true
+
+        # ath79 target patches (731, 740)
+        find target/linux/ath79 -maxdepth 2 -path '*/patches-6.*/*.patch' \
+          \( -name '731-*.patch' -o -name '740-*.patch' \) \
+          -exec cp -v {} out/injected/kernel-patches/ \; 2>/dev/null || true
+
+        # generic pending patches (440, 744, 745)
+        find target/linux/generic -maxdepth 2 -path '*/pending-6.*/*.patch' \
+          \( -name '440-*.patch' -o -name '744-*.patch' -o -name '745-*.patch' \) \
+          -exec cp -v {} out/injected/kernel-patches/ \; 2>/dev/null || true
+
+        # ipq40xx patches (706)
+        find target/linux/ipq40xx -maxdepth 2 -path '*/patches-6.*/*.patch' \
+          -name '706-*.patch' \
+          -exec cp -v {} out/injected/kernel-patches/ \; 2>/dev/null || true
+
+        # Also dump the quilt .pc state of the actual kernel tree so we can
+        # see which patches were really applied during the build
+        echo "=== Quilt-applied patches in kernel build_dir ===" | tee -a "../$LOGFILE"
+        find build_dir/target-*/linux-ath79_generic/linux-6.*/.pc -mindepth 1 -maxdepth 3 \
+          -type d 2>/dev/null | sort | tee -a "../$LOGFILE" || true
+        find build_dir/target-*/linux-ath79_generic/linux-6.*/.pc -maxdepth 3 \
+          -name '*.patch' 2>/dev/null | sort | tee -a "../$LOGFILE" || true
 
         mkdir -p out/injected/kernel-config
         for kc in target/linux/ath79/config-6.*; do
@@ -1065,7 +1234,6 @@ jobs:
         cp -v "../$LOGFILE" out/logs/ 2>/dev/null || true
         sha256sum bin/targets/ath79/generic/*cf-wa350* > out/logs/40-sha256.txt 2>/dev/null || true
 
-        # DTS SHA record
         echo "=== DTS SHA256 record ===" > out/logs/43-dts-sha.txt
         if [ -f target/linux/ath79/dts/qca9563_comfast_cf-wa350.dts ]; then
           sha256sum target/linux/ath79/dts/qca9563_comfast_cf-wa350.dts | tee -a out/logs/43-dts-sha.txt
@@ -1083,10 +1251,14 @@ jobs:
         echo "patch_740 input: ${{ github.event.inputs.patch_740 }}" | tee -a out/logs/41-build-choices.txt
         echo "patch_744 input: ${{ github.event.inputs.patch_744 }}" | tee -a out/logs/41-build-choices.txt
         echo "patch_745 input: ${{ github.event.inputs.patch_745 }}" | tee -a out/logs/41-build-choices.txt
+        echo "patch_706 input: ${{ github.event.inputs.patch_706 }}" | tee -a out/logs/41-build-choices.txt
+        echo "patch_440 input: ${{ github.event.inputs.patch_440 }}" | tee -a out/logs/41-build-choices.txt
         echo "INCLUDE_731    : ${INCLUDE_731:-<unset>}" | tee -a out/logs/41-build-choices.txt
         echo "INCLUDE_740    : ${INCLUDE_740:-<unset>}" | tee -a out/logs/41-build-choices.txt
         echo "INCLUDE_744    : ${INCLUDE_744:-<unset>}" | tee -a out/logs/41-build-choices.txt
         echo "INCLUDE_745    : ${INCLUDE_745:-<unset>}" | tee -a out/logs/41-build-choices.txt
+        echo "INCLUDE_706    : ${INCLUDE_706:-<unset>}" | tee -a out/logs/41-build-choices.txt
+        echo "INCLUDE_440    : ${INCLUDE_440:-<unset>}" | tee -a out/logs/41-build-choices.txt
 
         echo "=== uImage kernel size (bytes 12..15, big endian) ===" | tee -a "../$LOGFILE"
         for img in out/images/*cf-wa350-squashfs-sysupgrade.bin; do
@@ -1115,28 +1287,9 @@ jobs:
         df -h 2>&1 | tee -a "$LOGFILE"
         du -sh openwrt 2>&1 | tee -a "$LOGFILE" || true
 
-    - name: Upload log to repository (always)
-      if: always()
-      run: |
-        echo "=== Uploading log to repository ===" >> "$LOGFILE"
-        echo "=== BUILD LOG END - $(date) ===" >> "$LOGFILE"
-        echo "Build completed with status: ${{ job.status }}" >> "$LOGFILE"
-        echo "Slot: ${{ matrix.slot }} | Label: ${{ matrix.label }}" >> "$LOGFILE"
-
-        git config user.name "github-actions[bot]"
-        git config user.email "github-actions[bot]@users.noreply.github.com"
-        git add "$LOGFILE"
-        git commit -m "Update ${{ matrix.slot }} log for run ${{ github.run_id }}" || true
-
-        for attempt in 1 2 3 4 5; do
-          git pull --rebase origin main 2>/dev/null || true
-          if git push origin main 2>/dev/null; then
-            echo "✅ Log pushed (attempt $attempt)"
-            break
-          fi
-          echo "Push attempt $attempt failed, retrying in 5s..."
-          sleep 5
-        done
+    # NOTE: "Upload log to repository" step has been REMOVED on purpose.
+    # Logs are NOT pushed to the repo any more (they caused push conflicts).
+    # They are uploaded as artifacts in the next steps instead.
 
     - name: Upload full log as artifact (always)
       if: always()
