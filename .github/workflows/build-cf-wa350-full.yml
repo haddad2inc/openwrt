@@ -2,8 +2,10 @@ name: build-cf-wa350-full
 
 # Builds one CF-WA350 image that combines every piece of the project:
 #   base branch  : comfast-cf-wa350-support = PR #25040 device commit (freshest, rebased on current main)
-#   + kernel_branch range : 744 qca8k cached stats64, 745 netdev rate_threshold, ipq40xx 706 refresh
-#   + PR #25474  : 740 macronix .name restore            (cherry-pick, optional)
+#   + kernel_branch range : 744 v6 qca8k cached stats64, 745 v3 netdev rate_threshold + quadratic
+#                             afterglow, 746 (mac80211 subsys/394 tpt delivered-data), ipq40xx 706 refresh
+#   + PR #25474  : 460 macronix .name restore            (cherry-pick, optional; renamed 740- -> 460-
+#                             on DragonBluep's review)
 #   + PR #25477  : 731 ar8216 guard                     (cherry-pick, optional, explicit-mdio only)
 #   + PR #25040  : device commit                        (cherry-pick, optional; skipped when the base already carries it)
 #   + ci-wa350   : DTS variant (sha-gated) and .config asset
@@ -22,6 +24,20 @@ name: build-cf-wa350-full
 #                           logs/conflict-<label>.txt (uploaded as artifact), then fails
 # Every gate result is printed on the identity card so the artifact link and the
 # flashed image can always be matched.
+#
+# v6 (2026-10-07): the base branch and the three PR branches were REBASED onto
+# upstream/master (0ab51fb9c1, still LINUX_VERSION-6.18 = .55) - OpenWrt rejects merge
+# commits in PRs, so rebase (not merge) is what clears the "out-of-date" banner.
+# kernel_branch default is now k1-qca8k-v7 = base_branch + exactly ONE commit carrying
+# all four patches, so KERNEL-RANGE picks a single commit instead of ~250: no stale
+# .config or build log can leak into the build tree (they were tracked on main until
+# 1760e357527b, which made every 'git diff --name-only --exit-code' gate in Build Kernel
+# and Build all core packages fail for all targets).
+# Patch inventory carried by k1-qca8k-v7 (fingerprints):
+#   744 v6  target/linux/generic/pending-6.18/744-...       blob dd1c4839a2a6  sha256 2519098cc6f52650
+#   745 v3  target/linux/generic/pending-6.18/745-...       sha256 c8782b64f19c2b5d (post-refresh)
+#   746     package/kernel/mac80211/patches/subsys/394-...  sha256 0c5c6c68216316c0
+#   706     target/linux/ipq40xx/patches-6.18/706-...       blob 7046d32e1ee4 (+90/+9 offsets)
 
 on:
   workflow_dispatch:
@@ -36,17 +52,17 @@ on:
           - k1-qca8k-stats
           - main
       kernel_branch:
-        description: "Branch carrying the kernel patches (744/745/706-refresh); commits above merge-base with the base branch are picked"
+        description: "Branch carrying the kernel patches (744 v6 / 745 v3 / 746=subsys-394 / 706 refresh); commits above merge-base with the base branch are picked"
         required: false
-        default: k1-qca8k-v5
+        default: k1-qca8k-v7
         type: string
       include_kernel_patches:
-        description: "Cherry-pick the kernel_branch commit range (744 stats64 + 745 rate_threshold + 706 refresh)"
+        description: "Cherry-pick the kernel_branch commit range (744 v6 stats64 + 745 v3 rate_threshold/afterglow + 746 mac80211 tpt + 706 refresh)"
         required: false
         default: true
         type: boolean
       include_pr25474:
-        description: "Cherry-pick PR #25474 (patch 740 macronix .name restore)"
+        description: "Cherry-pick PR #25474 (patch 460 macronix .name restore)"
         required: false
         default: true
         type: boolean
