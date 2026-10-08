@@ -67,7 +67,7 @@ Signed-off-by: Robert Marko <robert.marko@sartura.hr>
  		mask = QCA8K_VTU_FUNC0_EG_MODE_PORT_NOT(i);
  
  		if ((reg & mask) != mask) {
-@@ -736,7 +736,7 @@ static int qca8k_update_port_member(stru
+@@ -756,7 +756,7 @@ static int qca8k_update_port_member(stru
  	u32 port_mask = BIT(dp->cpu_dp->index);
  	int i, ret;
  
