@@ -249,7 +249,7 @@ jobs:
           case "${{ inputs.dts_file }}" in
             *external*) V=EXTERNAL-MDIO;     E=c7cd13705d797229600a2d85f180fdb6736f39b493a7205c0211c746aaf015ca ;;
             *explicit*) V=INTERNAL-EXPLICIT; E=a755306340109abe2c63c47adb4144131011e12913f7ee3781c095be1dbe637e ;;
-            *)          V=INTERNAL-LEGACY;   E=1544a5482fabf497479b6acb6d21ec68ab450a7f253239b84ff61fd843c9bb30 ;;
+            *)          V=INTERNAL-LEGACY;   E=c393c70bda0890e79ee4263306a2ac3a1ea2ad72cc27e22334a125960374778d ;;
           esac
           { echo "variant    = $V"; echo "dts_file   = ${{ inputs.dts_file }}"; echo "dts_sha256 = $S"; } | tee logs/variant.txt
           [ "$S" = "$E" ] || { echo "::error::DTS sha mismatch"; exit 1; }
