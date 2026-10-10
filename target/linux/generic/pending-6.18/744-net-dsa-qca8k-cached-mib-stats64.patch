@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Salah Ahmed <haddad2inc@gmail.com>
-Date: Tue, 06 Oct 2026 04:07:09 +0300
+Date: Sat, 10 Oct 2026 19:37:03 +0300
 Subject: [PATCH] net: dsa: qca8k: expose cached per-port MIB counters via
  get_stats64
 
@@ -53,39 +53,55 @@ qca8k_setup(): a failing setup never reaches the remove callback, so
 arming it earlier would leave the delayed work running after the driver is
 gone.
 
+The poll work is armed at the end of qca8k_setup() and stopped from a new
+.teardown op. DSA calls .teardown both on the dsa_switch_setup() error
+paths that follow a successful ops->setup() - the tag protocol setup and
+the user MDIO bus allocation and registration - and from
+dsa_unregister_switch(), so the work cannot outlive the driver data it
+reads. Stopping it in qca8k_sw_remove() alone misses the probe error
+path: dsa_register_switch() fails, probe fails, devm frees priv and the
+armed work then runs on freed memory.
+
 Signed-off-by: Salah Ahmed <haddad2inc@gmail.com>
 ---
 --- a/drivers/net/dsa/qca/qca8k-8xxx.c
 +++ b/drivers/net/dsa/qca/qca8k-8xxx.c
-@@ -2110,6 +2110,12 @@ qca8k_setup(struct dsa_switch *ds)
+@@ -2110,6 +2110,14 @@ qca8k_setup(struct dsa_switch *ds)
  	/* HW learn on CPU port is limited and require manual setting */
  	ds->assisted_learning_on_cpu_port = true;
  
-+	/* Arm the MIB poll work only once every failure path above is behind
-+	 * us: a failed setup never reaches the remove callback, so starting
-+	 * the work earlier would leave it running after the driver is gone.
++	/* Arm the MIB poll work only after every failure path in this
++	 * function is behind us. DSA calls .teardown both on the
++	 * dsa_switch_setup() error paths that follow a successful
++	 * ops->setup() and from dsa_unregister_switch(), so the work is
++	 * always stopped again.
 +	 */
 +	qca8k_mib_poll_start(priv);
 +
  	return 0;
  }
  
-@@ -2125,6 +2131,7 @@ static const struct dsa_switch_ops qca8k
+@@ -2120,11 +2128,20 @@ static const struct phylink_mac_ops qca8
+ 	.mac_link_up	= qca8k_phylink_mac_link_up,
+ };
+ 
++static void qca8k_teardown(struct dsa_switch *ds)
++{
++	struct qca8k_priv *priv = ds->priv;
++
++	qca8k_mib_poll_stop(priv);
++}
++
+ static const struct dsa_switch_ops qca8k_switch_ops = {
+ 	.get_tag_protocol	= qca8k_get_tag_protocol,
  	.setup			= qca8k_setup,
++	.teardown		= qca8k_teardown,
  	.get_strings		= qca8k_get_strings,
  	.get_ethtool_stats	= qca8k_get_ethtool_stats,
 +	.get_stats64		= qca8k_get_stats64,
  	.get_sset_count		= qca8k_get_sset_count,
  	.set_ageing_time	= qca8k_set_ageing_time,
  	.support_eee		= dsa_supports_eee,
-@@ -2239,6 +2246,7 @@ qca8k_sw_remove(struct mdio_device *mdio
- 	for (i = 0; i < QCA8K_NUM_PORTS; i++)
- 		qca8k_port_set_status(priv, i, 0);
- 
-+	qca8k_mib_poll_stop(priv);
- 	dsa_unregister_switch(priv->ds);
- }
- 
 --- a/drivers/net/dsa/qca/qca8k-common.c
 +++ b/drivers/net/dsa/qca/qca8k-common.c
 @@ -553,6 +553,116 @@ void qca8k_get_ethtool_stats(struct dsa_

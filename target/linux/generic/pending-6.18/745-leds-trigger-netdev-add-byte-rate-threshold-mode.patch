@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Salah Ahmed <haddad2inc@gmail.com>
-Date: Sun, 4 Oct 2026 02:34:59 +0300
+Date: Sat, 10 Oct 2026 19:37:03 +0300
 Subject: [PATCH] leds: trigger-netdev: add byte-rate threshold mode
 
 The tx/rx modes blink once per observed change of the packet counters,
@@ -46,10 +46,20 @@ release below it - and when the counter goes silent the blink fades out
 quadratically from the last peak over 20 s, with the ladder step only
 ever slowing during the fade.
 
+set_baseline_state() runs after every netdev notifier event and after
+every mode or device_name write, and both callers cancel the work first.
+It sets a solid brightness and only reschedules the work when one of the
+tx/rx/tx_err/rx_err bits is set, so rate mode used to stop for good on a
+link-only LED after a carrier change, and with tx/rx set the LED stayed
+solid under load: the work ran, computed the same ladder step as before,
+and skipped the re-arm because the step had not changed - while the
+brightness had just been reset to solid. Clear the armed step and
+schedule the work whenever a rate threshold is set.
+
 Signed-off-by: Salah Ahmed <haddad2inc@gmail.com>
 ---
- drivers/leds/trigger/ledtrig-netdev.c | 248 ++++++++++++++++++++
- 1 file changed, 248 insertions(+), 0 deletions(-)
+ drivers/leds/trigger/ledtrig-netdev.c | 257 +++++++++++++++++++-
+ 1 file changed, 256 insertions(+), 1 deletion(-)
 
 --- a/drivers/leds/trigger/ledtrig-netdev.c
 +++ b/drivers/leds/trigger/ledtrig-netdev.c
@@ -122,7 +132,20 @@ Signed-off-by: Salah Ahmed <haddad2inc@gmail.com>
  	unsigned long mode;
  	int link_speed;
  	__ETHTOOL_DECLARE_LINK_MODE_MASK(supported_link_modes);
-@@ -153,6 +194,18 @@ static void set_baseline_state(struct le
+@@ -148,11 +189,30 @@ static void set_baseline_state(struct le
+ 		if (test_bit(TRIGGER_NETDEV_TX, &trigger_data->mode) ||
+ 		    test_bit(TRIGGER_NETDEV_RX, &trigger_data->mode) ||
+ 		    test_bit(TRIGGER_NETDEV_TX_ERR, &trigger_data->mode) ||
+-		    test_bit(TRIGGER_NETDEV_RX_ERR, &trigger_data->mode))
++		    test_bit(TRIGGER_NETDEV_RX_ERR, &trigger_data->mode) ||
++		    trigger_data->rate_threshold_kbps) {
++			/* Rate mode re-arms the blink only when the ladder step
++			 * changes, and the brightness has just been set to a solid
++			 * state, so forget the step that was armed before this.
++			 */
++			trigger_data->rate_last_ms = 0;
+ 			schedule_delayed_work(&trigger_data->work, 0);
++		}
  	}
  }
  
@@ -141,7 +164,7 @@ Signed-off-by: Salah Ahmed <haddad2inc@gmail.com>
  static bool supports_hw_control(struct led_classdev *led_cdev)
  {
  	if (!led_cdev->hw_control_get || !led_cdev->hw_control_set ||
-@@ -292,6 +345,7 @@ static int set_device_name(struct led_ne
+@@ -292,6 +352,7 @@ static int set_device_name(struct led_ne
  		get_device_state(trigger_data);
  
  	trigger_data->last_activity = 0;
@@ -149,7 +172,7 @@ Signed-off-by: Salah Ahmed <haddad2inc@gmail.com>
  
  	/* Skip if we're called from netdev_trig_activate() and hw_control is true */
  	if (!trigger_data->hw_control || led_get_trigger_data(trigger_data->led_cdev))
-@@ -475,7 +529,51 @@ static ssize_t interval_store(struct dev
+@@ -475,7 +536,51 @@ static ssize_t interval_store(struct dev
  	return size;
  }
  
@@ -201,7 +224,7 @@ Signed-off-by: Salah Ahmed <haddad2inc@gmail.com>
  
  static ssize_t offloaded_show(struct device *dev,
  			      struct device_attribute *attr, char *buf)
-@@ -551,6 +649,7 @@ static struct attribute *netdev_trig_att
+@@ -551,6 +656,7 @@ static struct attribute *netdev_trig_att
  	&dev_attr_rx_err.attr,
  	&dev_attr_tx_err.attr,
  	&dev_attr_interval.attr,
@@ -209,7 +232,7 @@ Signed-off-by: Salah Ahmed <haddad2inc@gmail.com>
  	&dev_attr_offloaded.attr,
  	NULL
  };
-@@ -597,12 +696,14 @@ static int netdev_trig_notify(struct not
+@@ -597,12 +703,14 @@ static int netdev_trig_notify(struct not
  		dev_put(trigger_data->net_dev);
  		dev_hold(dev);
  		trigger_data->net_dev = dev;
@@ -224,7 +247,7 @@ Signed-off-by: Salah Ahmed <haddad2inc@gmail.com>
  		break;
  	case NETDEV_UP:
  		trigger_data->hw_control = can_hw_control(trigger_data);
-@@ -632,6 +733,8 @@ static void netdev_trig_work(struct work
+@@ -632,6 +740,8 @@ static void netdev_trig_work(struct work
  	unsigned int new_activity;
  	struct rtnl_link_stats64 temp;
  	unsigned long interval;
@@ -233,7 +256,7 @@ Signed-off-by: Salah Ahmed <haddad2inc@gmail.com>
  	int invert;
  
  	/* If we dont have a device, insure we are off */
-@@ -640,6 +743,151 @@ static void netdev_trig_work(struct work
+@@ -640,6 +750,151 @@ static void netdev_trig_work(struct work
  		return;
  	}
  
