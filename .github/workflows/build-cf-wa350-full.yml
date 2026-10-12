@@ -76,14 +76,21 @@ name: build-cf-wa350-full
 #           (measured 2026-10-11; the v6-header pin 7046d32e1ee4 predates de6b2bf and is stale)
 #   0001    package/base-files/files/etc/init.d/led    916d4215469840cc / 911bd155f436
 #
-# v8 (2026-10-11): adds two optional inputs sourced from the external
-# building-helper repository (https://github.com/haddad2inc/building-helper.git):
-#   include_files : inject <building-helper>/files/* into the OpenWrt tree as
-#                   ./files/ before defconfig (runtime overlay).
-#   attach_theme  : import <building-helper>/luci-theme-enan-dashboard/ into
-#                   ./package/luci-theme-enan-dashboard and enable
-#                   CONFIG_PACKAGE_luci-theme-enan-dashboard=y in .config.
-# Both steps are idempotent and only run when the input is true.
+# v8 (2026-10-11/12):
+#   1 adds two optional inputs sourced from the external building-helper
+#     repository (https://github.com/haddad2inc/building-helper.git):
+#       include_files : inject <building-helper>/files/* into the OpenWrt tree
+#                       as ./files/ before defconfig (runtime overlay).
+#       attach_theme  : import <building-helper>/luci-theme-enan-dashboard/ into
+#                       ./package/luci-theme-enan-dashboard and enable
+#                       CONFIG_PACKAGE_luci-theme-enan-dashboard=y in .config.
+#     Both steps are idempotent and only run when the input is true.
+#   2 hard-forces CONFIG_PACKAGE_lldpd=y and CONFIG_PACKAGE_watchcat=y in the
+#     .config. They are set BEFORE make defconfig and, if defconfig drops them
+#     (e.g. because a dependency is missing in the current branch), they are
+#     re-added and defconfig is re-run once so the final image always carries
+#     both packages. Presence is echoed into logs/config-proof.txt so the
+#     artifact can be matched to the flashed image.
 
 on:
   workflow_dispatch:
@@ -349,7 +356,7 @@ jobs:
           exit 0
 
       # =====================================================================
-      # NEW: import assets from the external building-helper repository
+      # v8: import assets from the external building-helper repository
       # =====================================================================
       - name: Import building-helper repository
         if: ${{ inputs.include_files == true || inputs.attach_theme == true }}
@@ -432,18 +439,26 @@ jobs:
         run: |
           echo "=== attach_theme=false → skipping luci-theme-enan-dashboard import ===" | tee -a logs/building-helper.txt
 
-      - name: Config from root .config + luci/ethtool + defconfig + proofs
+      # =====================================================================
+      # v8: .config finalisation
+      #   - luci + ethtool + optional enan-theme
+      #   - HARD-FORCE lldpd=y and watchcat=y (before AND after defconfig)
+      # =====================================================================
+      - name: Config from root .config + luci/ethtool + lldpd/watchcat + defconfig + proofs
         run: |
           set +e
           cp /tmp/assets/.config .config
-          # the ci-wa350 .config asset disables the LuCI meta package and ethtool;
-          # validation images must ship both (web UI + LED MIB probe tooling)
-          sed -i 's/^# CONFIG_PACKAGE_luci is not set/CONFIG_PACKAGE_luci=y/' .config
-          grep -q '^CONFIG_PACKAGE_ethtool=y' .config || echo 'CONFIG_PACKAGE_ethtool=y' >> .config
 
-          # If attach_theme=true, force-enable the imported theme in .config
-          # (the package directory was just copied into ./package/ above, so
-          #  defconfig + feeds install -a will pick it up).
+          # ---------------------------------------------------------------
+          # 1. luci + ethtool (validation images must ship both)
+          # ---------------------------------------------------------------
+          # the ci-wa350 .config asset disables the LuCI meta package and ethtool
+          sed -i 's/^# CONFIG_PACKAGE_luci is not set/CONFIG_PACKAGE_luci=y/' .config
+          #grep -q '^CONFIG_PACKAGE_ethtool=y' .config || echo 'CONFIG_PACKAGE_ethtool=y' >> .config
+
+          # ---------------------------------------------------------------
+          # 2. optional enan dashboard theme (attach_theme=true)
+          # ---------------------------------------------------------------
           if [ "${{ inputs.attach_theme }}" = "true" ]; then
             echo "--- Injecting CONFIG_PACKAGE_luci-theme-enan-dashboard=y ---" | tee -a logs/building-helper.txt
             sed -i '/^CONFIG_PACKAGE_luci-theme-enan-dashboard=/d' .config
@@ -451,15 +466,71 @@ jobs:
             echo 'CONFIG_PACKAGE_luci-theme-enan-dashboard=y' >> .config
           fi
 
+          # ---------------------------------------------------------------
+          # 3. v8: HARD-FORCE lldpd + watchcat (pre-defconfig)
+          #    Remove any existing y/m/not-set line, then append =y.
+          # ---------------------------------------------------------------
+          force_enable_pre() {
+            local sym="$1"
+            echo "--- Force-enabling ${sym}=y (pre-defconfig) ---" | tee -a logs/config-proof.txt
+            sed -i "/^${sym}=/d"                     .config
+            sed -i "/^# ${sym} is not set/d"         .config
+            echo "${sym}=y" >> .config
+          }
+          force_enable_pre "CONFIG_PACKAGE_lldpd"
+          force_enable_pre "CONFIG_PACKAGE_watchcat"
+
+          # ---------------------------------------------------------------
+          # 4. feeds + defconfig
+          # ---------------------------------------------------------------
           ./scripts/feeds update -a >/dev/null 2>&1
           ./scripts/feeds install -a >/dev/null 2>&1
           make defconfig || exit 1
 
-          grep -E '^CONFIG_TARGET_PROFILE=|^CONFIG_PACKAGE_kmod-dsa-qca8k=|^CONFIG_TARGET_ROOTFS_INITRAMFS=|^CONFIG_GCC_VERSION=|^CONFIG_PACKAGE_luci=|^CONFIG_PACKAGE_ethtool=|^CONFIG_PACKAGE_luci-theme-enan-dashboard=' .config | tee logs/config-proof.txt
+          # ---------------------------------------------------------------
+          # 5. v8: re-force lldpd + watchcat if defconfig dropped them.
+          #    A single re-run of defconfig is enough: OpenWrt only drops a
+          #    select if its dependencies are missing, and those come from
+          #    the feeds we just installed.
+          # ---------------------------------------------------------------
+          need_redefconfig=0
+          force_enable_post() {
+            local sym="$1"
+            if grep -q "^${sym}=y" .config; then
+              echo "✅ ${sym}=y survived defconfig." | tee -a logs/config-proof.txt
+              return 0
+            fi
+            echo "⚠️ ${sym} not =y after defconfig → re-forcing." | tee -a logs/config-proof.txt
+            sed -i "/^${sym}=/d"             .config
+            sed -i "/^# ${sym} is not set/d" .config
+            echo "${sym}=y" >> .config
+            need_redefconfig=1
+          }
+          force_enable_post "CONFIG_PACKAGE_lldpd"
+          force_enable_post "CONFIG_PACKAGE_watchcat"
 
-          grep -q '^CONFIG_PACKAGE_luci=y' .config || { echo "::error::luci missing after defconfig"; exit 1; }
+          if [ "$need_redefconfig" -eq 1 ]; then
+            echo "--- Re-running defconfig to merge re-forced lldpd/watchcat ---" | tee -a logs/config-proof.txt
+            make defconfig || exit 1
+            # Final sanity: if defconfig STILL drops them, fail loudly instead
+            # of silently producing an image without them.
+            if ! grep -q '^CONFIG_PACKAGE_lldpd=y' .config || \
+               ! grep -q '^CONFIG_PACKAGE_watchcat=y' .config; then
+              echo "::error::defconfig refuses to keep lldpd/watchcat=y - dependencies likely missing on this branch"
+              grep -E 'lldpd|watchcat' .config | tee -a logs/config-proof.txt
+              exit 1
+            fi
+          fi
 
-          # If attach_theme=true, verify the theme survived defconfig
+          # ---------------------------------------------------------------
+          # 6. proofs
+          # ---------------------------------------------------------------
+          grep -E '^CONFIG_TARGET_PROFILE=|^CONFIG_PACKAGE_kmod-dsa-qca8k=|^CONFIG_TARGET_ROOTFS_INITRAMFS=|^CONFIG_GCC_VERSION=|^CONFIG_PACKAGE_luci=|^CONFIG_PACKAGE_ethtool=|^CONFIG_PACKAGE_luci-theme-enan-dashboard=|^CONFIG_PACKAGE_lldpd=|^CONFIG_PACKAGE_watchcat=' .config | tee -a logs/config-proof.txt
+
+          grep -q '^CONFIG_PACKAGE_luci=y'     .config || { echo "::error::luci missing after defconfig";     exit 1; }
+          grep -q '^CONFIG_PACKAGE_lldpd=y'    .config || { echo "::error::lldpd missing after defconfig";    exit 1; }
+          grep -q '^CONFIG_PACKAGE_watchcat=y' .config || { echo "::error::watchcat missing after defconfig"; exit 1; }
+
           if [ "${{ inputs.attach_theme }}" = "true" ]; then
             if grep -q '^CONFIG_PACKAGE_luci-theme-enan-dashboard=y' .config; then
               echo "✅ luci-theme-enan-dashboard enabled after defconfig." | tee -a logs/config-proof.txt
@@ -484,10 +555,12 @@ jobs:
         run: |
           set +e
           {
+            echo "workflow       = build-cf-wa350-full v8"
             echo "base_branch    = ${{ inputs.base_branch }} ($(git rev-parse ${{ inputs.base_branch }} 2>/dev/null || git rev-parse origin/${{ inputs.base_branch }}))"
             echo "kernel_branch  = ${{ inputs.kernel_branch }} ($(git rev-parse ${{ inputs.kernel_branch }} 2>/dev/null || git rev-parse origin/${{ inputs.kernel_branch }}))"
             echo "include_files  = ${{ inputs.include_files }}"
             echo "attach_theme   = ${{ inputs.attach_theme }}"
+            echo "force_pkgs     = CONFIG_PACKAGE_lldpd=y CONFIG_PACKAGE_watchcat=y"
             echo "heads:"; cat logs/heads.txt 2>/dev/null
             echo "gates:"; cat logs/picks.txt 2>/dev/null | grep -E 'ALREADY-IN-BASE|EQUIVALENT-IN-BASE|TREE-ALREADY-IN-BASE|EMPTY-AFTER-PICK|ASSET-CONFLICT|PICKED|KERNEL-RANGE|HEAD-NOW'
             cat logs/asset-source.txt 2>/dev/null
