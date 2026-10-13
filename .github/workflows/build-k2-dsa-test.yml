@@ -8,6 +8,7 @@
 # يظهر فقط من الفرع الافتراضي)، أنشئ فرع `k2-dsa-v1` كما في README‑K2‑DSA‑ar.md §2، ثم
 # Actions → build-k2-dsa-test → Run workflow (k2_branch=k2-dsa-v1).
 #
+# v5 (r20-i): scripts/config مجلد لا أمر (علة run#2, exit 126) ⇒ الإلحاق+defconfig ثانية.
 # v4 (r20-h): إصلاح فشل run#1 («device not selected»): defconfig مزدوج + فرض scripts/config
 # + تشخيصات قبل الموت + G6 (TARGET_DEVICES) + proof واقعي (kmod=[ym]) + الحكم النهائي manifest الصورة.
 # تعديلات المستخدم على سقالة الوايفاي (open AP بلا مفتاح) محفوظة كما رفعها.
@@ -135,38 +136,38 @@ jobs:
           # 1) ضمان وجود إعداد الوايفاي أصلاً (لا يعتمد على ترتيب توليده مقابل uci-defaults)
           ETC="${IPKG_INSTROOT:-}/etc"
           if [ ! -f "$ETC/config/wireless" ]; then
-            mkdir -p "$ETC/config"
-            wifi detect > "$ETC/config/wireless" 2>/dev/null || true
+          	mkdir -p "$ETC/config"
+          	wifi detect > "$ETC/config/wireless" 2>/dev/null || true
           fi
           [ -f "$ETC/config/wireless" ] || exit 0
 
           # 2) لكل radio: تفعيل + قناة ثابتة معروفة (‏6 للـ2.4G و36 للـ5G — بلا DFS)
           for dev in $(uci show wireless 2>/dev/null | sed -n 's/^wireless\.\([A-Za-z0-9_]*\)=wifi-device$/\1/p'); do
-            band="$(uci -q get "wireless.$dev.band" 2>/dev/null)$(uci -q get "wireless.$dev.hwmode" 2>/dev/null)"
-            case "$band" in
-              *5g*|*11a*) ssid="$RESCUE_SSID_5G"; ch="36" ;;
-              *)          ssid="$RESCUE_SSID_2G"; ch="6"  ;;
-            esac
-            uci -q set "wireless.$dev.disabled=0"
-            uci -q set "wireless.$dev.channel=$ch"
+          	band="$(uci -q get "wireless.$dev.band" 2>/dev/null)$(uci -q get "wireless.$dev.hwmode" 2>/dev/null)"
+          	case "$band" in
+          		*5g*|*11a*) ssid="$RESCUE_SSID_5G"; ch="36" ;;
+          		*)          ssid="$RESCUE_SSID_2G"; ch="6"  ;;
+          	esac
+          	uci -q set "wireless.$dev.disabled=0"
+          	uci -q set "wireless.$dev.channel=$ch"
 
-            # أول iface لهذا الradio (أو أنشئ واحداً) ⇒ AP على شبكة lan
-            iface=""
-            for cand in $(uci show wireless 2>/dev/null | sed -n 's/^wireless\.\([A-Za-z0-9_]*\)=wifi-iface$/\1/p'); do
-              if [ "$(uci -q get "wireless.$cand.device" 2>/dev/null)" = "$dev" ]; then
-                iface="$cand"
-                break
-              fi
-            done
-            if [ -z "$iface" ]; then
-              iface="$(uci -q add wireless wifi-iface 2>/dev/null)"
-              [ -n "$iface" ] || continue
-              uci -q set "wireless.$iface.device=$dev"
-            fi
-            uci -q set "wireless.$iface.mode=ap"
-            uci -q set "wireless.$iface.network=lan"
-            uci -q set "wireless.$iface.ssid=$ssid"
-            uci -q set "wireless.$iface.encryption=none"
+          	# أول iface لهذا الradio (أو أنشئ واحداً) ⇒ AP على شبكة lan
+          	iface=""
+          	for cand in $(uci show wireless 2>/dev/null | sed -n 's/^wireless\.\([A-Za-z0-9_]*\)=wifi-iface$/\1/p'); do
+          		if [ "$(uci -q get "wireless.$cand.device" 2>/dev/null)" = "$dev" ]; then
+          			iface="$cand"
+          			break
+          		fi
+          	done
+          	if [ -z "$iface" ]; then
+          		iface="$(uci -q add wireless wifi-iface 2>/dev/null)"
+          		[ -n "$iface" ] || continue
+          		uci -q set "wireless.$iface.device=$dev"
+          	fi
+          	uci -q set "wireless.$iface.mode=ap"
+          	uci -q set "wireless.$iface.network=lan"
+          	uci -q set "wireless.$iface.ssid=$ssid"
+          	uci -q set "wireless.$iface.encryption=none"
 
           done
 
@@ -221,8 +222,15 @@ jobs:
           # والثانية تحل رمز الجهاز عليه (علة run#1: الرمز سقط من التمريرة الواحدة)
           make defconfig
           if ! grep -q "^CONFIG_${DEVSYM}=y" .config; then
-            echo "::warning::device not selected after pass 1 — forcing via scripts/config + pass 2"
-            ./scripts/config --enable TARGET_ramips --enable TARGET_ramips_mt7620 --enable "$DEVSYM"
+            # v5: scripts/config في OpenWrt **مجلد** (مصدر kconfig) لا أمر — علة run#2 (exit 126).
+            # الإلحاق ثم defconfig ثانية هو الآلية القياسية (التمريرة الأولى تولّد metadata للtarget).
+            echo "::warning::device not selected after pass 1 — re-seeding device lines + defconfig pass 2"
+            {
+              echo "CONFIG_TARGET_ramips=y"
+              echo "CONFIG_TARGET_ramips_mt7620=y"
+              echo "CONFIG_TARGET_${DEVSYM}=y"
+              echo "CONFIG_PACKAGE_luci=y"
+            } >> .config
             make defconfig
           fi
 
@@ -234,7 +242,10 @@ jobs:
           if ! grep -q "^CONFIG_${DEVSYM}=y" .config; then
             echo "::error::config proof: device STILL not selected — diagnostics:"
             echo "--- TARGET_DEVICES line in mk:";  grep -n 'TARGET_DEVICES += phicomm_k2-v22' target/linux/ramips/image/mt7620.mk || true
-            echo "--- device symbol in generated metadata:"; grep -rn "phicomm_k2-v22.4" tmp/.config-package.in 2>/dev/null | head -5 || echo "(symbol ABSENT from tmp/.config-package.in — device metadata not generated!)"
+            echo "--- device symbol in generated metadata:"
+            grep -rn "phicomm_k2-v22" tmp/.config-package.in 2>/dev/null | head -3 || echo "(absent from tmp/.config-package.in)"
+            grep -rn "phicomm_k2-v22" tmp/.config-target.in 2>/dev/null | head -3 || echo "(absent from tmp/.config-target.in)"
+            ls tmp/ 2>/dev/null | head -10
             echo "--- Device block as parsed:"; sed -n '/^define Device\/phicomm_k2-v22.4$/,/^endef$/p' target/linux/ramips/image/mt7620.mk
             exit 1
           fi
@@ -267,7 +278,7 @@ jobs:
         run: |
           set +e
           {
-            echo "workflow     = build-k2-dsa-test v4 (r20-h)"
+            echo "workflow     = build-k2-dsa-test v5 (r20-i)"
             echo "k2_branch    = ${{ inputs.k2_branch }} ($(cat logs/head.txt 2>/dev/null))"
             echo "include_luci = ${{ inputs.include_luci }}"
             echo "include_test_pkgs = ${{ inputs.include_test_pkgs }}"
