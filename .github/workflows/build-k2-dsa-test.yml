@@ -1,0 +1,262 @@
+# build-k2-dsa-test.yml — صورة اختبار Phicomm K2 v22.4 المحوَّل إلى DSA (r20‑d، v2 في r20‑f)
+#
+# الفكرة: نفس فلسفة build-cf-wa350-full (بوابات fail‑closed + بطاقة هوية + شواهد sha256)،
+# لكن **بلا building-helper ولا theme**: الoverlay هناك يعيد بناء /etc/config/network ويثبت
+# MACs لجهاز آخر (م136: الoverlay يجب ألا يمس موضوع الاختبار — وموضوعنا هنا الشبكة نفسها).
+#
+# التشغيل: انسخ هذا الملف إلى `.github/workflows/` على فرع `main` في fork (‏workflow_dispatch
+# يظهر فقط من الفرع الافتراضي)، أنشئ فرع `k2-dsa-v1` كما في README‑K2‑DSA‑ar.md §2، ثم
+# Actions → build-k2-dsa-test → Run workflow (k2_branch=k2-dsa-v1).
+#
+name: build-k2-dsa-test
+
+on:
+  workflow_dispatch:
+    inputs:
+      k2_branch:
+        description: "Branch on this fork carrying the K2 v22.4 DSA commit(s) on top of openwrt master"
+        required: false
+        default: k2-dsa-v1
+        type: string
+      include_luci:
+        description: "Add LuCI to the test image (default: headless — testing is serial/CLI)"
+        required: false
+        default: false
+        type: boolean
+      include_test_pkgs:
+        description: "Add measurement packages (ethtool, ip-bridge, iperf3, tcpdump-mini)"
+        required: false
+        default: true
+        type: boolean
+      wifi_rescue:
+        description: "Inject /etc/uci-defaults/99-k2-wifi-rescue (force both radios up as K2-DSA-RESCUE APs on br-lan) — the no-serial safety net"
+        required: false
+        default: true
+        type: boolean
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Checkout k2 branch
+        uses: actions/checkout@v4
+        with:
+          repository: haddad2inc/openwrt
+          ref: ${{ inputs.k2_branch }}
+          fetch-depth: 0
+
+      # ------------------------------------------------------------
+      # بوابات المحتوى (fail-closed — م127): إن لم يكن الbranch يحمل
+      # التحويل فعلاً فلا معنى لحرق ساعة بناء؛ الموت هنا رخيص.
+      # ------------------------------------------------------------
+      - name: Content gates + identity witnesses
+        run: |
+          set -e
+          mkdir -p logs
+          DTS=target/linux/ramips/dts/mt7620a_phicomm_k2-v22.4.dts
+          MK=target/linux/ramips/image/mt7620.mk
+          NET=target/linux/ramips/mt7620/base-files/etc/board.d/02_network
+          fail(){ echo "::error::GATE FAIL: $1"; exit 1; }
+
+          # G1 — الDTS يحمل شكل DSA الكامل (5 منافذ مستخدم داخلية + CPU)
+          grep -q 'ports {' "$DTS"                              || fail "G1 no ports node in $DTS"
+          [ "$(grep -c 'phy-handle = <&ephy' "$DTS")" = "5" ]   || fail "G1 phy-handle count != 5"
+          [ "$(grep -c 'phy-mode = "mii"' "$DTS")" = "5" ]      || fail "G1 phy-mode mii count != 5 (internal NOT accepted)"
+          grep -q 'mdio-bus {' "$DTS"                           || fail "G1 no mdio-bus node"
+          grep -q 'status = "okay";' "$DTS"                     || fail "G1 mdio-bus not enabled"
+          grep -q 'label = "wan";' "$DTS"                       || fail "G1 no wan port label"
+          grep -q 'ethernet = <&ethernet>;' "$DTS"              || fail "G1 cpu port lacks ethernet phandle"
+
+          # G2 — وصفة الصورة في كتلة k2-v22.4 وحدها
+          awk '/^define Device\/phicomm_k2-v22.4$/,/^endef$/' "$MK" > logs/mk-block.txt
+          grep -q 'kmod-dsa-mt7620' logs/mk-block.txt           || fail "G2 kmod-dsa-mt7620 missing from Device block"
+          grep -q -- '-swconfig' logs/mk-block.txt              || fail "G2 -swconfig missing from Device block"
+          grep -q 'DEVICE_COMPAT_VERSION := 1.1' logs/mk-block.txt || fail "G2 DEVICE_COMPAT_VERSION missing"
+
+          # G3 — فصل الcase في 02_network: v22.4 وحده DSA، وv22.5+ البقية ما زالوا swconfig
+          grep -A1 'phicomm,k2-v22.4)' "$NET" | grep -q 'ucidef_set_interfaces_lan_wan "lan1 lan2 lan3 lan4" "wan"' \
+                                                              || fail "G3 k2-v22.4 interfaces case not in DSA form"
+          grep -A6 'phicomm,k2-v22.5|' "$NET" | grep -q 'ucidef_add_switch' \
+                                                              || fail "G3 k2-v22.5 lost its swconfig case (case split broken)"
+          # G3c/G3d (r20-g) — العلة الميدانية الحقيقية: الشق في **وسط** قائمة الأنماط يسحب
+          # الأجهزة التي فوق k2-v22.4 (dlink,dir-810l / netcore,nw5212 / netgear,jwnr2010-v5)
+          # إلى حالة DSA. الفحصان أدناه يمسكانها من الطرفين (م142: اختبار بمحتوى ملوث).
+          sed -n '/^ramips_setup_interfaces()/,/^}/p' "$NET" > /tmp/k2-iface
+          grep -A9 'dlink,dir-810l|' /tmp/k2-iface | grep -q 'ucidef_add_switch' \
+                                                              || fail "G3c dlink,dir-810l/netcore/jwnr2010 fell into the DSA case"
+          if grep -q 'phicomm,k2-v22.4|' /tmp/k2-iface; then
+            fail "G3d k2-v22.4 still a member of a shared swconfig case (first-match wins — standalone case dead)"
+          fi
+          rm -f /tmp/k2-iface
+
+          # G4 — شواهد الهوية (م79): بصمات الملفات الثلاثة ورأس الفرع
+          sha256sum "$DTS" "$MK" "$NET" | tee logs/files.sha256
+          git log --oneline -5 | tee logs/commits.txt
+          git rev-parse HEAD | tee logs/head.txt
+          echo "GATES: PASS (G1..G4)" | tee logs/gates.txt
+
+      # ------------------------------------------------------------
+      # سقالة النجاة (r20-f): الجهاز تحت الاختبار بلا USB-TTL —
+      # الوايفاي هو القناة الخارج-نطاقية إن مات جانب السويتش.
+      # المحتوى مولَّد حرفياً من device-k2-dsa/files/99-k2-wifi-rescue
+      # (مختبر 21/21) — إن عدّلت أحدهما فعدّل الآخر وقارن sha256.
+      # ------------------------------------------------------------
+      - name: Inject WiFi rescue overlay (no-serial safety net)
+        if: ${{ inputs.wifi_rescue }}
+        run: |
+          set -e
+          mkdir -p files/etc/uci-defaults
+          cat > files/etc/uci-defaults/99-k2-wifi-rescue << 'RESCUE'
+          #!/bin/sh
+          # 99-k2-wifi-rescue — سقالة اختبار r20‑f لجهاز K2 v22.4 (ليست جزءاً من أي PR مستقبلي).
+          #
+          # لماذا: الجهاز تحت الاختبار **بلا طرفية تسلسلية** (لا USB‑TTL). إن فشل جانب السويتش/DSA
+          # فالوايفاي هو القناة الخارج‑نطاقية الوحيدة: الـwmac (‏2.4G) والـMT7612E (‏PCIe 5G) مستقلان
+          # تماماً عن المفتاح وعن مسار DSA (لا يلمسهما الpatch) ⇒ حتى لو ماتت المنافذ كلها يبقى AP
+          # معروف الاسم على br‑lan للدخول والتشخيص والعودة للصورة القديمة.
+          #
+          # التصميم order‑agnostic: إن وُجد /etc/config/wireless عدّله، وإن غاب ولّده أولاً (‏wifi detect).
+          # يعمل على أي عدد من الradios وبأي تسمية (radio0/radio1 أو غيرها). لا يفشل أبداً (exit 0) —
+          # سقالة النجاة يجب ألا تكون سبباً في فشل إقلاع.
+          #
+          # الشبكة/المفتاح: ‏K2‑DSA‑RESCUE / K2‑DSA‑RESCUE‑5G ومفتاح WPA2 ‏«k2-rescue-2026» —
+          # صورة اختبار خاصة؛ غيّرهما هنا (وفي نسخة الworkflow) إن أردت قبل البناء.
+
+          RESCUE_SSID_2G="K2-DSA-RESCUE"
+          RESCUE_SSID_5G="K2-DSA-RESCUE-5G"
+
+          # 1) ضمان وجود إعداد الوايفاي أصلاً (لا يعتمد على ترتيب توليده مقابل uci-defaults)
+          ETC="${IPKG_INSTROOT:-}/etc"
+          if [ ! -f "$ETC/config/wireless" ]; then
+          	mkdir -p "$ETC/config"
+          	wifi detect > "$ETC/config/wireless" 2>/dev/null || true
+          fi
+          [ -f "$ETC/config/wireless" ] || exit 0
+
+          # 2) لكل radio: تفعيل + قناة ثابتة معروفة (‏6 للـ2.4G و36 للـ5G — بلا DFS)
+          for dev in $(uci show wireless 2>/dev/null | sed -n 's/^wireless\.\([A-Za-z0-9_]*\)=wifi-device$/\1/p'); do
+          	band="$(uci -q get "wireless.$dev.band" 2>/dev/null)$(uci -q get "wireless.$dev.hwmode" 2>/dev/null)"
+          	case "$band" in
+          		*5g*|*11a*) ssid="$RESCUE_SSID_5G"; ch="36" ;;
+          		*)          ssid="$RESCUE_SSID_2G"; ch="6"  ;;
+          	esac
+          	uci -q set "wireless.$dev.disabled=0"
+          	uci -q set "wireless.$dev.channel=$ch"
+
+          	# أول iface لهذا الradio (أو أنشئ واحداً) ⇒ AP على شبكة lan
+          	iface=""
+          	for cand in $(uci show wireless 2>/dev/null | sed -n 's/^wireless\.\([A-Za-z0-9_]*\)=wifi-iface$/\1/p'); do
+          		if [ "$(uci -q get "wireless.$cand.device" 2>/dev/null)" = "$dev" ]; then
+          			iface="$cand"
+          			break
+          		fi
+          	done
+          	if [ -z "$iface" ]; then
+          		iface="$(uci -q add wireless wifi-iface 2>/dev/null)"
+          		[ -n "$iface" ] || continue
+          		uci -q set "wireless.$iface.device=$dev"
+          	fi
+          	uci -q set "wireless.$iface.mode=ap"
+          	uci -q set "wireless.$iface.network=lan"
+          	uci -q set "wireless.$iface.ssid=$ssid"
+          	uci -q set "wireless.$iface.encryption=none"
+          
+          done
+
+          uci -q commit wireless 2>/dev/null
+
+          # 3) شاهد قابل للقراءة لاحقاً (متى/هل اشتغلت السقالة) — يُقرأ عبر SSH في §F
+          echo "wifi-rescue applied $(date -u +%FT%TZ)" > "$ETC/k2-wifi-rescue.stamp"
+
+          exit 0
+          RESCUE
+          chmod 755 files/etc/uci-defaults/99-k2-wifi-rescue
+          # G5 — بوابة السقالة: موجودة + قابلة للتنفيذ + سليمة النحو + بعلاماتها
+          sh -n files/etc/uci-defaults/99-k2-wifi-rescue || { echo "::error::G5 FAIL: rescue syntax"; exit 1; }
+          [ -x files/etc/uci-defaults/99-k2-wifi-rescue ] || { echo "::error::G5 FAIL: not executable (uci-defaults تتجاوزه)"; exit 1; }
+          grep -q 'K2-DSA-RESCUE' files/etc/uci-defaults/99-k2-wifi-rescue || { echo "::error::G5 FAIL: markers missing"; exit 1; }
+          sha256sum files/etc/uci-defaults/99-k2-wifi-rescue | tee logs/rescue.sha256
+
+      - name: Install feeds
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      # ------------------------------------------------------------
+      # البذرة: نفس محتوى files/seed-k2-dsa.config في الحزمة (مضمنة هنا
+      # كي يكون الworkflow مكتفياً ذاتياً على الfork) + defconfig + إثبات
+      # ------------------------------------------------------------
+      - name: Seed .config + defconfig + config proof
+        run: |
+          set -e
+          cat > .config << 'SEED'
+          CONFIG_TARGET_ramips=y
+          CONFIG_TARGET_ramips_mt7620=y
+          CONFIG_TARGET_DEVICE_ramips_mt7620_DEVICE_phicomm_k2-v22.4=y
+          CONFIG_PACKAGE_kmod-dsa-mt7620=y
+          SEED
+          if [ "${{ inputs.include_test_pkgs }}" = "true" ]; then
+            cat >> .config << 'PKGS'
+          CONFIG_PACKAGE_ethtool=y
+          CONFIG_PACKAGE_ip-bridge=y
+          CONFIG_PACKAGE_iperf3=y
+          CONFIG_PACKAGE_tcpdump-mini=y
+          PKGS
+          fi
+          if [ "${{ inputs.include_luci }}" = "true" ]; then
+            echo 'CONFIG_PACKAGE_luci=y' >> .config
+          fi
+          make defconfig
+          {
+            echo "--- device + dsa + swconfig + test pkgs as resolved by defconfig ---"
+            grep -E '^CONFIG_TARGET_DEVICE_ramips_mt7620_DEVICE_phicomm_k2-v22\.4=|^CONFIG_PACKAGE_kmod-dsa-mt7620=|^CONFIG_PACKAGE_swconfig=|^# CONFIG_PACKAGE_swconfig is not set|^CONFIG_PACKAGE_(ethtool|ip-bridge|iperf3|tcpdump-mini|luci)=' .config || true
+          } | tee logs/config-proof.txt
+          grep -q '^CONFIG_TARGET_DEVICE_ramips_mt7620_DEVICE_phicomm_k2-v22.4=y' .config \
+            || { echo "::error::config proof: device not selected"; exit 1; }
+          grep -q '^CONFIG_PACKAGE_kmod-dsa-mt7620=y' .config \
+            || { echo "::error::config proof: kmod-dsa-mt7620 not enabled"; exit 1; }
+          if grep -q '^CONFIG_PACKAGE_swconfig=y' .config; then
+            echo "::error::config proof: swconfig USERSPACE present despite -swconfig"; exit 1
+          fi
+
+      - name: Build (sysupgrade + initramfs)
+        run: |
+          set +e
+          make -j"$(nproc)" V=s 2>&1 | tee logs/build.log
+          rc=${PIPESTATUS[0]}
+          ls -l bin/targets/ramips/mt7620/ | tee logs/bin-list.txt
+          sha256sum bin/targets/ramips/mt7620/*k2-v22.4* 2>/dev/null | tee logs/images.sha256
+          exit "$rc"
+
+      - name: Identity card
+        if: always()
+        run: |
+          set +e
+          {
+            echo "workflow     = build-k2-dsa-test v3 (r20-g)"
+            echo "k2_branch    = ${{ inputs.k2_branch }} ($(cat logs/head.txt 2>/dev/null))"
+            echo "include_luci = ${{ inputs.include_luci }}"
+            echo "include_test_pkgs = ${{ inputs.include_test_pkgs }}"
+            echo "wifi_rescue  = ${{ inputs.wifi_rescue }}"
+            echo "rescue.sha256:"; cat logs/rescue.sha256 2>/dev/null
+            echo "gates:"; cat logs/gates.txt 2>/dev/null
+            echo "files.sha256:"; cat logs/files.sha256 2>/dev/null
+            echo "commits:"; cat logs/commits.txt 2>/dev/null
+            echo "config_proof:"; cat logs/config-proof.txt 2>/dev/null
+            echo "kernel = 6.18$(grep -m1 'LINUX_VERSION-6.18' target/linux/generic/kernel-6.18 2>/dev/null | sed 's/.*= //')"
+            echo "date   = $(date -u +%FT%TZ)"
+            echo "runner = $RUNNER_NAME"
+          } > logs/00-identity.txt
+          cat logs/00-identity.txt
+          exit 0
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: k2-dsa-test-${{ github.run_number }}
+          path: |
+            logs/
+            bin/targets/ramips/mt7620/*k2-v22.4*
+          retention-days: 30
