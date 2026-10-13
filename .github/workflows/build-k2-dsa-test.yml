@@ -197,11 +197,12 @@ jobs:
       - name: Seed .config + defconfig (double-pass) + config proof
         run: |
           set -e
-          DEVSYM=TARGET_DEVICE_ramips_mt7620_DEVICE_phicomm_k2-v22.4
+          DEVSYM=TARGET_ramips_mt7620_DEVICE_phicomm_k2-v22.4
           cat > .config << 'SEED'
           CONFIG_TARGET_ramips=y
           CONFIG_TARGET_ramips_mt7620=y
-          CONFIG_TARGET_DEVICE_ramips_mt7620_DEVICE_phicomm_k2-v22.4=y
+          # CONFIG_TARGET_MULTI_PROFILE is not set
+          CONFIG_TARGET_ramips_mt7620_DEVICE_phicomm_k2-v22.4=y
           CONFIG_PACKAGE_kmod-dsa-mt7620=y
           SEED
           if [ "${{ inputs.include_test_pkgs }}" = "true" ]; then
@@ -227,9 +228,10 @@ jobs:
             echo "::warning::device not selected after pass 1 — re-seeding device lines + defconfig pass 2"
             {
               echo "CONFIG_TARGET_ramips=y"
+              echo "# CONFIG_TARGET_MULTI_PROFILE is not set"
               echo "CONFIG_TARGET_ramips_mt7620=y"
               echo "CONFIG_TARGET_${DEVSYM}=y"
-              echo "CONFIG_PACKAGE_luci=y"
+              echo "CONFIG_PACKAGE_luci=y=y"
             } >> .config
             make defconfig
           fi
@@ -278,7 +280,7 @@ jobs:
         run: |
           set +e
           {
-            echo "workflow     = build-k2-dsa-test v5 (r20-i)"
+            echo "workflow     = build-k2-dsa-test v6 (r20-j)"
             echo "k2_branch    = ${{ inputs.k2_branch }} ($(cat logs/head.txt 2>/dev/null))"
             echo "include_luci = ${{ inputs.include_luci }}"
             echo "include_test_pkgs = ${{ inputs.include_test_pkgs }}"
