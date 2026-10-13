@@ -1,4 +1,4 @@
-# build-k2-dsa-test.yml — صورة اختبار Phicomm K2 v22.4 المحوَّل إلى DSA (r20‑d، v2 في r20‑f)
+# build-k2-dsa-test.yml — صورة اختبار Phicomm K2 v22.4 المحوَّل إلى DSA (r20‑d، v2 في r20‑f، v4 في r20‑h)
 #
 # الفكرة: نفس فلسفة build-cf-wa350-full (بوابات fail‑closed + بطاقة هوية + شواهد sha256)،
 # لكن **بلا building-helper ولا theme**: الoverlay هناك يعيد بناء /etc/config/network ويثبت
@@ -8,6 +8,9 @@
 # يظهر فقط من الفرع الافتراضي)، أنشئ فرع `k2-dsa-v1` كما في README‑K2‑DSA‑ar.md §2، ثم
 # Actions → build-k2-dsa-test → Run workflow (k2_branch=k2-dsa-v1).
 #
+# v4 (r20-h): إصلاح فشل run#1 («device not selected»): defconfig مزدوج + فرض scripts/config
+# + تشخيصات قبل الموت + G6 (TARGET_DEVICES) + proof واقعي (kmod=[ym]) + الحكم النهائي manifest الصورة.
+# تعديلات المستخدم على سقالة الوايفاي (open AP بلا مفتاح) محفوظة كما رفعها.
 name: build-k2-dsa-test
 
 on:
@@ -90,6 +93,9 @@ jobs:
           fi
           rm -f /tmp/k2-iface
 
+          # G6 (v4) — الجهاز مسجّل في TARGET_DEVICES (بدونه لا يولد رمز kconfig للجهاز أساساً)
+          grep -q '^TARGET_DEVICES += phicomm_k2-v22.4$' "$MK" || fail "G6 TARGET_DEVICES += phicomm_k2-v22.4 missing from mt7620.mk"
+
           # G4 — شواهد الهوية (م79): بصمات الملفات الثلاثة ورأس الفرع
           sha256sum "$DTS" "$MK" "$NET" | tee logs/files.sha256
           git log --oneline -5 | tee logs/commits.txt
@@ -120,8 +126,8 @@ jobs:
           # يعمل على أي عدد من الradios وبأي تسمية (radio0/radio1 أو غيرها). لا يفشل أبداً (exit 0) —
           # سقالة النجاة يجب ألا تكون سبباً في فشل إقلاع.
           #
-          # الشبكة/المفتاح: ‏K2‑DSA‑RESCUE / K2‑DSA‑RESCUE‑5G ومفتاح WPA2 ‏«k2-rescue-2026» —
-          # صورة اختبار خاصة؛ غيّرهما هنا (وفي نسخة الworkflow) إن أردت قبل البناء.
+          # الشبكة: ‏K2‑DSA‑RESCUE / K2‑DSA‑RESCUE‑5G — **open بلا مفتاح** (قرار المستخدم r20‑h:
+          # سهولة الوصول عند النجدة أهم من الخصوصية لشبكة اختبار منزلية قصيرة العمر).
 
           RESCUE_SSID_2G="K2-DSA-RESCUE"
           RESCUE_SSID_5G="K2-DSA-RESCUE-5G"
@@ -129,39 +135,39 @@ jobs:
           # 1) ضمان وجود إعداد الوايفاي أصلاً (لا يعتمد على ترتيب توليده مقابل uci-defaults)
           ETC="${IPKG_INSTROOT:-}/etc"
           if [ ! -f "$ETC/config/wireless" ]; then
-          	mkdir -p "$ETC/config"
-          	wifi detect > "$ETC/config/wireless" 2>/dev/null || true
+            mkdir -p "$ETC/config"
+            wifi detect > "$ETC/config/wireless" 2>/dev/null || true
           fi
           [ -f "$ETC/config/wireless" ] || exit 0
 
           # 2) لكل radio: تفعيل + قناة ثابتة معروفة (‏6 للـ2.4G و36 للـ5G — بلا DFS)
           for dev in $(uci show wireless 2>/dev/null | sed -n 's/^wireless\.\([A-Za-z0-9_]*\)=wifi-device$/\1/p'); do
-          	band="$(uci -q get "wireless.$dev.band" 2>/dev/null)$(uci -q get "wireless.$dev.hwmode" 2>/dev/null)"
-          	case "$band" in
-          		*5g*|*11a*) ssid="$RESCUE_SSID_5G"; ch="36" ;;
-          		*)          ssid="$RESCUE_SSID_2G"; ch="6"  ;;
-          	esac
-          	uci -q set "wireless.$dev.disabled=0"
-          	uci -q set "wireless.$dev.channel=$ch"
+            band="$(uci -q get "wireless.$dev.band" 2>/dev/null)$(uci -q get "wireless.$dev.hwmode" 2>/dev/null)"
+            case "$band" in
+              *5g*|*11a*) ssid="$RESCUE_SSID_5G"; ch="36" ;;
+              *)          ssid="$RESCUE_SSID_2G"; ch="6"  ;;
+            esac
+            uci -q set "wireless.$dev.disabled=0"
+            uci -q set "wireless.$dev.channel=$ch"
 
-          	# أول iface لهذا الradio (أو أنشئ واحداً) ⇒ AP على شبكة lan
-          	iface=""
-          	for cand in $(uci show wireless 2>/dev/null | sed -n 's/^wireless\.\([A-Za-z0-9_]*\)=wifi-iface$/\1/p'); do
-          		if [ "$(uci -q get "wireless.$cand.device" 2>/dev/null)" = "$dev" ]; then
-          			iface="$cand"
-          			break
-          		fi
-          	done
-          	if [ -z "$iface" ]; then
-          		iface="$(uci -q add wireless wifi-iface 2>/dev/null)"
-          		[ -n "$iface" ] || continue
-          		uci -q set "wireless.$iface.device=$dev"
-          	fi
-          	uci -q set "wireless.$iface.mode=ap"
-          	uci -q set "wireless.$iface.network=lan"
-          	uci -q set "wireless.$iface.ssid=$ssid"
-          	uci -q set "wireless.$iface.encryption=none"
-          
+            # أول iface لهذا الradio (أو أنشئ واحداً) ⇒ AP على شبكة lan
+            iface=""
+            for cand in $(uci show wireless 2>/dev/null | sed -n 's/^wireless\.\([A-Za-z0-9_]*\)=wifi-iface$/\1/p'); do
+              if [ "$(uci -q get "wireless.$cand.device" 2>/dev/null)" = "$dev" ]; then
+                iface="$cand"
+                break
+              fi
+            done
+            if [ -z "$iface" ]; then
+              iface="$(uci -q add wireless wifi-iface 2>/dev/null)"
+              [ -n "$iface" ] || continue
+              uci -q set "wireless.$iface.device=$dev"
+            fi
+            uci -q set "wireless.$iface.mode=ap"
+            uci -q set "wireless.$iface.network=lan"
+            uci -q set "wireless.$iface.ssid=$ssid"
+            uci -q set "wireless.$iface.encryption=none"
+
           done
 
           uci -q commit wireless 2>/dev/null
@@ -187,9 +193,10 @@ jobs:
       # البذرة: نفس محتوى files/seed-k2-dsa.config في الحزمة (مضمنة هنا
       # كي يكون الworkflow مكتفياً ذاتياً على الfork) + defconfig + إثبات
       # ------------------------------------------------------------
-      - name: Seed .config + defconfig + config proof
+      - name: Seed .config + defconfig (double-pass) + config proof
         run: |
           set -e
+          DEVSYM=TARGET_DEVICE_ramips_mt7620_DEVICE_phicomm_k2-v22.4
           cat > .config << 'SEED'
           CONFIG_TARGET_ramips=y
           CONFIG_TARGET_ramips_mt7620=y
@@ -207,17 +214,33 @@ jobs:
           if [ "${{ inputs.include_luci }}" = "true" ]; then
             echo 'CONFIG_PACKAGE_luci=y' >> .config
           fi
+          cp .config logs/seed.config          # شاهد: ما دخل defconfig حرفياً
+          echo "--- seed ---"; cat logs/seed.config
+
+          # v4: defconfig مزدوج — التمريرة الأولى تبني metadata للtarget الجديد،
+          # والثانية تحل رمز الجهاز عليه (علة run#1: الرمز سقط من التمريرة الواحدة)
           make defconfig
+          if ! grep -q "^CONFIG_${DEVSYM}=y" .config; then
+            echo "::warning::device not selected after pass 1 — forcing via scripts/config + pass 2"
+            ./scripts/config --enable TARGET_ramips --enable TARGET_ramips_mt7620 --enable "$DEVSYM"
+            make defconfig
+          fi
+
+          # proof (واقعي): kmod قد يكون =m (tristate) — هذا سليم؛ swconfig يحسمه manifest لا .config
           {
-            echo "--- device + dsa + swconfig + test pkgs as resolved by defconfig ---"
-            grep -E '^CONFIG_TARGET_DEVICE_ramips_mt7620_DEVICE_phicomm_k2-v22\.4=|^CONFIG_PACKAGE_kmod-dsa-mt7620=|^CONFIG_PACKAGE_swconfig=|^# CONFIG_PACKAGE_swconfig is not set|^CONFIG_PACKAGE_(ethtool|ip-bridge|iperf3|tcpdump-mini|luci)=' .config || true
+            echo "--- resolved by defconfig ---"
+            grep -E "^CONFIG_${DEVSYM}=|^CONFIG_PACKAGE_kmod-dsa-mt7620=|^CONFIG_PACKAGE_swconfig=|^# CONFIG_PACKAGE_swconfig is not set|^CONFIG_PACKAGE_(ethtool|ip-bridge|iperf3|tcpdump-mini|luci)=" .config || true
           } | tee logs/config-proof.txt
-          grep -q '^CONFIG_TARGET_DEVICE_ramips_mt7620_DEVICE_phicomm_k2-v22.4=y' .config \
-            || { echo "::error::config proof: device not selected"; exit 1; }
-          grep -q '^CONFIG_PACKAGE_kmod-dsa-mt7620=y' .config \
-            || { echo "::error::config proof: kmod-dsa-mt7620 not enabled"; exit 1; }
+          if ! grep -q "^CONFIG_${DEVSYM}=y" .config; then
+            echo "::error::config proof: device STILL not selected — diagnostics:"
+            echo "--- TARGET_DEVICES line in mk:";  grep -n 'TARGET_DEVICES += phicomm_k2-v22' target/linux/ramips/image/mt7620.mk || true
+            echo "--- device symbol in generated metadata:"; grep -rn "phicomm_k2-v22.4" tmp/.config-package.in 2>/dev/null | head -5 || echo "(symbol ABSENT from tmp/.config-package.in — device metadata not generated!)"
+            echo "--- Device block as parsed:"; sed -n '/^define Device\/phicomm_k2-v22.4$/,/^endef$/p' target/linux/ramips/image/mt7620.mk
+            exit 1
+          fi
+          grep -Eq '^CONFIG_PACKAGE_kmod-dsa-mt7620=[ym]' .config || { echo "::error::config proof: kmod-dsa-mt7620 not enabled"; exit 1; }
           if grep -q '^CONFIG_PACKAGE_swconfig=y' .config; then
-            echo "::error::config proof: swconfig USERSPACE present despite -swconfig"; exit 1
+            echo "::warning::swconfig =y in .config — الحكم النهائي في manifest الصورة (خطوة البناء تفحصه)"
           fi
 
       - name: Build (sysupgrade + initramfs)
@@ -227,6 +250,16 @@ jobs:
           rc=${PIPESTATUS[0]}
           ls -l bin/targets/ramips/mt7620/ | tee logs/bin-list.txt
           sha256sum bin/targets/ramips/mt7620/*k2-v22.4* 2>/dev/null | tee logs/images.sha256
+          # v4: manifest الصورة = الحكم النهائي على DEVICE_PACKAGES (‎-swconfig فعلية؟ kmod-dsa داخل؟)
+          MAN=$(ls bin/targets/ramips/mt7620/*k2-v22.4*sysupgrade*.manifest 2>/dev/null | head -1)
+          if [ -n "$MAN" ]; then
+            grep -E '^(swconfig|kmod-dsa-mt7620|kmod-dsa-core|kmod-mt76x2)' "$MAN" | tee logs/manifest-proof.txt || true
+            if grep -q '^swconfig ' "$MAN"; then echo "::error::MANIFEST FAIL: swconfig inside the image despite -swconfig"; exit 1; fi
+            grep -q '^kmod-dsa-mt7620 ' "$MAN" || { echo "::error::MANIFEST FAIL: kmod-dsa-mt7620 missing from the image"; exit 1; }
+            echo "MANIFEST-PROOF: OK (dsa in, swconfig out)" | tee -a logs/manifest-proof.txt
+          else
+            echo "::warning::no manifest found (rc=$rc) — skip manifest proof"
+          fi
           exit "$rc"
 
       - name: Identity card
@@ -234,7 +267,7 @@ jobs:
         run: |
           set +e
           {
-            echo "workflow     = build-k2-dsa-test v3 (r20-g)"
+            echo "workflow     = build-k2-dsa-test v4 (r20-h)"
             echo "k2_branch    = ${{ inputs.k2_branch }} ($(cat logs/head.txt 2>/dev/null))"
             echo "include_luci = ${{ inputs.include_luci }}"
             echo "include_test_pkgs = ${{ inputs.include_test_pkgs }}"
