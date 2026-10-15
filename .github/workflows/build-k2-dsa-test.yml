@@ -27,11 +27,6 @@ on:
         required: false
         default: true
         type: boolean
-      wifi_rescue:
-        description: "Inject /etc/uci-defaults/99-k2-wifi-rescue (force both radios up as K2-DSA-RESCUE APs on br-lan) — the no-serial safety net"
-        required: false
-        default: true
-        type: boolean
       include_files:
         description: 'Inject custom files from "files" directory (bh_k2)'
         required: false
@@ -39,6 +34,11 @@ on:
         type: boolean
       attach_theme:
         description: 'Import luci-theme-enan-dashboard package and enable it in .config'
+        required: false
+        default: false
+        type: boolean
+      wifi_rescue:
+        description: "Inject /etc/uci-defaults/99-k2-wifi-rescue (force both radios up as K2-DSA-RESCUE APs on br-lan) — the no-serial safety net"
         required: false
         default: false
         type: boolean
