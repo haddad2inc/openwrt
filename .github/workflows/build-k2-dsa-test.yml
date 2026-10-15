@@ -1,17 +1,12 @@
 # build-k2-dsa-test.yml — صورة اختبار Phicomm K2 v22.4 المحوَّل إلى DSA (r20‑d، v2 في r20‑f، v4 في r20‑h)
 #
 # الفكرة: نفس فلسفة build-cf-wa350-full (بوابات fail‑closed + بطاقة هوية + شواهد sha256)،
-# لكن **بلا building-helper ولا theme**: الoverlay هناك يعيد بناء /etc/config/network ويثبت
-# MACs لجهاز آخر (م136: الoverlay يجب ألا يمس موضوع الاختبار — وموضوعنا هنا الشبكة نفسها).
+# لكن مع إضافة خيارات include_files و attach_theme من مستودع bh_k2 لتخصيص الصورة.
 #
 # التشغيل: انسخ هذا الملف إلى `.github/workflows/` على فرع `main` في fork (‏workflow_dispatch
 # يظهر فقط من الفرع الافتراضي)، أنشئ فرع `k2-dsa-v1` كما في README‑K2‑DSA‑ar.md §2، ثم
 # Actions → build-k2-dsa-test → Run workflow (k2_branch=k2-dsa-v1).
 #
-# v5 (r20-i): scripts/config مجلد لا أمر (علة run#2, exit 126) ⇒ الإلحاق+defconfig ثانية.
-# v4 (r20-h): إصلاح فشل run#1 («device not selected»): defconfig مزدوج + فرض scripts/config
-# + تشخيصات قبل الموت + G6 (TARGET_DEVICES) + proof واقعي (kmod=[ym]) + الحكم النهائي manifest الصورة.
-# تعديلات المستخدم على سقالة الوايفاي (open AP بلا مفتاح) محفوظة كما رفعها.
 name: build-k2-dsa-test
 
 on:
@@ -20,7 +15,7 @@ on:
       k2_branch:
         description: "Branch on this fork carrying the K2 v22.4 DSA commit(s) on top of openwrt master"
         required: false
-        default: k2-dsa-v1
+        default: ramips-convert-k2-v22.4-to-dsa
         type: string
       include_luci:
         description: "Add LuCI to the test image (default: headless — testing is serial/CLI)"
@@ -37,6 +32,19 @@ on:
         required: false
         default: true
         type: boolean
+      include_files:
+        description: 'Inject custom files from "files" directory (bh_k2)'
+        required: false
+        default: false
+        type: boolean
+      attach_theme:
+        description: 'Import luci-theme-enan-dashboard package and enable it in .config'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  BH_K2_REPO: https://github.com/haddad2inc/bh_k2.git
 
 jobs:
   build:
@@ -83,9 +91,7 @@ jobs:
                                                               || fail "G3 k2-v22.4 interfaces case not in DSA form"
           grep -A6 'phicomm,k2-v22.5|' "$NET" | grep -q 'ucidef_add_switch' \
                                                               || fail "G3 k2-v22.5 lost its swconfig case (case split broken)"
-          # G3c/G3d (r20-g) — العلة الميدانية الحقيقية: الشق في **وسط** قائمة الأنماط يسحب
-          # الأجهزة التي فوق k2-v22.4 (dlink,dir-810l / netcore,nw5212 / netgear,jwnr2010-v5)
-          # إلى حالة DSA. الفحصان أدناه يمسكانها من الطرفين (م142: اختبار بمحتوى ملوث).
+          
           sed -n '/^ramips_setup_interfaces()/,/^}/p' "$NET" > /tmp/k2-iface
           grep -A9 'dlink,dir-810l|' /tmp/k2-iface | grep -q 'ucidef_add_switch' \
                                                               || fail "G3c dlink,dir-810l/netcore/jwnr2010 fell into the DSA case"
@@ -94,20 +100,17 @@ jobs:
           fi
           rm -f /tmp/k2-iface
 
-          # G6 (v4) — الجهاز مسجّل في TARGET_DEVICES (بدونه لا يولد رمز kconfig للجهاز أساساً)
+          # G6 (v4) — الجهاز مسجّل في TARGET_DEVICES
           grep -q '^TARGET_DEVICES += phicomm_k2-v22.4$' "$MK" || fail "G6 TARGET_DEVICES += phicomm_k2-v22.4 missing from mt7620.mk"
 
-          # G4 — شواهد الهوية (م79): بصمات الملفات الثلاثة ورأس الفرع
+          # G4 — شواهد الهوية
           sha256sum "$DTS" "$MK" "$NET" | tee logs/files.sha256
           git log --oneline -5 | tee logs/commits.txt
           git rev-parse HEAD | tee logs/head.txt
           echo "GATES: PASS (G1..G4)" | tee logs/gates.txt
 
       # ------------------------------------------------------------
-      # سقالة النجاة (r20-f): الجهاز تحت الاختبار بلا USB-TTL —
-      # الوايفاي هو القناة الخارج-نطاقية إن مات جانب السويتش.
-      # المحتوى مولَّد حرفياً من device-k2-dsa/files/99-k2-wifi-rescue
-      # (مختبر 21/21) — إن عدّلت أحدهما فعدّل الآخر وقارن sha256.
+      # سقالة النجاة (r20-f): الجهاز تحت الاختبار بلا USB-TTL
       # ------------------------------------------------------------
       - name: Inject WiFi rescue overlay (no-serial safety net)
         if: ${{ inputs.wifi_rescue }}
@@ -116,72 +119,52 @@ jobs:
           mkdir -p files/etc/uci-defaults
           cat > files/etc/uci-defaults/99-k2-wifi-rescue << 'RESCUE'
           #!/bin/sh
-          # 99-k2-wifi-rescue — سقالة اختبار r20‑f لجهاز K2 v22.4 (ليست جزءاً من أي PR مستقبلي).
-          #
-          # لماذا: الجهاز تحت الاختبار **بلا طرفية تسلسلية** (لا USB‑TTL). إن فشل جانب السويتش/DSA
-          # فالوايفاي هو القناة الخارج‑نطاقية الوحيدة: الـwmac (‏2.4G) والـMT7612E (‏PCIe 5G) مستقلان
-          # تماماً عن المفتاح وعن مسار DSA (لا يلمسهما الpatch) ⇒ حتى لو ماتت المنافذ كلها يبقى AP
-          # معروف الاسم على br‑lan للدخول والتشخيص والعودة للصورة القديمة.
-          #
-          # التصميم order‑agnostic: إن وُجد /etc/config/wireless عدّله، وإن غاب ولّده أولاً (‏wifi detect).
-          # يعمل على أي عدد من الradios وبأي تسمية (radio0/radio1 أو غيرها). لا يفشل أبداً (exit 0) —
-          # سقالة النجاة يجب ألا تكون سبباً في فشل إقلاع.
-          #
-          # الشبكة: ‏K2‑DSA‑RESCUE / K2‑DSA‑RESCUE‑5G — **open بلا مفتاح** (قرار المستخدم r20‑h:
-          # سهولة الوصول عند النجدة أهم من الخصوصية لشبكة اختبار منزلية قصيرة العمر).
-
           RESCUE_SSID_2G="K2-DSA-RESCUE"
           RESCUE_SSID_5G="K2-DSA-RESCUE-5G"
 
-          # 1) ضمان وجود إعداد الوايفاي أصلاً (لا يعتمد على ترتيب توليده مقابل uci-defaults)
           ETC="${IPKG_INSTROOT:-}/etc"
           if [ ! -f "$ETC/config/wireless" ]; then
-          	mkdir -p "$ETC/config"
-          	wifi detect > "$ETC/config/wireless" 2>/dev/null || true
+            mkdir -p "$ETC/config"
+            wifi detect > "$ETC/config/wireless" 2>/dev/null || true
           fi
           [ -f "$ETC/config/wireless" ] || exit 0
 
-          # 2) لكل radio: تفعيل + قناة ثابتة معروفة (‏6 للـ2.4G و36 للـ5G — بلا DFS)
           for dev in $(uci show wireless 2>/dev/null | sed -n 's/^wireless\.\([A-Za-z0-9_]*\)=wifi-device$/\1/p'); do
-          	band="$(uci -q get "wireless.$dev.band" 2>/dev/null)$(uci -q get "wireless.$dev.hwmode" 2>/dev/null)"
-          	case "$band" in
-          		*5g*|*11a*) ssid="$RESCUE_SSID_5G"; ch="36" ;;
-          		*)          ssid="$RESCUE_SSID_2G"; ch="6"  ;;
-          	esac
-          	uci -q set "wireless.$dev.disabled=0"
-          	uci -q set "wireless.$dev.channel=$ch"
+            band="$(uci -q get "wireless.$dev.band" 2>/dev/null)$(uci -q get "wireless.$dev.hwmode" 2>/dev/null)"
+            case "$band" in
+              *5g*|*11a*) ssid="$RESCUE_SSID_5G"; ch="36" ;;
+              *)          ssid="$RESCUE_SSID_2G"; ch="6"  ;;
+            esac
+            uci -q set "wireless.$dev.disabled=0"
+            uci -q set "wireless.$dev.channel=$ch"
 
-          	# أول iface لهذا الradio (أو أنشئ واحداً) ⇒ AP على شبكة lan
-          	iface=""
-          	for cand in $(uci show wireless 2>/dev/null | sed -n 's/^wireless\.\([A-Za-z0-9_]*\)=wifi-iface$/\1/p'); do
-          		if [ "$(uci -q get "wireless.$cand.device" 2>/dev/null)" = "$dev" ]; then
-          			iface="$cand"
-          			break
-          		fi
-          	done
-          	if [ -z "$iface" ]; then
-          		iface="$(uci -q add wireless wifi-iface 2>/dev/null)"
-          		[ -n "$iface" ] || continue
-          		uci -q set "wireless.$iface.device=$dev"
-          	fi
-          	uci -q set "wireless.$iface.mode=ap"
-          	uci -q set "wireless.$iface.network=lan"
-          	uci -q set "wireless.$iface.ssid=$ssid"
-          	uci -q set "wireless.$iface.encryption=none"
-
+            iface=""
+            for cand in $(uci show wireless 2>/dev/null | sed -n 's/^wireless\.\([A-Za-z0-9_]*\)=wifi-iface$/\1/p'); do
+              if [ "$(uci -q get "wireless.$cand.device" 2>/dev/null)" = "$dev" ]; then
+                iface="$cand"
+                break
+              fi
+            done
+            if [ -z "$iface" ]; then
+              iface="$(uci -q add wireless wifi-iface 2>/dev/null)"
+              [ -n "$iface" ] || continue
+              uci -q set "wireless.$iface.device=$dev"
+            fi
+            uci -q set "wireless.$iface.mode=ap"
+            uci -q set "wireless.$iface.network=lan"
+            uci -q set "wireless.$iface.ssid=$ssid"
+            uci -q set "wireless.$iface.encryption=none"
           done
 
           uci -q commit wireless 2>/dev/null
-
-          # 3) شاهد قابل للقراءة لاحقاً (متى/هل اشتغلت السقالة) — يُقرأ عبر SSH في §F
-          echo "wifi-rescue applied $(date -u +%FT%TZ)" > "$ETC/k2-wifi-rescue.stamp"
-
+          echo "wifi-rescue applied $(date -u +\%FT\%TZ)" > "$ETC/k2-wifi-rescue.stamp"
           exit 0
           RESCUE
           chmod 755 files/etc/uci-defaults/99-k2-wifi-rescue
-          # G5 — بوابة السقالة: موجودة + قابلة للتنفيذ + سليمة النحو + بعلاماتها
+          
+          # G5 — بوابة السقالة
           sh -n files/etc/uci-defaults/99-k2-wifi-rescue || { echo "::error::G5 FAIL: rescue syntax"; exit 1; }
-          [ -x files/etc/uci-defaults/99-k2-wifi-rescue ] || { echo "::error::G5 FAIL: not executable (uci-defaults تتجاوزه)"; exit 1; }
+          [ -x files/etc/uci-defaults/99-k2-wifi-rescue ] || { echo "::error::G5 FAIL: not executable"; exit 1; }
           grep -q 'K2-DSA-RESCUE' files/etc/uci-defaults/99-k2-wifi-rescue || { echo "::error::G5 FAIL: markers missing"; exit 1; }
           sha256sum files/etc/uci-defaults/99-k2-wifi-rescue | tee logs/rescue.sha256
 
@@ -190,9 +173,78 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
+      # =====================================================================
+      # bh_k2 Integration: Import assets from the external bh_k2 repository
+      # =====================================================================
+      - name: Import bh_k2 repository
+        if: ${{ inputs.include_files == true || inputs.attach_theme == true }}
+        run: |
+          set +e
+          echo "=== Importing bh_k2 repository ===" | tee -a logs/bh_k2.txt
+          BH_K2_DIR="/tmp/bh_k2"
+          rm -rf "$BH_K2_DIR"
+          if git clone --depth 1 "$BH_K2_REPO" "$BH_K2_DIR" 2>&1 | tee -a logs/bh_k2.txt; then
+            echo "✅ bh_k2 clone succeeded." | tee -a logs/bh_k2.txt
+          else
+            echo "::error::bh_k2 clone FAILED."
+            exit 1
+          fi
+          rm -rf "$BH_K2_DIR/.git"
+          echo "=== Contents of bh_k2 (top-level) ===" | tee -a logs/bh_k2.txt
+          ls -la "$BH_K2_DIR" | tee -a logs/bh_k2.txt
+          exit 0
+
+      - name: Inject custom files from bh_k2 (include_files=true)
+        if: ${{ inputs.include_files == true }}
+        run: |
+          set +e
+          echo "=== Injecting custom files (include_files=true) ===" | tee -a logs/bh_k2.txt
+          SRC_DIR="/tmp/bh_k2/files"
+          if [ ! -d "$SRC_DIR" ]; then
+            echo "::error::$SRC_DIR not found in bh_k2."
+            ls -la /tmp/bh_k2 | tee -a logs/bh_k2.txt
+            exit 1
+          fi
+          mkdir -p files
+          cp -rv "$SRC_DIR"/. files/ 2>&1 | tee -a logs/bh_k2.txt
+          echo "✅ Custom files injected into ./files/" | tee -a logs/bh_k2.txt
+          find files -maxdepth 3 -type f | sort | tee -a logs/bh_k2.txt
+          exit 0
+
+      - name: Import luci-theme-enan-dashboard package (attach_theme=true)
+        if: ${{ inputs.attach_theme == true }}
+        run: |
+          set +e
+          echo "=== Importing luci-theme-enan-dashboard from bh_k2 ===" | tee -a logs/bh_k2.txt
+          SRC_DIR="/tmp/bh_k2/luci-theme-enan-dashboard"
+          TARGET_PARENT="package"
+          TARGET_DIR="$TARGET_PARENT/luci-theme-enan-dashboard"
+
+          if [ ! -d "$SRC_DIR" ]; then
+            echo "::error::$SRC_DIR not found in bh_k2."
+            ls -la /tmp/bh_k2 | tee -a logs/bh_k2.txt
+            exit 1
+          fi
+
+          mkdir -p "$TARGET_PARENT"
+          rm -rf "$TARGET_DIR"
+          cp -rv "$SRC_DIR" "$TARGET_PARENT"/ 2>&1 | tee -a logs/bh_k2.txt
+
+          chmod -R u+rwX,go+rX "$TARGET_DIR" 2>&1 | tee -a logs/bh_k2.txt
+          find "$TARGET_DIR" -type f -name "*.sh" -exec chmod +x {} \; 2>&1 | tee -a logs/bh_k2.txt
+          find "$TARGET_DIR" -type f -name "Makefile" -exec chmod 644 {} \; 2>&1 | tee -a logs/bh_k2.txt
+          find "$TARGET_DIR/files" -type f -exec chmod +x {} \; 2>/dev/null || true
+
+          if [ -f "$TARGET_DIR/Makefile" ]; then
+            echo "✅ Makefile found at $TARGET_DIR/Makefile" | tee -a logs/bh_k2.txt
+          else
+            echo "::error::Makefile NOT found in $TARGET_DIR"
+            exit 1
+          fi
+          exit 0
+
       # ------------------------------------------------------------
-      # البذرة: نفس محتوى files/seed-k2-dsa.config في الحزمة (مضمنة هنا
-      # كي يكون الworkflow مكتفياً ذاتياً على الfork) + defconfig + إثبات
+      # البذرة: defconfig + إثبات
       # ------------------------------------------------------------
       - name: Seed .config + defconfig (double-pass) + config proof
         run: |
@@ -204,6 +256,9 @@ jobs:
           # CONFIG_TARGET_MULTI_PROFILE is not set
           CONFIG_TARGET_ramips_mt7620_DEVICE_phicomm_k2-v22.4=y
           CONFIG_PACKAGE_kmod-dsa-mt7620=y
+          CONFIG_FEED_luci=y
+          CONFIG_PACKAGE_lldpd=y
+          CONFIG_PACKAGE_luci-app-watchcat=y
           SEED
           if [ "${{ inputs.include_test_pkgs }}" = "true" ]; then
             cat >> .config << 'PKGS'
@@ -213,48 +268,48 @@ jobs:
           CONFIG_PACKAGE_tcpdump-mini=y
           PKGS
           fi
-          if [ "${{ inputs.include_luci }}" = "true" ]; then
+          if [ "${{ inputs.include_luci }}" = "true" ] \vert{}\vert{} [ "${{ inputs.attach_theme }}" = "true" ]; then
             echo 'CONFIG_PACKAGE_luci=y' >> .config
           fi
-          cp .config logs/seed.config          # شاهد: ما دخل defconfig حرفياً
+          if [ "${{ inputs.attach_theme }}" = "true" ]; then
+            echo 'CONFIG_PACKAGE_luci-theme-enan-dashboard=y' >> .config
+          fi
+
+          cp .config logs/seed.config
           echo "--- seed ---"; cat logs/seed.config
 
-          # v4: defconfig مزدوج — التمريرة الأولى تبني metadata للtarget الجديد،
-          # والثانية تحل رمز الجهاز عليه (علة run#1: الرمز سقط من التمريرة الواحدة)
           make defconfig
           if ! grep -q "^CONFIG_${DEVSYM}=y" .config; then
-            # v5: scripts/config في OpenWrt **مجلد** (مصدر kconfig) لا أمر — علة run#2 (exit 126).
-            # الإلحاق ثم defconfig ثانية هو الآلية القياسية (التمريرة الأولى تولّد metadata للtarget).
             echo "::warning::device not selected after pass 1 — re-seeding device lines + defconfig pass 2"
             {
               echo "CONFIG_TARGET_ramips=y"
               echo "# CONFIG_TARGET_MULTI_PROFILE is not set"
               echo "CONFIG_TARGET_ramips_mt7620=y"
+              echo "CONFIG_FEED_luci=y"
+              echo "CONFIG_PACKAGE_lldpd=y"
+              echo "CONFIG_PACKAGE_luci-app-watchcat=y"
               echo "CONFIG_TARGET_${DEVSYM}=y"
-              echo "CONFIG_PACKAGE_luci=y=y"
             } >> .config
+            if [ "${{ inputs.include_luci }}" = "true" ] \vert{}\vert{} [ "${{ inputs.attach_theme }}" = "true" ]; then
+              echo "CONFIG_PACKAGE_luci=y" >> .config
+            fi
+            if [ "${{ inputs.attach_theme }}" = "true" ]; then
+              echo "CONFIG_PACKAGE_luci-theme-enan-dashboard=y" >> .config
+            fi
             make defconfig
           fi
 
-          # proof (واقعي): kmod قد يكون =m (tristate) — هذا سليم؛ swconfig يحسمه manifest لا .config
           {
             echo "--- resolved by defconfig ---"
             grep -E "^CONFIG_${DEVSYM}=|^CONFIG_PACKAGE_kmod-dsa-mt7620=|^CONFIG_PACKAGE_swconfig=|^# CONFIG_PACKAGE_swconfig is not set|^CONFIG_PACKAGE_(ethtool|ip-bridge|iperf3|tcpdump-mini|luci)=" .config || true
+            grep -E "^CONFIG_PACKAGE_luci-theme-enan-dashboard=" .config || true
           } | tee logs/config-proof.txt
+
           if ! grep -q "^CONFIG_${DEVSYM}=y" .config; then
-            echo "::error::config proof: device STILL not selected — diagnostics:"
-            echo "--- TARGET_DEVICES line in mk:";  grep -n 'TARGET_DEVICES += phicomm_k2-v22' target/linux/ramips/image/mt7620.mk || true
-            echo "--- device symbol in generated metadata:"
-            grep -rn "phicomm_k2-v22" tmp/.config-package.in 2>/dev/null | head -3 || echo "(absent from tmp/.config-package.in)"
-            grep -rn "phicomm_k2-v22" tmp/.config-target.in 2>/dev/null | head -3 || echo "(absent from tmp/.config-target.in)"
-            ls tmp/ 2>/dev/null | head -10
-            echo "--- Device block as parsed:"; sed -n '/^define Device\/phicomm_k2-v22.4$/,/^endef$/p' target/linux/ramips/image/mt7620.mk
+            echo "::error::config proof: device STILL not selected"
             exit 1
           fi
           grep -Eq '^CONFIG_PACKAGE_kmod-dsa-mt7620=[ym]' .config || { echo "::error::config proof: kmod-dsa-mt7620 not enabled"; exit 1; }
-          if grep -q '^CONFIG_PACKAGE_swconfig=y' .config; then
-            echo "::warning::swconfig =y in .config — الحكم النهائي في manifest الصورة (خطوة البناء تفحصه)"
-          fi
 
       - name: Build (sysupgrade + initramfs)
         run: |
@@ -263,7 +318,7 @@ jobs:
           rc=${PIPESTATUS[0]}
           ls -l bin/targets/ramips/mt7620/ | tee logs/bin-list.txt
           sha256sum bin/targets/ramips/mt7620/*k2-v22.4* 2>/dev/null | tee logs/images.sha256
-          # v4: manifest الصورة = الحكم النهائي على DEVICE_PACKAGES (‎-swconfig فعلية؟ kmod-dsa داخل؟)
+          
           MAN=$(ls bin/targets/ramips/mt7620/*k2-v22.4*sysupgrade*.manifest 2>/dev/null | head -1)
           if [ -n "$MAN" ]; then
             grep -E '^(swconfig|kmod-dsa-mt7620|kmod-dsa-core|kmod-mt76x2)' "$MAN" | tee logs/manifest-proof.txt || true
@@ -280,15 +335,18 @@ jobs:
         run: |
           set +e
           {
-            echo "workflow     = build-k2-dsa-test v6 (r20-j)"
+            echo "workflow     = build-k2-dsa-test v7 (bh_k2 integrated)"
             echo "k2_branch    = ${{ inputs.k2_branch }} ($(cat logs/head.txt 2>/dev/null))"
             echo "include_luci = ${{ inputs.include_luci }}"
             echo "include_test_pkgs = ${{ inputs.include_test_pkgs }}"
             echo "wifi_rescue  = ${{ inputs.wifi_rescue }}"
+            echo "include_files= ${{ inputs.include_files }}"
+            echo "attach_theme = ${{ inputs.attach_theme }}"
             echo "rescue.sha256:"; cat logs/rescue.sha256 2>/dev/null
             echo "gates:"; cat logs/gates.txt 2>/dev/null
             echo "files.sha256:"; cat logs/files.sha256 2>/dev/null
             echo "commits:"; cat logs/commits.txt 2>/dev/null
+            echo "bh_k2 log:"; cat logs/bh_k2.txt 2>/dev/null
             echo "config_proof:"; cat logs/config-proof.txt 2>/dev/null
             echo "kernel = 6.18$(grep -m1 'LINUX_VERSION-6.18' target/linux/generic/kernel-6.18 2>/dev/null | sed 's/.*= //')"
             echo "date   = $(date -u +%FT%TZ)"
