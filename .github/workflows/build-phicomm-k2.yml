@@ -1,18 +1,22 @@
-# build-k2-dsa-test.yml — صورة اختبار Phicomm K2 v22.4 المحوَّل إلى DSA (r20‑d، v2 في r20‑f، v4 في r20‑h)
+# build-phicomm-k2-dsa.yml — صورة اختبار Phicomm K2 v22.4 المحوَّل إلى DSA
 #
-# الفكرة: نفس فلسفة build-cf-wa350-full (بوابات fail‑closed + بطاقة هوية + شواهد sha256)،
-# مع خيارات include_files و attach_theme من مستودع bh_k2 لتخصيص الصورة.
-#
-# v8: أُزيل خياري include_luci و include_test_pkgs نهائياً (لا وجود لهما في workflow_dispatch
-# ولا في الشروط ولا في البذرة). وأُضيفت ثلاث حزم أساسية ثابتة دائماً في الصورة:
-#     CONFIG_FEED_luci=y
-#     CONFIG_PACKAGE_lldpd=y
-#     CONFIG_PACKAGE_luci-app-watchcat=y
-# ويبقى CONFIG_PACKAGE_luci=y مطلوباً فقط عند attach_theme=true (القالب يحتاج LuCI).
-#
-# التشغيل: انسخ هذا الملف إلى `.github/workflows/` على فرع `main` في fork (‏workflow_dispatch
-# يظهر فقط من الفرع الافتراضي)، أنشئ فرع `k2-dsa-v1` كما في README‑K2‑DSA‑ar.md §2، ثم
-# Actions → build-k2-dsa-test → Run workflow (k2_branch=k2-dsa-v1).
+# v9:
+#   - الحزم الأساسية الثابتة في كل صورة:
+#       CONFIG_FEED_luci=y
+#       CONFIG_PACKAGE_lldpd=y
+#       CONFIG_PACKAGE_luci-app-watchcat=y
+#       CONFIG_PACKAGE_uhttpd=y          ← (جديد v9)
+#     وCONFIG_PACKAGE_luci=y فقط عند attach_theme=true.
+#   - مُدخل جديد extra_packages: قائمة أسماء حزم (بدون بادئة CONFIG_PACKAGE_)
+#     تفصل بينها فاصلة أو مسافة. يُبنى لكل اسم CONFIG_PACKAGE_<name>=y، ويُعاد
+#     فرضه بعد defconfig لو أسقطه.
+#   - خطوة جديدة "Probe requested packages": تفحص كل حزمة مطلوبة (أساسية أو
+#     إضافية) داخل package/ بعد feeds install -a، وتكتب النتيجة في
+#     logs/pkg-availability.txt، مع تحذير صريح لأي حزمة غير موجودة أصلاً.
+#     هذا هو تفسير اختفاء أي حزمة أضفتها يدوياً: defconfig يُسقط Symbol بصمت
+#     إن لم يوجد Makefile له أو لم تُلبَّ تبعياته.
+#   - فحوص fail-closed بعد defconfig لكل الحزم الثابتة + extra_packages.
+#   - فحص manifest يشمل الآن uhttpd أيضاً.
 #
 name: build-phicomm-k2-dsa
 
@@ -23,6 +27,11 @@ on:
         description: "Branch on this fork carrying the K2 v22.4 DSA commit(s) on top of openwrt master"
         required: false
         default: ramips-convert-k2-v22.4-to-dsa
+        type: string
+      extra_packages:
+        description: "Extra packages (comma/space separated, WITHOUT CONFIG_PACKAGE_ prefix). Example: uhttpd,curl,luci-app-ddns"
+        required: false
+        default: ''
         type: string
       include_files:
         description: 'Inject custom files from "files" directory (bh_k2)'
@@ -56,8 +65,8 @@ jobs:
           fetch-depth: 0
 
       # ------------------------------------------------------------
-      # بوابات المحتوى (fail-closed — م127): إن لم يكن الbranch يحمل
-      # التحويل فعلاً فلا معنى لحرق ساعة بناء؛ الموت هنا رخيص.
+      # بوابات المحتوى (fail-closed): إن لم يكن الbranch يحمل التحويل
+      # فعلاً فلا معنى لحرق ساعة بناء؛ الموت هنا رخيص.
       # ------------------------------------------------------------
       - name: Content gates + identity witnesses
         run: |
@@ -83,7 +92,7 @@ jobs:
           grep -q -- '-swconfig' logs/mk-block.txt              || fail "G2 -swconfig missing from Device block"
           grep -q 'DEVICE_COMPAT_VERSION := 1.1' logs/mk-block.txt || fail "G2 DEVICE_COMPAT_VERSION missing"
 
-          # G3 — فصل الcase في 02_network: v22.4 وحده DSA، وv22.5+ البقية ما زالوا swconfig
+          # G3 — فصل الcase في 02_network
           grep -A1 'phicomm,k2-v22.4)' "$NET" | grep -q 'ucidef_set_interfaces_lan_wan "lan1 lan2 lan3 lan4" "wan"' \
                                                               || fail "G3 k2-v22.4 interfaces case not in DSA form"
           grep -A6 'phicomm,k2-v22.5|' "$NET" | grep -q 'ucidef_add_switch' \
@@ -97,7 +106,7 @@ jobs:
           fi
           rm -f /tmp/k2-iface
 
-          # G6 (v4) — الجهاز مسجّل في TARGET_DEVICES
+          # G6 — الجهاز مسجّل في TARGET_DEVICES
           grep -q '^TARGET_DEVICES += phicomm_k2-v22.4$' "$MK" || fail "G6 TARGET_DEVICES += phicomm_k2-v22.4 missing from mt7620.mk"
 
           # G4 — شواهد الهوية
@@ -107,7 +116,7 @@ jobs:
           echo "GATES: PASS (G1..G4)" | tee logs/gates.txt
 
       # ------------------------------------------------------------
-      # سقالة النجاة (r20-f): الجهاز تحت الاختبار بلا USB-TTL
+      # سقالة النجاة: الجهاز تحت الاختبار بلا USB-TTL
       # ------------------------------------------------------------
       - name: Inject WiFi rescue overlay (no-serial safety net)
         if: ${{ inputs.wifi_rescue }}
@@ -159,7 +168,6 @@ jobs:
           RESCUE
           chmod 755 files/etc/uci-defaults/99-k2-wifi-rescue
 
-          # G5 — بوابة السقالة
           sh -n files/etc/uci-defaults/99-k2-wifi-rescue || { echo "::error::G5 FAIL: rescue syntax"; exit 1; }
           [ -x files/etc/uci-defaults/99-k2-wifi-rescue ] || { echo "::error::G5 FAIL: not executable"; exit 1; }
           grep -q 'K2-DSA-RESCUE' files/etc/uci-defaults/99-k2-wifi-rescue || { echo "::error::G5 FAIL: markers missing"; exit 1; }
@@ -169,6 +177,52 @@ jobs:
         run: |
           ./scripts/feeds update -a
           ./scripts/feeds install -a
+
+      # =====================================================================
+      # v9: package availability probe
+      #   - يسأل: هل هذه الحزمة موجودة فعلاً في package/ بعد feeds install -a؟
+      #   - يكتب النتيجة في logs/pkg-availability.txt
+      #   - يشرح سبب اختفاء أي حزمة أضفتها يدوياً:
+      #       defconfig يُسقط بصمت أي CONFIG_PACKAGE_<x>=y ليس له Makefile
+      #       (أو لم تُلبَّ تبعياته) — فتصبح الصورة بلا الحزمة دون أي خطأ.
+      # =====================================================================
+      - name: Probe requested packages (fixed base + extra_packages)
+        env:
+          EXTRA_PKGS: ${{ inputs.extra_packages }}
+        run: |
+          set +e
+          echo "=== Availability probe ===" | tee logs/pkg-availability.txt
+          echo "Fixed base (always requested):" | tee -a logs/pkg-availability.txt
+          FIXED="kmod-dsa-mt7620 lldpd luci-app-watchcat uhttpd"
+          for p in $FIXED; do
+            echo "  - $p" | tee -a logs/pkg-availability.txt
+          done
+
+          # normalise extra_packages: commas -> spaces
+          E="${EXTRA_PKGS//,/ }"
+          echo "Extra (from inputs.extra_packages): '${E}'" | tee -a logs/pkg-availability.txt
+
+          ALL="$FIXED $E"
+          MISSING=0
+          for p in $ALL; do
+            [ -z "$p" ] && continue
+            # Look for PKG_NAME:=<p> in any Makefile under package/ (feeds install -a
+            # has already symlinked every installed feed package into package/feeds/).
+            if grep -rlE "^PKG_NAME[[:space:]]*[:+]?=[[:space:]]*${p}[[:space:]]*$" \
+                 package/ 2>/dev/null | head -1 | grep -q . ; then
+              echo "  OK       $p" | tee -a logs/pkg-availability.txt
+            else
+              echo "  MISSING  $p  (no Makefile found → defconfig will silently drop CONFIG_PACKAGE_${p})" \
+                | tee -a logs/pkg-availability.txt
+              echo "::warning::package '$p' has no Makefile under package/ — it will NOT appear in the image"
+              MISSING=$((MISSING+1))
+            fi
+          done
+          echo "Probe summary: missing=$MISSING" | tee -a logs/pkg-availability.txt
+          # N.B.: we do NOT fail here — this is diagnostic only. The hard
+          # fail-closed happens after defconfig, once we know exactly which
+          # of the requested symbols survived.
+          exit 0
 
       # =====================================================================
       # bh_k2 Integration: Import assets from the external bh_k2 repository
@@ -242,17 +296,26 @@ jobs:
 
       # ------------------------------------------------------------
       # البذرة: defconfig + إثبات
-      #   v8: لا include_luci ولا include_test_pkgs.
-      #   الحزم الأساسية الثابتة:
-      #     CONFIG_FEED_luci=y
-      #     CONFIG_PACKAGE_lldpd=y
-      #     CONFIG_PACKAGE_luci-app-watchcat=y
-      #   وCONFIG_PACKAGE_luci=y فقط عند attach_theme=true (قالب enan يحتاج LuCI).
+      #   v9: الحزم الأساسية الثابتة:
+      #       CONFIG_FEED_luci=y
+      #       CONFIG_PACKAGE_lldpd=y
+      #       CONFIG_PACKAGE_luci-app-watchcat=y
+      #       CONFIG_PACKAGE_uhttpd=y
+      #       (+ CONFIG_PACKAGE_luci=y عند attach_theme=true)
+      #   extra_packages: كل اسم يُضاف كـ CONFIG_PACKAGE_<name>=y.
+      #   لو أسقط defconfig أي حزمة مطلوبة → إعادة فرض + defconfig مرة أخيرة،
+      #   وإن بقيت غير y → fail-closed.
       # ------------------------------------------------------------
       - name: Seed .config + defconfig (double-pass) + config proof
+        env:
+          EXTRA_PKGS: ${{ inputs.extra_packages }}
         run: |
           set -e
           DEVSYM=TARGET_ramips_mt7620_DEVICE_phicomm_k2-v22.4
+
+          # ---- normalise extra_packages (comma → space) ----
+          E="${EXTRA_PKGS//,/ }"
+
           cat > .config << 'SEED'
           CONFIG_TARGET_ramips=y
           CONFIG_TARGET_ramips_mt7620=y
@@ -265,7 +328,13 @@ jobs:
           CONFIG_PACKAGE_uhttpd=y
           SEED
 
-          # LuCI نفسه مطلوب فقط عندما يُركَّب قالب enan (قالب LuCI).
+          # extra packages (from inputs.extra_packages)
+          for p in $E; do
+            [ -z "$p" ] && continue
+            echo "CONFIG_PACKAGE_${p}=y" >> .config
+          done
+
+          # LuCI نفسه مطلوب فقط عند تركيب قالب enan
           if [ "${{ inputs.attach_theme }}" = "true" ]; then
             echo 'CONFIG_PACKAGE_luci=y' >> .config
             echo 'CONFIG_PACKAGE_luci-theme-enan-dashboard=y' >> .config
@@ -283,10 +352,14 @@ jobs:
               echo "CONFIG_TARGET_ramips_mt7620=y"
               echo "CONFIG_TARGET_${DEVSYM}=y"
               echo "CONFIG_FEED_luci=y"
-              echo "CONFIG_PACKAGE_uhttpd=y"
               echo "CONFIG_PACKAGE_lldpd=y"
               echo "CONFIG_PACKAGE_luci-app-watchcat=y"
+              echo "CONFIG_PACKAGE_uhttpd=y"
             } >> .config
+            for p in $E; do
+              [ -z "$p" ] && continue
+              echo "CONFIG_PACKAGE_${p}=y" >> .config
+            done
             if [ "${{ inputs.attach_theme }}" = "true" ]; then
               echo "CONFIG_PACKAGE_luci=y" >> .config
               echo "CONFIG_PACKAGE_luci-theme-enan-dashboard=y" >> .config
@@ -294,8 +367,9 @@ jobs:
             make defconfig
           fi
 
-          # v8: تأكيد أن الحزم الأساسية الثابتة بقيت =y بعد defconfig.
-          # لو أسقطها defconfig (تبعية ناقصة) نعيد فرضها ونجري defconfig مرة أخيرة.
+          # ---------------------------------------------------------
+          # v9: re-force every requested package if defconfig dropped it
+          # ---------------------------------------------------------
           need_redefconfig=0
           force_post() {
             local sym="$1"
@@ -312,34 +386,64 @@ jobs:
           force_post "CONFIG_FEED_luci"
           force_post "CONFIG_PACKAGE_lldpd"
           force_post "CONFIG_PACKAGE_luci-app-watchcat"
+          force_post "CONFIG_PACKAGE_uhttpd"
+          for p in $E; do
+            [ -z "$p" ] && continue
+            force_post "CONFIG_PACKAGE_${p}"
+          done
 
           if [ "$need_redefconfig" -eq 1 ]; then
-            echo "--- Re-running defconfig to merge re-forced base packages ---" | tee -a logs/config-proof.txt
+            echo "--- Re-running defconfig to merge re-forced packages ---" | tee -a logs/config-proof.txt
             make defconfig
           fi
 
           {
             echo "--- resolved by defconfig ---"
             grep -E "^CONFIG_${DEVSYM}=|^CONFIG_PACKAGE_kmod-dsa-mt7620=|^CONFIG_PACKAGE_swconfig=|^# CONFIG_PACKAGE_swconfig is not set" .config || true
-            grep -E "^CONFIG_FEED_luci=|^CONFIG_PACKAGE_lldpd=|^CONFIG_PACKAGE_luci-app-watchcat=" .config || true
+            grep -E "^CONFIG_FEED_luci=|^CONFIG_PACKAGE_lldpd=|^CONFIG_PACKAGE_luci-app-watchcat=|^CONFIG_PACKAGE_uhttpd=" .config || true
+            for p in $E; do
+              [ -z "$p" ] && continue
+              grep -E "^CONFIG_PACKAGE_${p}=" .config || echo "(extra) CONFIG_PACKAGE_${p} missing after defconfig"
+            done
             grep -E "^CONFIG_PACKAGE_luci=" .config || true
             grep -E "^CONFIG_PACKAGE_luci-theme-enan-dashboard=" .config || true
           } | tee logs/config-proof.txt
 
+          # ---------------------------------------------------------
+          # Fail-closed on the fixed base packages
+          # ---------------------------------------------------------
           if ! grep -q "^CONFIG_${DEVSYM}=y" .config; then
             echo "::error::config proof: device STILL not selected"
             exit 1
           fi
           grep -Eq '^CONFIG_PACKAGE_kmod-dsa-mt7620=[ym]' .config || { echo "::error::config proof: kmod-dsa-mt7620 not enabled"; exit 1; }
 
-          # v8: fail-closed على الحزم الأساسية الثابتة.
           grep -q '^CONFIG_FEED_luci=y'                 .config || { echo "::error::config proof: CONFIG_FEED_luci != y";                 exit 1; }
           grep -q '^CONFIG_PACKAGE_lldpd=y'             .config || { echo "::error::config proof: CONFIG_PACKAGE_lldpd != y";             exit 1; }
           grep -q '^CONFIG_PACKAGE_luci-app-watchcat=y' .config || { echo "::error::config proof: CONFIG_PACKAGE_luci-app-watchcat != y"; exit 1; }
+          grep -q '^CONFIG_PACKAGE_uhttpd=y'            .config || { echo "::error::config proof: CONFIG_PACKAGE_uhttpd != y";            exit 1; }
+
+          # ---------------------------------------------------------
+          # v9: fail-closed on every extra package the user requested
+          #     (with a clear diagnostic pointing at pkg-availability.txt)
+          # ---------------------------------------------------------
+          for p in $E; do
+            [ -z "$p" ] && continue
+            if grep -q "^CONFIG_PACKAGE_${p}=y" .config; then
+              echo "✅ extra package kept: CONFIG_PACKAGE_${p}=y" | tee -a logs/config-proof.txt
+            else
+              echo "::error::requested package '${p}' did NOT survive defconfig — see logs/pkg-availability.txt (probably no Makefile in any installed feed, or a missing dependency)"
+              echo "---- grep in .config for ${p} ----" | tee -a logs/config-proof.txt
+              grep -n "${p}" .config | tee -a logs/config-proof.txt || true
+              echo "---- availability log ----" | tee -a logs/config-proof.txt
+              cat logs/pkg-availability.txt     | tee -a logs/config-proof.txt || true
+              exit 1
+            fi
+          done
 
           if [ "${{ inputs.attach_theme }}" = "true" ]; then
-            grep -q '^CONFIG_PACKAGE_luci=y' .config                          || { echo "::error::config proof: luci missing (needed by theme)";        exit 1; }
-            grep -q '^CONFIG_PACKAGE_luci-theme-enan-dashboard=y' .config     || { echo "::error::config proof: enan-dashboard theme missing";          exit 1; }
+            grep -q '^CONFIG_PACKAGE_luci=y' .config                      || { echo "::error::config proof: luci missing (needed by theme)"; exit 1; }
+            grep -q '^CONFIG_PACKAGE_luci-theme-enan-dashboard=y' .config || { echo "::error::config proof: enan-dashboard theme missing";   exit 1; }
           fi
 
       - name: Build (sysupgrade + initramfs)
@@ -352,12 +456,13 @@ jobs:
 
           MAN=$(ls bin/targets/ramips/mt7620/*k2-v22.4*sysupgrade*.manifest 2>/dev/null | head -1)
           if [ -n "$MAN" ]; then
-            grep -E '^(swconfig|kmod-dsa-mt7620|kmod-dsa-core|kmod-mt76x2|lldpd|luci-app-watchcat)' "$MAN" | tee logs/manifest-proof.txt || true
+            grep -E '^(swconfig|kmod-dsa-mt7620|kmod-dsa-core|kmod-mt76x2|lldpd|luci-app-watchcat|uhttpd)' "$MAN" | tee logs/manifest-proof.txt || true
             if grep -q '^swconfig ' "$MAN"; then echo "::error::MANIFEST FAIL: swconfig inside the image despite -swconfig"; exit 1; fi
-            grep -q '^kmod-dsa-mt7620 ' "$MAN"     || { echo "::error::MANIFEST FAIL: kmod-dsa-mt7620 missing from the image"; exit 1; }
-            grep -q '^lldpd ' "$MAN"                || { echo "::error::MANIFEST FAIL: lldpd missing from the image";             exit 1; }
-            grep -q '^luci-app-watchcat ' "$MAN"   || { echo "::error::MANIFEST FAIL: luci-app-watchcat missing from the image"; exit 1; }
-            echo "MANIFEST-PROOF: OK (dsa in, swconfig out, lldpd+watchcat in)" | tee -a logs/manifest-proof.txt
+            grep -q '^kmod-dsa-mt7620 ' "$MAN"   || { echo "::error::MANIFEST FAIL: kmod-dsa-mt7620 missing from the image";   exit 1; }
+            grep -q '^lldpd ' "$MAN"              || { echo "::error::MANIFEST FAIL: lldpd missing from the image";              exit 1; }
+            grep -q '^luci-app-watchcat ' "$MAN" || { echo "::error::MANIFEST FAIL: luci-app-watchcat missing from the image"; exit 1; }
+            grep -q '^uhttpd ' "$MAN"             || { echo "::error::MANIFEST FAIL: uhttpd missing from the image";             exit 1; }
+            echo "MANIFEST-PROOF: OK (dsa in, swconfig out, lldpd+watchcat+uhttpd in)" | tee -a logs/manifest-proof.txt
           else
             echo "::warning::no manifest found (rc=$rc) — skip manifest proof"
           fi
@@ -368,16 +473,18 @@ jobs:
         run: |
           set +e
           {
-            echo "workflow     = build-k2-dsa-test v8 (bh_k2 integrated; fixed base pkgs: lldpd + luci-app-watchcat; luci feed always on)"
+            echo "workflow     = build-phicomm-k2-dsa v9 (bh_k2 integrated; fixed base: lldpd + luci-app-watchcat + uhttpd)"
             echo "k2_branch    = ${{ inputs.k2_branch }} ($(cat logs/head.txt 2>/dev/null))"
+            echo "extra_packages = '${{ inputs.extra_packages }}'"
             echo "wifi_rescue  = ${{ inputs.wifi_rescue }}"
             echo "include_files= ${{ inputs.include_files }}"
             echo "attach_theme = ${{ inputs.attach_theme }}"
-            echo "fixed_base_pkgs = CONFIG_FEED_luci=y CONFIG_PACKAGE_lldpd=y CONFIG_PACKAGE_luci-app-watchcat=y"
+            echo "fixed_base_pkgs = CONFIG_FEED_luci=y CONFIG_PACKAGE_lldpd=y CONFIG_PACKAGE_luci-app-watchcat=y CONFIG_PACKAGE_uhttpd=y"
             echo "rescue.sha256:"; cat logs/rescue.sha256 2>/dev/null
             echo "gates:"; cat logs/gates.txt 2>/dev/null
             echo "files.sha256:"; cat logs/files.sha256 2>/dev/null
             echo "commits:"; cat logs/commits.txt 2>/dev/null
+            echo "pkg-availability:"; cat logs/pkg-availability.txt 2>/dev/null
             echo "bh_k2 log:"; cat logs/bh_k2.txt 2>/dev/null
             echo "config_proof:"; cat logs/config-proof.txt 2>/dev/null
             echo "kernel = 6.18$(grep -m1 'LINUX_VERSION-6.18' target/linux/generic/kernel-6.18 2>/dev/null | sed 's/.*= //')"
@@ -391,7 +498,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: k2-dsa-test-${{ github.run_number }}
+          name: phicomm-k2-dsa-${{ github.run_number }}
           path: |
             logs/
             bin/targets/ramips/mt7620/*k2-v22.4*
