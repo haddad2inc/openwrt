@@ -262,6 +262,7 @@ jobs:
           CONFIG_FEED_luci=y
           CONFIG_PACKAGE_lldpd=y
           CONFIG_PACKAGE_luci-app-watchcat=y
+          CONFIG_PACKAGE_uhttpd=y
           SEED
 
           # LuCI نفسه مطلوب فقط عندما يُركَّب قالب enan (قالب LuCI).
@@ -282,6 +283,7 @@ jobs:
               echo "CONFIG_TARGET_ramips_mt7620=y"
               echo "CONFIG_TARGET_${DEVSYM}=y"
               echo "CONFIG_FEED_luci=y"
+              echo "CONFIG_PACKAGE_uhttpd=y"
               echo "CONFIG_PACKAGE_lldpd=y"
               echo "CONFIG_PACKAGE_luci-app-watchcat=y"
             } >> .config
