@@ -18,11 +18,19 @@
 #   - فحوص fail-closed بعد defconfig لكل الحزم الثابتة + extra_packages.
 #   - فحص manifest يشمل الآن uhttpd أيضاً.
 #
+# v10:
+#   - مُدخل output_suffix لإضافة لاحقة اختيارية إلى اسم الـ artifact.
+#
 name: build-phicomm-k2-dsa
 
 on:
   workflow_dispatch:
     inputs:
+      output_suffix:
+        description: 'Optional suffix appended to all artifact names (e.g. "test1")'
+        required: false
+        default: ''
+        type: string
       k2_branch:
         description: "Branch on this fork carrying the K2 v22.4 DSA commit(s) on top of openwrt master"
         required: false
@@ -473,7 +481,8 @@ jobs:
         run: |
           set +e
           {
-            echo "workflow     = build-phicomm-k2-dsa v9 (bh_k2 integrated; fixed base: lldpd + luci-app-watchcat + uhttpd)"
+            echo "workflow     = build-phicomm-k2-dsa v10 (bh_k2 integrated; fixed base: lldpd + luci-app-watchcat + uhttpd)"
+            echo "output_suffix = '${{ inputs.output_suffix }}'"
             echo "k2_branch    = ${{ inputs.k2_branch }} ($(cat logs/head.txt 2>/dev/null))"
             echo "extra_packages = '${{ inputs.extra_packages }}'"
             echo "wifi_rescue  = ${{ inputs.wifi_rescue }}"
@@ -498,7 +507,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: phicomm-k2-dsa-${{ github.run_number }}
+          name: phicomm-k2-dsa${{ inputs.output_suffix != '' && format('-{0}', inputs.output_suffix) || '' }}-${{ github.run_number }}
           path: |
             logs/
             bin/targets/ramips/mt7620/*k2-v22.4*
