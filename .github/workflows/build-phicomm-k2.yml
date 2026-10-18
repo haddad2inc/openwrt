@@ -1,25 +1,12 @@
 # build-phicomm-k2-dsa.yml — صورة اختبار Phicomm K2 v22.4 المحوَّل إلى DSA
 #
-# v9:
-#   - الحزم الأساسية الثابتة في كل صورة:
-#       CONFIG_FEED_luci=y
-#       CONFIG_PACKAGE_lldpd=y
-#       CONFIG_PACKAGE_luci-app-watchcat=y
-#       CONFIG_PACKAGE_uhttpd=y          ← (جديد v9)
-#     وCONFIG_PACKAGE_luci=y فقط عند attach_theme=true.
-#   - مُدخل جديد extra_packages: قائمة أسماء حزم (بدون بادئة CONFIG_PACKAGE_)
-#     تفصل بينها فاصلة أو مسافة. يُبنى لكل اسم CONFIG_PACKAGE_<name>=y، ويُعاد
-#     فرضه بعد defconfig لو أسقطه.
-#   - خطوة جديدة "Probe requested packages": تفحص كل حزمة مطلوبة (أساسية أو
-#     إضافية) داخل package/ بعد feeds install -a، وتكتب النتيجة في
-#     logs/pkg-availability.txt، مع تحذير صريح لأي حزمة غير موجودة أصلاً.
-#     هذا هو تفسير اختفاء أي حزمة أضفتها يدوياً: defconfig يُسقط Symbol بصمت
-#     إن لم يوجد Makefile له أو لم تُلبَّ تبعياته.
-#   - فحوص fail-closed بعد defconfig لكل الحزم الثابتة + extra_packages.
-#   - فحص manifest يشمل الآن uhttpd أيضاً.
-#
-# v10:
-#   - مُدخل output_suffix لإضافة لاحقة اختيارية إلى اسم الـ artifact.
+# v11:
+#   - استبدال include_files و attach_theme بمُدخل asset_profile:
+#       main    → m/files + m/luci-theme-enan-dashboard
+#       general → g/files + g/luci-theme-enan-dashboard
+#       special → s/files + s/luci-theme-enan-dashboard
+#     خطوة واحدة تنسخ المحتويات، وتتجاهل المجلدات غير الموجودة (يمكن للملف
+#     الشخصي أن يحمل files فقط أو theme فقط).
 #
 name: build-phicomm-k2-dsa
 
@@ -31,6 +18,15 @@ on:
         required: false
         default: ''
         type: string
+      asset_profile:
+        description: 'Asset profile to import (m/g/s folder from bh_k2)'
+        required: true
+        default: main
+        type: choice
+        options:
+          - main
+          - general
+          - special
       k2_branch:
         description: "Branch on this fork carrying the K2 v22.4 DSA commit(s) on top of openwrt master"
         required: false
@@ -41,16 +37,6 @@ on:
         required: false
         default: ''
         type: string
-      include_files:
-        description: 'Inject custom files from "files" directory (bh_k2)'
-        required: false
-        default: false
-        type: boolean
-      attach_theme:
-        description: 'Import luci-theme-enan-dashboard package and enable it in .config'
-        required: false
-        default: false
-        type: boolean
       wifi_rescue:
         description: "Inject /etc/uci-defaults/99-k2-wifi-rescue (force both radios up as K2-DSA-RESCUE APs on br-lan) — the no-serial safety net"
         required: false
@@ -72,10 +58,6 @@ jobs:
           ref: ${{ inputs.k2_branch }}
           fetch-depth: 0
 
-      # ------------------------------------------------------------
-      # بوابات المحتوى (fail-closed): إن لم يكن الbranch يحمل التحويل
-      # فعلاً فلا معنى لحرق ساعة بناء؛ الموت هنا رخيص.
-      # ------------------------------------------------------------
       - name: Content gates + identity witnesses
         run: |
           set -e
@@ -85,7 +67,6 @@ jobs:
           NET=target/linux/ramips/mt7620/base-files/etc/board.d/02_network
           fail(){ echo "::error::GATE FAIL: $1"; exit 1; }
 
-          # G1 — الDTS يحمل شكل DSA الكامل (5 منافذ مستخدم داخلية + CPU)
           grep -q 'ports {' "$DTS"                              || fail "G1 no ports node in $DTS"
           [ "$(grep -c 'phy-handle = <&ephy' "$DTS")" = "5" ]   || fail "G1 phy-handle count != 5"
           [ "$(grep -c 'phy-mode = "mii"' "$DTS")" = "5" ]      || fail "G1 phy-mode mii count != 5 (internal NOT accepted)"
@@ -94,13 +75,11 @@ jobs:
           grep -q 'label = "wan";' "$DTS"                       || fail "G1 no wan port label"
           grep -q 'ethernet = <&ethernet>;' "$DTS"              || fail "G1 cpu port lacks ethernet phandle"
 
-          # G2 — وصفة الصورة في كتلة k2-v22.4 وحدها
           awk '/^define Device\/phicomm_k2-v22.4$/,/^endef$/' "$MK" > logs/mk-block.txt
           grep -q 'kmod-dsa-mt7620' logs/mk-block.txt           || fail "G2 kmod-dsa-mt7620 missing from Device block"
           grep -q -- '-swconfig' logs/mk-block.txt              || fail "G2 -swconfig missing from Device block"
           grep -q 'DEVICE_COMPAT_VERSION := 1.1' logs/mk-block.txt || fail "G2 DEVICE_COMPAT_VERSION missing"
 
-          # G3 — فصل الcase في 02_network
           grep -A1 'phicomm,k2-v22.4)' "$NET" | grep -q 'ucidef_set_interfaces_lan_wan "lan1 lan2 lan3 lan4" "wan"' \
                                                               || fail "G3 k2-v22.4 interfaces case not in DSA form"
           grep -A6 'phicomm,k2-v22.5|' "$NET" | grep -q 'ucidef_add_switch' \
@@ -114,18 +93,13 @@ jobs:
           fi
           rm -f /tmp/k2-iface
 
-          # G6 — الجهاز مسجّل في TARGET_DEVICES
           grep -q '^TARGET_DEVICES += phicomm_k2-v22.4$' "$MK" || fail "G6 TARGET_DEVICES += phicomm_k2-v22.4 missing from mt7620.mk"
 
-          # G4 — شواهد الهوية
           sha256sum "$DTS" "$MK" "$NET" | tee logs/files.sha256
           git log --oneline -5 | tee logs/commits.txt
           git rev-parse HEAD | tee logs/head.txt
           echo "GATES: PASS (G1..G4)" | tee logs/gates.txt
 
-      # ------------------------------------------------------------
-      # سقالة النجاة: الجهاز تحت الاختبار بلا USB-TTL
-      # ------------------------------------------------------------
       - name: Inject WiFi rescue overlay (no-serial safety net)
         if: ${{ inputs.wifi_rescue }}
         run: |
@@ -186,14 +160,6 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      # =====================================================================
-      # v9: package availability probe
-      #   - يسأل: هل هذه الحزمة موجودة فعلاً في package/ بعد feeds install -a؟
-      #   - يكتب النتيجة في logs/pkg-availability.txt
-      #   - يشرح سبب اختفاء أي حزمة أضفتها يدوياً:
-      #       defconfig يُسقط بصمت أي CONFIG_PACKAGE_<x>=y ليس له Makefile
-      #       (أو لم تُلبَّ تبعياته) — فتصبح الصورة بلا الحزمة دون أي خطأ.
-      # =====================================================================
       - name: Probe requested packages (fixed base + extra_packages)
         env:
           EXTRA_PKGS: ${{ inputs.extra_packages }}
@@ -206,7 +172,6 @@ jobs:
             echo "  - $p" | tee -a logs/pkg-availability.txt
           done
 
-          # normalise extra_packages: commas -> spaces
           E="${EXTRA_PKGS//,/ }"
           echo "Extra (from inputs.extra_packages): '${E}'" | tee -a logs/pkg-availability.txt
 
@@ -214,8 +179,6 @@ jobs:
           MISSING=0
           for p in $ALL; do
             [ -z "$p" ] && continue
-            # Look for PKG_NAME:=<p> in any Makefile under package/ (feeds install -a
-            # has already symlinked every installed feed package into package/feeds/).
             if grep -rlE "^PKG_NAME[[:space:]]*[:+]?=[[:space:]]*${p}[[:space:]]*$" \
                  package/ 2>/dev/null | head -1 | grep -q . ; then
               echo "  OK       $p" | tee -a logs/pkg-availability.txt
@@ -227,93 +190,78 @@ jobs:
             fi
           done
           echo "Probe summary: missing=$MISSING" | tee -a logs/pkg-availability.txt
-          # N.B.: we do NOT fail here — this is diagnostic only. The hard
-          # fail-closed happens after defconfig, once we know exactly which
-          # of the requested symbols survived.
           exit 0
 
       # =====================================================================
-      # bh_k2 Integration: Import assets from the external bh_k2 repository
+      # v11: unified asset import via asset_profile (main|general|special)
+      #   main    -> m/files + m/luci-theme-enan-dashboard
+      #   general -> g/files + g/luci-theme-enan-dashboard
+      #   special -> s/files + s/luci-theme-enan-dashboard
       # =====================================================================
-      - name: Import bh_k2 repository
-        if: ${{ inputs.include_files == true || inputs.attach_theme == true }}
+      - name: Import assets from bh_k2 (profile-driven)
         run: |
           set +e
-          echo "=== Importing bh_k2 repository ===" | tee -a logs/bh_k2.txt
-          BH_K2_DIR="/tmp/bh_k2"
-          rm -rf "$BH_K2_DIR"
-          if git clone --depth 1 "$BH_K2_REPO" "$BH_K2_DIR" 2>&1 | tee -a logs/bh_k2.txt; then
+          echo "=== Importing assets (profile=${{ inputs.asset_profile }}) ===" | tee logs/bh_k2.txt
+          BH_DIR="/tmp/bh_k2"
+          rm -rf "$BH_DIR"
+          if git clone --depth 1 "$BH_K2_REPO" "$BH_DIR" 2>&1 | tee -a logs/bh_k2.txt; then
             echo "✅ bh_k2 clone succeeded." | tee -a logs/bh_k2.txt
           else
             echo "::error::bh_k2 clone FAILED."
             exit 1
           fi
-          rm -rf "$BH_K2_DIR/.git"
+          rm -rf "$BH_DIR/.git"
           echo "=== Contents of bh_k2 (top-level) ===" | tee -a logs/bh_k2.txt
-          ls -la "$BH_K2_DIR" | tee -a logs/bh_k2.txt
-          exit 0
+          ls -la "$BH_DIR" | tee -a logs/bh_k2.txt
 
-      - name: Inject custom files from bh_k2 (include_files=true)
-        if: ${{ inputs.include_files == true }}
-        run: |
-          set +e
-          echo "=== Injecting custom files (include_files=true) ===" | tee -a logs/bh_k2.txt
-          SRC_DIR="/tmp/bh_k2/files"
-          if [ ! -d "$SRC_DIR" ]; then
-            echo "::error::$SRC_DIR not found in bh_k2."
-            ls -la /tmp/bh_k2 | tee -a logs/bh_k2.txt
-            exit 1
-          fi
-          mkdir -p files
-          cp -rv "$SRC_DIR"/. files/ 2>&1 | tee -a logs/bh_k2.txt
-          echo "✅ Custom files injected into ./files/" | tee -a logs/bh_k2.txt
-          find files -maxdepth 3 -type f | sort | tee -a logs/bh_k2.txt
-          exit 0
-
-      - name: Import luci-theme-enan-dashboard package (attach_theme=true)
-        if: ${{ inputs.attach_theme == true }}
-        run: |
-          set +e
-          echo "=== Importing luci-theme-enan-dashboard from bh_k2 ===" | tee -a logs/bh_k2.txt
-          SRC_DIR="/tmp/bh_k2/luci-theme-enan-dashboard"
-          TARGET_PARENT="package"
-          TARGET_DIR="$TARGET_PARENT/luci-theme-enan-dashboard"
-
-          if [ ! -d "$SRC_DIR" ]; then
-            echo "::error::$SRC_DIR not found in bh_k2."
-            ls -la /tmp/bh_k2 | tee -a logs/bh_k2.txt
+          case "${{ inputs.asset_profile }}" in
+            main)    SUB=m ;;
+            general) SUB=g ;;
+            special) SUB=s ;;
+            *)       echo "::error::unknown asset_profile '${{ inputs.asset_profile }}'"; exit 1 ;;
+          esac
+          SRC="$BH_DIR/$SUB"
+          echo "=== Selected subfolder: $SRC ===" | tee -a logs/bh_k2.txt
+          if [ ! -d "$SRC" ]; then
+            echo "::error::asset_profile '${{ inputs.asset_profile }}' → $SRC not found in bh_k2."
+            ls -la "$BH_DIR" | tee -a logs/bh_k2.txt
             exit 1
           fi
 
-          mkdir -p "$TARGET_PARENT"
-          rm -rf "$TARGET_DIR"
-          cp -rv "$SRC_DIR" "$TARGET_PARENT"/ 2>&1 | tee -a logs/bh_k2.txt
-
-          chmod -R u+rwX,go+rX "$TARGET_DIR" 2>&1 | tee -a logs/bh_k2.txt
-          find "$TARGET_DIR" -type f -name "*.sh" -exec chmod +x {} \; 2>&1 | tee -a logs/bh_k2.txt
-          find "$TARGET_DIR" -type f -name "Makefile" -exec chmod 644 {} \; 2>&1 | tee -a logs/bh_k2.txt
-          find "$TARGET_DIR/files" -type f -exec chmod +x {} \; 2>/dev/null || true
-
-          if [ -f "$TARGET_DIR/Makefile" ]; then
-            echo "✅ Makefile found at $TARGET_DIR/Makefile" | tee -a logs/bh_k2.txt
+          # --- files/ overlay ---
+          if [ -d "$SRC/files" ]; then
+            mkdir -p files
+            cp -rv "$SRC/files"/. files/ 2>&1 | tee -a logs/bh_k2.txt
+            echo "✅ files/ injected from $SUB/files" | tee -a logs/bh_k2.txt
+            find files -maxdepth 4 -type f | sort | tee -a logs/bh_k2.txt
           else
-            echo "::error::Makefile NOT found in $TARGET_DIR"
-            exit 1
+            echo "ℹ️ $SRC/files not present — skipping files overlay." | tee -a logs/bh_k2.txt
           fi
+
+          # --- luci-theme-enan-dashboard package ---
+          if [ -d "$SRC/luci-theme-enan-dashboard" ]; then
+            TARGET_PARENT="package"
+            TARGET_DIR="$TARGET_PARENT/luci-theme-enan-dashboard"
+            mkdir -p "$TARGET_PARENT"
+            rm -rf "$TARGET_DIR"
+            cp -rv "$SRC/luci-theme-enan-dashboard" "$TARGET_PARENT"/ 2>&1 | tee -a logs/bh_k2.txt
+            chmod -R u+rwX,go+rX "$TARGET_DIR" 2>&1 | tee -a logs/bh_k2.txt
+            find "$TARGET_DIR" -type f -name "*.sh" -exec chmod +x {} \; 2>&1 | tee -a logs/bh_k2.txt
+            find "$TARGET_DIR" -type f -name "Makefile" -exec chmod 644 {} \; 2>&1 | tee -a logs/bh_k2.txt
+            find "$TARGET_DIR/files" -type f -exec chmod +x {} \; 2>/dev/null || true
+            if [ -f "$TARGET_DIR/Makefile" ]; then
+              echo "✅ luci-theme-enan-dashboard imported from $SUB/luci-theme-enan-dashboard" | tee -a logs/bh_k2.txt
+            else
+              echo "::error::Makefile NOT found in $TARGET_DIR"
+              exit 1
+            fi
+          else
+            echo "ℹ️ $SRC/luci-theme-enan-dashboard not present — skipping theme package." | tee -a logs/bh_k2.txt
+          fi
+
+          echo "=== Import completed for profile '${{ inputs.asset_profile }}' ===" | tee -a logs/bh_k2.txt
           exit 0
 
-      # ------------------------------------------------------------
-      # البذرة: defconfig + إثبات
-      #   v9: الحزم الأساسية الثابتة:
-      #       CONFIG_FEED_luci=y
-      #       CONFIG_PACKAGE_lldpd=y
-      #       CONFIG_PACKAGE_luci-app-watchcat=y
-      #       CONFIG_PACKAGE_uhttpd=y
-      #       (+ CONFIG_PACKAGE_luci=y عند attach_theme=true)
-      #   extra_packages: كل اسم يُضاف كـ CONFIG_PACKAGE_<name>=y.
-      #   لو أسقط defconfig أي حزمة مطلوبة → إعادة فرض + defconfig مرة أخيرة،
-      #   وإن بقيت غير y → fail-closed.
-      # ------------------------------------------------------------
       - name: Seed .config + defconfig (double-pass) + config proof
         env:
           EXTRA_PKGS: ${{ inputs.extra_packages }}
@@ -321,7 +269,6 @@ jobs:
           set -e
           DEVSYM=TARGET_ramips_mt7620_DEVICE_phicomm_k2-v22.4
 
-          # ---- normalise extra_packages (comma → space) ----
           E="${EXTRA_PKGS//,/ }"
 
           cat > .config << 'SEED'
@@ -336,14 +283,12 @@ jobs:
           CONFIG_PACKAGE_uhttpd=y
           SEED
 
-          # extra packages (from inputs.extra_packages)
           for p in $E; do
             [ -z "$p" ] && continue
             echo "CONFIG_PACKAGE_${p}=y" >> .config
           done
 
-          # LuCI نفسه مطلوب فقط عند تركيب قالب enan
-          if [ "${{ inputs.attach_theme }}" = "true" ]; then
+          if [ -d "package/luci-theme-enan-dashboard" ]; then
             echo 'CONFIG_PACKAGE_luci=y' >> .config
             echo 'CONFIG_PACKAGE_luci-theme-enan-dashboard=y' >> .config
           fi
@@ -368,16 +313,13 @@ jobs:
               [ -z "$p" ] && continue
               echo "CONFIG_PACKAGE_${p}=y" >> .config
             done
-            if [ "${{ inputs.attach_theme }}" = "true" ]; then
+            if [ -d "package/luci-theme-enan-dashboard" ]; then
               echo "CONFIG_PACKAGE_luci=y" >> .config
               echo "CONFIG_PACKAGE_luci-theme-enan-dashboard=y" >> .config
             fi
             make defconfig
           fi
 
-          # ---------------------------------------------------------
-          # v9: re-force every requested package if defconfig dropped it
-          # ---------------------------------------------------------
           need_redefconfig=0
           force_post() {
             local sym="$1"
@@ -417,9 +359,6 @@ jobs:
             grep -E "^CONFIG_PACKAGE_luci-theme-enan-dashboard=" .config || true
           } | tee logs/config-proof.txt
 
-          # ---------------------------------------------------------
-          # Fail-closed on the fixed base packages
-          # ---------------------------------------------------------
           if ! grep -q "^CONFIG_${DEVSYM}=y" .config; then
             echo "::error::config proof: device STILL not selected"
             exit 1
@@ -431,10 +370,6 @@ jobs:
           grep -q '^CONFIG_PACKAGE_luci-app-watchcat=y' .config || { echo "::error::config proof: CONFIG_PACKAGE_luci-app-watchcat != y"; exit 1; }
           grep -q '^CONFIG_PACKAGE_uhttpd=y'            .config || { echo "::error::config proof: CONFIG_PACKAGE_uhttpd != y";            exit 1; }
 
-          # ---------------------------------------------------------
-          # v9: fail-closed on every extra package the user requested
-          #     (with a clear diagnostic pointing at pkg-availability.txt)
-          # ---------------------------------------------------------
           for p in $E; do
             [ -z "$p" ] && continue
             if grep -q "^CONFIG_PACKAGE_${p}=y" .config; then
@@ -449,7 +384,7 @@ jobs:
             fi
           done
 
-          if [ "${{ inputs.attach_theme }}" = "true" ]; then
+          if [ -d "package/luci-theme-enan-dashboard" ]; then
             grep -q '^CONFIG_PACKAGE_luci=y' .config                      || { echo "::error::config proof: luci missing (needed by theme)"; exit 1; }
             grep -q '^CONFIG_PACKAGE_luci-theme-enan-dashboard=y' .config || { echo "::error::config proof: enan-dashboard theme missing";   exit 1; }
           fi
@@ -481,13 +416,12 @@ jobs:
         run: |
           set +e
           {
-            echo "workflow     = build-phicomm-k2-dsa v10 (bh_k2 integrated; fixed base: lldpd + luci-app-watchcat + uhttpd)"
+            echo "workflow     = build-phicomm-k2-dsa v11 (profile-driven assets: main|general|special)"
             echo "output_suffix = '${{ inputs.output_suffix }}'"
+            echo "asset_profile = ${{ inputs.asset_profile }}"
             echo "k2_branch    = ${{ inputs.k2_branch }} ($(cat logs/head.txt 2>/dev/null))"
             echo "extra_packages = '${{ inputs.extra_packages }}'"
             echo "wifi_rescue  = ${{ inputs.wifi_rescue }}"
-            echo "include_files= ${{ inputs.include_files }}"
-            echo "attach_theme = ${{ inputs.attach_theme }}"
             echo "fixed_base_pkgs = CONFIG_FEED_luci=y CONFIG_PACKAGE_lldpd=y CONFIG_PACKAGE_luci-app-watchcat=y CONFIG_PACKAGE_uhttpd=y"
             echo "rescue.sha256:"; cat logs/rescue.sha256 2>/dev/null
             echo "gates:"; cat logs/gates.txt 2>/dev/null
@@ -507,7 +441,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: phicomm-k2-dsa${{ inputs.output_suffix != '' && format('-{0}', inputs.output_suffix) || '' }}-${{ github.run_number }}
+          name: phicomm-k2-dsa-${{ inputs.asset_profile }}${{ inputs.output_suffix != '' && format('-{0}', inputs.output_suffix) || '' }}-${{ github.run_number }}
           path: |
             logs/
             bin/targets/ramips/mt7620/*k2-v22.4*
