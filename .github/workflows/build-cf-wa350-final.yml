@@ -1,23 +1,25 @@
 name: build-cf-wa350-final
 
 # Builds one CF-WA350 image that combines every piece of the project:
-#   base branch  : comfast-cf-wa350-support = PR #25040 device commit
+#   base branch  : comfast-cf-wa350-support = PR #25040 device commit (freshest, rebased on current main)
 #   + kernel_branch range : commits above merge-base with base_branch are cherry-picked
-#   + PR #25474  : macronix .name restore (cherry-pick, optional)
-#   + PR #25477  : ar8216 guard (cherry-pick, optional)
-#   + PR #25040  : device commit (cherry-pick, optional)
+#                             (generic-leds-wired-rate-activity carries the new patches,
+#                              including 0956-net-dsa-qca8k-support-the-qca-etype-tagging-protocol)
+#   + PR #25474  : 460 macronix .name restore            (cherry-pick)
+#   + PR #25477  : 731 ar8216 guard                     (cherry-pick)
+#   + PR #25040  : device commit                        (cherry-pick)
 #   + ci-wa350   : DTS variant (sha-gated) and .config asset
+#   + building-helper/{m,g,s} : profile-driven custom files/ and
+#                               luci-theme-enan-dashboard package
 #
-# v12 (2026-10-19):
-#   - Removed inputs include_files and attach_theme.
-#   - Added asset_profile choice: main | general | special.
-#     main    -> clone building-helper, copy from m/files and m/luci-theme-enan-dashboard
-#     general -> clone building-helper, copy from g/files and g/luci-theme-enan-dashboard
-#     special -> clone building-helper, copy from s/files and s/luci-theme-enan-dashboard
-#   - One unified step handles the injection. If a subfolder is missing, that
-#     part is skipped (no hard failure) so a profile can carry files only, or
-#     theme only.
-#   - Workflow renamed from build-cf-wa350-full to build-cf-wa350-final.
+# v13:
+#   - Workflow renamed build-cf-wa350-full → build-cf-wa350-final.
+#   - include_files / attach_theme removed; replaced by asset_profile
+#     (main → m/, general → g/, special → s/).
+#   - base_branch, kernel_branch, include_* and dts_file are now fixed in
+#     env and removed from the UI so the working behaviour of the original
+#     workflow is preserved unchanged.
+#   - output_suffix added at the top (appended to the artifact name).
 
 on:
   workflow_dispatch:
@@ -36,53 +38,16 @@ on:
           - main
           - general
           - special
-      base_branch:
-        description: "Base branch of the integration build (device commit = PR #25040 head)"
-        required: false
-        default: comfast-cf-wa350-support
-        type: choice
-        options:
-          - comfast-cf-wa350-support
-          - k1-qca8k-stats
-          - main
-      kernel_branch:
-        description: "Branch carrying the kernel patches; commits above merge-base with the base branch are picked"
-        required: false
-        default: generic-leds-wired-rate-activity
-        type: string
-      include_kernel_patches:
-        description: "Cherry-pick the kernel_branch commit range"
-        required: false
-        default: true
-        type: boolean
-      include_pr25474:
-        description: "Cherry-pick PR #25474 (patch 460 macronix .name restore)"
-        required: false
-        default: true
-        type: boolean
-      include_pr25477:
-        description: "Cherry-pick PR #25477 (patch 731 ar8216 guard)"
-        required: false
-        default: true
-        type: boolean
-      include_pr25040:
-        description: "Cherry-pick PR #25040 (device commit; skipped automatically when the base already carries its content)"
-        required: false
-        default: true
-        type: boolean
-      dts_file:
-        description: DTS variant from root dts/ folder on ci-wa350
-        required: false
-        default: qca9563_comfast_cf-wa350.dts
-        type: choice
-        options:
-          - qca9563_comfast_cf-wa350.dts
-          - qca9563_comfast_cf-wa350-internal-mdio.dts
-          - qca9563_comfast_cf-wa350-explicit-mdio.dts
-          - qca9563_comfast_cf-wa350-external.dts
 
 env:
   BUILDING_HELPER_REPO: https://github.com/haddad2inc/building-helper.git
+  BASE_BRANCH: comfast-cf-wa350-support
+  KERNEL_BRANCH: generic-leds-wired-rate-activity
+  INCLUDE_KERNEL_PATCHES: "true"
+  INCLUDE_PR25474: "true"
+  INCLUDE_PR25477: "true"
+  INCLUDE_PR25040: "true"
+  DTS_FILE: qca9563_comfast_cf-wa350.dts
 
 jobs:
   build:
@@ -93,7 +58,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: haddad2inc/openwrt
-          ref: ${{ inputs.base_branch }}
+          ref: ${{ env.BASE_BRANCH }}
           fetch-depth: 0
 
       - name: Fetch branches used by the gates
@@ -101,13 +66,13 @@ jobs:
           set +e
           mkdir -p logs
           git fetch origin main \
-                           "${{ inputs.kernel_branch }}" \
+                           "${{ env.KERNEL_BRANCH }}" \
                            comfast-cf-wa350-support \
                            ath79-mtd-mx25l12805d-restore-name \
                            ath79-ar8216-internal-mdio || { echo "::error::fetch branches failed"; exit 1; }
           {
-            echo "base_branch    = ${{ inputs.base_branch }} $(git rev-parse HEAD)"
-            echo "kernel_branch  = ${{ inputs.kernel_branch }} $(git rev-parse origin/${{ inputs.kernel_branch }} 2>/dev/null || git rev-parse ${{ inputs.kernel_branch }})"
+            echo "base_branch    = ${{ env.BASE_BRANCH }} $(git rev-parse HEAD)"
+            echo "kernel_branch  = ${{ env.KERNEL_BRANCH }} $(git rev-parse origin/${{ env.KERNEL_BRANCH }} 2>/dev/null || git rev-parse ${{ env.KERNEL_BRANCH }})"
             echo "PR-25040 head  = $(git rev-parse origin/comfast-cf-wa350-support)"
             echo "PR-25474 head  = $(git rev-parse origin/ath79-mtd-mx25l12805d-restore-name)"
             echo "PR-25477 head  = $(git rev-parse origin/ath79-ar8216-internal-mdio)"
@@ -211,8 +176,8 @@ jobs:
             exit 1
           }
 
-          if [ "${{ inputs.include_kernel_patches }}" = "true" ]; then
-            KB="${{ inputs.kernel_branch }}"
+          if [ "${{ env.INCLUDE_KERNEL_PATCHES }}" = "true" ]; then
+            KB="${{ env.KERNEL_BRANCH }}"
             git rev-parse -q --verify "origin/$KB" >/dev/null && KB="origin/$KB"
             MB="$(git merge-base "$KB" HEAD)"
             N="$(git rev-list --count "$MB..$KB")"
@@ -225,9 +190,9 @@ jobs:
               log "KERNEL-RANGE-EMPTY $KB (nothing above merge-base)"
             fi
           fi
-          [ "${{ inputs.include_pr25474 }}" = "true" ] && pick origin/ath79-mtd-mx25l12805d-restore-name PR-25474
-          [ "${{ inputs.include_pr25477 }}" = "true" ] && pick origin/ath79-ar8216-internal-mdio PR-25477
-          [ "${{ inputs.include_pr25040 }}" = "true" ] && pick origin/comfast-cf-wa350-support PR-25040
+          [ "${{ env.INCLUDE_PR25474 }}" = "true" ] && pick origin/ath79-mtd-mx25l12805d-restore-name PR-25474
+          [ "${{ env.INCLUDE_PR25477 }}" = "true" ] && pick origin/ath79-ar8216-internal-mdio PR-25477
+          [ "${{ env.INCLUDE_PR25040 }}" = "true" ] && pick origin/comfast-cf-wa350-support PR-25040
           log "HEAD-NOW $(git rev-parse HEAD) (base was $BASE_SHA)"
           git log --oneline "$BASE_SHA..HEAD" | tee -a logs/picks.txt
           exit 0
@@ -237,7 +202,7 @@ jobs:
           set +e
           git fetch --depth 1 origin ci-wa350 || exit 1
           mkdir -p /tmp/assets
-          F="${{ inputs.dts_file }}"
+          F="${{ env.DTS_FILE }}"
           if git show "origin/main:dts/$F" > /tmp/assets/dts 2>/dev/null && [ -s /tmp/assets/dts ]; then
             DTS_SRC="main"
           elif git show "origin/ci-wa350:dts/$F" > /tmp/assets/dts 2>/dev/null && [ -s /tmp/assets/dts ]; then
@@ -257,24 +222,21 @@ jobs:
           D=target/linux/ath79/dts/qca9563_comfast_cf-wa350.dts
           cp /tmp/assets/dts "$D"
           S="$(sha256sum "$D" | cut -d' ' -f1)"
-          case "${{ inputs.dts_file }}" in
+          case "${{ env.DTS_FILE }}" in
             *external*)      V=EXTERNAL-MDIO;         E=c7cd13705d797229600a2d85f180fdb6736f39b493a7205c0211c746aaf015ca ;;
             *explicit*)      V=INTERNAL-EXPLICIT;     E=a755306340109abe2c63c47adb4144131011e12913f7ee3781c095be1dbe637e ;;
             *internal-mdio*) V=INTERNAL-MDIO-PRE-SWAP; E=1544a5482fabf497479b6acb6d21ec68ab450a7f253239b84ff61fd843c9bb30 ;;
             *)               V=INTERNAL-LEGACY;       E=c393c70bda0890e79ee4263306a2ac3a1ea2ad72cc27e22334a125960374778d ;;
           esac
-          { echo "variant    = $V"; echo "dts_file   = ${{ inputs.dts_file }}"; echo "dts_sha256 = $S"; } | tee logs/variant.txt
+          { echo "variant    = $V"; echo "dts_file   = ${{ env.DTS_FILE }}"; echo "dts_sha256 = $S"; } | tee logs/variant.txt
           [ "$S" = "$E" ] || { echo "::error::DTS sha mismatch"; exit 1; }
           echo "V=$V" >> "$GITHUB_ENV"
           exit 0
 
       # =====================================================================
-      # v12: unified asset import via asset_profile (main|general|special)
-      #   main    -> m/files + m/luci-theme-enan-dashboard
-      #   general -> g/files + g/luci-theme-enan-dashboard
-      #   special -> s/files + s/luci-theme-enan-dashboard
-      # Missing subfolders are tolerated (profile may carry files only or
-      # theme only). The step is idempotent and logs every copied path.
+      # Profile-driven asset import (main → m/, general → g/, special → s/)
+      # Replaces the old include_files / attach_theme pair.
+      # Missing subfolders are tolerated (files-only or theme-only profiles).
       # =====================================================================
       - name: Import assets from building-helper (profile-driven)
         run: |
@@ -352,8 +314,14 @@ jobs:
           set +e
           cp /tmp/assets/.config .config
 
+          # ---------------------------------------------------------------
+          # 1. luci always on
+          # ---------------------------------------------------------------
           sed -i 's/^# CONFIG_PACKAGE_luci is not set/CONFIG_PACKAGE_luci=y/' .config
 
+          # ---------------------------------------------------------------
+          # 2. theme only if the imported profile provided it
+          # ---------------------------------------------------------------
           if [ -d "package/luci-theme-enan-dashboard" ]; then
             echo "--- Injecting CONFIG_PACKAGE_luci-theme-enan-dashboard=y ---" | tee -a logs/building-helper.txt
             sed -i '/^CONFIG_PACKAGE_luci-theme-enan-dashboard=/d' .config
@@ -361,6 +329,9 @@ jobs:
             echo 'CONFIG_PACKAGE_luci-theme-enan-dashboard=y' >> .config
           fi
 
+          # ---------------------------------------------------------------
+          # 3. HARD-FORCE lldpd + watchcat (pre-defconfig)
+          # ---------------------------------------------------------------
           force_enable_pre() {
             local sym="$1"
             echo "--- Force-enabling ${sym}=y (pre-defconfig) ---" | tee -a logs/config-proof.txt
@@ -371,10 +342,16 @@ jobs:
           force_enable_pre "CONFIG_PACKAGE_lldpd"
           force_enable_pre "CONFIG_PACKAGE_watchcat"
 
+          # ---------------------------------------------------------------
+          # 4. feeds + defconfig
+          # ---------------------------------------------------------------
           ./scripts/feeds update -a >/dev/null 2>&1
           ./scripts/feeds install -a >/dev/null 2>&1
           make defconfig || exit 1
 
+          # ---------------------------------------------------------------
+          # 5. re-force lldpd + watchcat if defconfig dropped them
+          # ---------------------------------------------------------------
           need_redefconfig=0
           force_enable_post() {
             local sym="$1"
@@ -402,6 +379,9 @@ jobs:
             fi
           fi
 
+          # ---------------------------------------------------------------
+          # 6. proofs
+          # ---------------------------------------------------------------
           grep -E '^CONFIG_TARGET_PROFILE=|^CONFIG_PACKAGE_kmod-dsa-qca8k=|^CONFIG_TARGET_ROOTFS_INITRAMFS=|^CONFIG_GCC_VERSION=|^CONFIG_PACKAGE_luci=|^CONFIG_PACKAGE_luci-theme-enan-dashboard=|^CONFIG_PACKAGE_lldpd=|^CONFIG_PACKAGE_watchcat=' .config | tee -a logs/config-proof.txt
 
           grep -q '^CONFIG_PACKAGE_luci=y'     .config || { echo "::error::luci missing after defconfig";     exit 1; }
@@ -432,11 +412,16 @@ jobs:
         run: |
           set +e
           {
-            echo "workflow       = build-cf-wa350-final v12"
+            echo "workflow       = build-cf-wa350-final v13"
             echo "output_suffix  = '${{ inputs.output_suffix }}'"
             echo "asset_profile  = ${{ inputs.asset_profile }}"
-            echo "base_branch    = ${{ inputs.base_branch }} ($(git rev-parse ${{ inputs.base_branch }} 2>/dev/null || git rev-parse origin/${{ inputs.base_branch }}))"
-            echo "kernel_branch  = ${{ inputs.kernel_branch }} ($(git rev-parse ${{ inputs.kernel_branch }} 2>/dev/null || git rev-parse origin/${{ inputs.kernel_branch }}))"
+            echo "base_branch    = ${{ env.BASE_BRANCH }} ($(git rev-parse ${{ env.BASE_BRANCH }} 2>/dev/null || git rev-parse origin/${{ env.BASE_BRANCH }}))"
+            echo "kernel_branch  = ${{ env.KERNEL_BRANCH }} ($(git rev-parse ${{ env.KERNEL_BRANCH }} 2>/dev/null || git rev-parse origin/${{ env.KERNEL_BRANCH }}))"
+            echo "dts_file       = ${{ env.DTS_FILE }}"
+            echo "include_kernel_patches = ${{ env.INCLUDE_KERNEL_PATCHES }}"
+            echo "include_pr25474        = ${{ env.INCLUDE_PR25474 }}"
+            echo "include_pr25477        = ${{ env.INCLUDE_PR25477 }}"
+            echo "include_pr25040        = ${{ env.INCLUDE_PR25040 }}"
             echo "force_pkgs     = CONFIG_PACKAGE_lldpd=y CONFIG_PACKAGE_watchcat=y"
             echo "heads:"; cat logs/heads.txt 2>/dev/null
             echo "gates:"; cat logs/picks.txt 2>/dev/null | grep -E 'ALREADY-IN-BASE|EQUIVALENT-IN-BASE|TREE-ALREADY-IN-BASE|EMPTY-AFTER-PICK|ASSET-CONFLICT|PICKED|KERNEL-RANGE|HEAD-NOW'
@@ -455,7 +440,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: cf-wa350-final-${{ inputs.dts_file }}-${{ inputs.asset_profile }}${{ inputs.output_suffix != '' && format('-{0}', inputs.output_suffix) || '' }}-${{ github.run_number }}
+          name: cf-wa350-final-${{ inputs.asset_profile }}${{ inputs.output_suffix != '' && format('-{0}', inputs.output_suffix) || '' }}-${{ github.run_number }}
           path: |
             logs/
             bin/targets/ath79/generic/*cf-wa350*
