@@ -2,24 +2,107 @@ name: build-cf-wa350-final
 
 # Builds one CF-WA350 image that combines every piece of the project:
 #   base branch  : comfast-cf-wa350-support = PR #25040 device commit (freshest, rebased on current main)
-#   + kernel_branch range : commits above merge-base with base_branch are cherry-picked
-#                             (generic-leds-wired-rate-activity carries the new patches,
-#                              including 0956-net-dsa-qca8k-support-the-qca-etype-tagging-protocol)
-#   + PR #25474  : 460 macronix .name restore            (cherry-pick)
-#   + PR #25477  : 731 ar8216 guard                     (cherry-pick)
-#   + PR #25040  : device commit                        (cherry-pick)
+#   + kernel_branch range : 744 v6 qca8k cached stats64, 745 v3 netdev rate_threshold + quadratic
+#                             afterglow, 746 (mac80211 subsys/394 tpt delivered-data), ipq40xx 706 refresh
+#   + PR #25474  : 460 macronix .name restore            (cherry-pick, optional; renamed 740- -> 460-
+#                             on DragonBluep's review)
+#   + PR #25477  : 731 ar8216 guard                     (cherry-pick, optional, explicit-mdio only)
+#   + PR #25040  : device commit                        (cherry-pick, optional; skipped when the base already carries it)
 #   + ci-wa350   : DTS variant (sha-gated) and .config asset
 #   + building-helper/{m,g,s} : profile-driven custom files/ and
 #                               luci-theme-enan-dashboard package
 #
-# v13:
-#   - Workflow renamed build-cf-wa350-full → build-cf-wa350-final.
+# v5 (run 37005732172 post-mortem): the base is now the DEVICE branch and the kernel
+# commits are picked on top, because k1-qca8k-stats already contains the device tree
+# (it was grown from 4ca06c6439, the unsigned twin of the PR head d0361a04dc).
+# Picking d0361a04dc onto it yields an EMPTY commit, which git reports with a non-zero
+# exit status - the old pick() treated every non-zero status as "conflict" and aborted.
+# pick() now has five ordered gates:
+#   1 ALREADY-IN-BASE       merge-base --is-ancestor
+#   2 EQUIVALENT-IN-BASE    git cherry patch-id match (rebased / re-signed twin)
+#   3 TREE-ALREADY-IN-BASE  every blob the commit touches is byte-identical at HEAD
+#   4 EMPTY-AFTER-PICK      cherry-pick produced no diff -> --skip, still counted as applied
+#   5 real conflict         prints the conflicted paths, writes per-file diffs to
+#                           logs/conflict-<label>.txt (uploaded as artifact), then fails
+# Every gate result is printed on the identity card so the artifact link and the
+# flashed image can always be matched.
+#
+# v6 (2026-10-07): the base branch and the three PR branches were REBASED onto
+# upstream/master (0ab51fb9c1, still LINUX_VERSION-6.18 = .55) - OpenWrt rejects merge
+# commits in PRs, so rebase (not merge) is what clears the "out-of-date" banner.
+# kernel_branch default is now k1-qca8k-v7 = base_branch + exactly ONE commit carrying
+# all four patches, so KERNEL-RANGE picks a single commit instead of ~250: no stale
+# .config or build log can leak into the build tree (they were tracked on main until
+# 1760e357527b, which made every 'git diff --name-only --exit-code' gate in Build Kernel
+# and Build all core packages fail for all targets).
+# Patch inventory carried by k1-qca8k-v7 (fingerprints):
+#   744 v6  target/linux/generic/pending-6.18/744-...       blob dd1c4839a2a6  sha256 2519098cc6f52650
+#   745 v3  target/linux/generic/pending-6.18/745-...       sha256 c8782b64f19c2b5d (post-refresh)
+#   746     package/kernel/mac80211/patches/subsys/394-...  sha256 0c5c6c68216316c0
+#   706     target/linux/ipq40xx/patches-6.18/706-...       blob 7046d32e1ee4 (+90/+9 offsets)
+#
+# v7 (2026-10-11, runs #12-#14 post-mortem): the 2026-10-10 DTS rework on
+# PR #25040 (function/color swap, new head 2a2d51c95afe, blob 5f685f111c,
+# sha256 c393c70...) drifted apart from the kernel branch and the asset branch:
+#   1 KERNEL-RANGE picked e9c7d7b91c (the OLD device twin, colour-first DTS
+#     1aafe75ab5) onto the NEW PR head -> add/add conflict on the DTS and the
+#     run died in gate 5. pick() gains gate 6 ASSET-CONFLICT: when the ONLY
+#     unmerged path is the asset-managed DTS, resolve it to the BASE side and
+#     continue (or skip when the remainder is empty). This cannot leak into the
+#     image: the Inject-DTS step below overwrites that exact file from the
+#     asset branch and sha256-gates it. Any other conflicted path still fails.
+#   2 upstream master took subsys numbers 394-422 between 0ab51fb9c1 (Oct 7,
+#     the base of k1-qca8k-v10) and eb51d41b129c (Oct 10, the base of the PR
+#     head): v10's subsys/394+395 would now interleave with upstream's own
+#     394/395 in the quilt series (untested order, rx.c offset roulette).
+#     kernel_branch default is therefore k1-qca8k-v11 = PR-head base + the six
+#     r7 files under their PR names (744 v7, 835 v4, subsys/423 master-
+#     refreshed, subsys/424, ipq40xx/706 refresh, base-files 0001) - exactly
+#     the combination measured zero-offset in R21 (m93).
+#   3 the DTS asset is read from origin/main:dts/<file> first (updated
+#     2026-10-10 in 50828bb77b05 to the swapped PR-head content, sha256
+#     c393c70...), falling back to origin/ci-wa350:dts/<file> for the variants
+#     that live only there; the source used is printed on the identity card.
+#     .config still comes from ci-wa350. (ci-wa350's default copy was synced
+#     in 9529bb37 at 20:13Z, after runs #12-#14 - both sources now carry the
+#     c393c70 content; the fallback keeps the three variant files working.)
+#     internal-mdio keeps its own gate: its ci-wa350 copy is the pre-swap
+#     content (1544a548...).
+# Patch inventory carried by k1-qca8k-v11 (sha256 / blob):
+#   744 v7  target/linux/generic/pending-6.18/744-...  a389a165cabf3d27 / 9331caa39d24
+#   835 v4  target/linux/generic/pending-6.18/835-...  ea7893e638a21c68 / af2d200fe083
+#   423     .../mac80211/patches/subsys/423-...        611a74d29e2409fe / 7e1ba8975461
+#   424     .../mac80211/patches/subsys/424-...        17c58f4ab21fed1a / 6be1ded07f56
+#   706     target/linux/ipq40xx/patches-6.18/706-...  (from k1-qca8k-v10) / 32dfc2130afe
+#           (measured 2026-10-11; the v6-header pin 7046d32e1ee4 predates de6b2bf and is stale)
+#   0001    package/base-files/files/etc/init.d/led    916d4215469840cc / 911bd155f436
+#
+# v8 (2026-10-11/12):
+#   1 adds two optional inputs sourced from the external building-helper
+#     repository (https://github.com/haddad2inc/building-helper.git):
+#       include_files : inject <building-helper>/files/* into the OpenWrt tree
+#                       as ./files/ before defconfig (runtime overlay).
+#       attach_theme  : import <building-helper>/luci-theme-enan-dashboard/ into
+#                       ./package/luci-theme-enan-dashboard and enable
+#                       CONFIG_PACKAGE_luci-theme-enan-dashboard=y in .config.
+#     Both steps are idempotent and only run when the input is true.
+#   2 hard-forces CONFIG_PACKAGE_lldpd=y and CONFIG_PACKAGE_watchcat=y in the
+#     .config. They are set BEFORE make defconfig and, if defconfig drops them
+#     (e.g. because a dependency is missing in the current branch), they are
+#     re-added and defconfig is re-run once so the final image always carries
+#     both packages. Presence is echoed into logs/config-proof.txt so the
+#     artifact can be matched to the flashed image.
+#
+# v9 (2026-10-13):
 #   - include_files / attach_theme removed; replaced by asset_profile
-#     (main → m/, general → g/, special → s/).
-#   - base_branch, kernel_branch, include_* and dts_file are now fixed in
-#     env and removed from the UI so the working behaviour of the original
-#     workflow is preserved unchanged.
-#   - output_suffix added at the top (appended to the artifact name).
+#     (main → m/, general → g/, special → s/), matching the logic of
+#     build-cf-wa350-final. Missing subfolders are tolerated.
+#   - output_suffix added at the top of the workflow_dispatch inputs
+#     (appended to the artifact name, same pattern as build-cf-wa350-final).
+#   - the four old building-helper steps (import, inject files, skip files,
+#     import theme, skip theme) are consolidated into a single profile-driven
+#     "Import assets from building-helper" step.
+#   - all cherry-pick / DTS / .config hard gates from v8 are preserved intact.
 
 on:
   workflow_dispatch:
@@ -29,6 +112,50 @@ on:
         required: false
         default: ''
         type: string
+      base_branch:
+        description: "Base branch of the integration build (device commit = PR #25040 head)"
+        required: false
+        default: comfast-cf-wa350-support
+        type: choice
+        options:
+          - comfast-cf-wa350-support
+          - k1-qca8k-stats
+          - main
+      kernel_branch:
+        description: "Branch carrying the kernel patches (generic-leds-wired-rate-activity); commits above merge-base with the base branch are picked"
+        required: false
+        default: k1-qca8k-v13
+        type: string
+      include_kernel_patches:
+        description: "Cherry-pick the kernel_branch commit range (744 v7 stats64+.teardown + 835 v4 rate_threshold/afterglow + 423/424 mac80211 tpt + 706 refresh + base-files 0001)"
+        required: false
+        default: true
+        type: boolean
+      include_pr25474:
+        description: "Cherry-pick PR #25474 (patch 460 macronix .name restore)"
+        required: false
+        default: true
+        type: boolean
+      include_pr25477:
+        description: "Cherry-pick PR #25477 (patch 731 ar8216 guard; required for explicit-mdio DTS, harmless regression witness on legacy mapping)"
+        required: false
+        default: true
+        type: boolean
+      include_pr25040:
+        description: "Cherry-pick PR #25040 (device commit; skipped automatically when the base already carries its content)"
+        required: false
+        default: true
+        type: boolean
+      dts_file:
+        description: DTS variant from root dts/ folder on ci-wa350
+        required: false
+        default: qca9563_comfast_cf-wa350.dts
+        type: choice
+        options:
+          - qca9563_comfast_cf-wa350.dts
+          - qca9563_comfast_cf-wa350-internal-mdio.dts
+          - qca9563_comfast_cf-wa350-explicit-mdio.dts
+          - qca9563_comfast_cf-wa350-external.dts
       asset_profile:
         description: 'Asset profile to import (m/g/s folder from building-helper)'
         required: true
@@ -41,13 +168,6 @@ on:
 
 env:
   BUILDING_HELPER_REPO: https://github.com/haddad2inc/building-helper.git
-  BASE_BRANCH: comfast-cf-wa350-support
-  KERNEL_BRANCH: generic-leds-wired-rate-activity
-  INCLUDE_KERNEL_PATCHES: "true"
-  INCLUDE_PR25474: "true"
-  INCLUDE_PR25477: "true"
-  INCLUDE_PR25040: "true"
-  DTS_FILE: qca9563_comfast_cf-wa350.dts
 
 jobs:
   build:
@@ -58,7 +178,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: haddad2inc/openwrt
-          ref: ${{ env.BASE_BRANCH }}
+          ref: ${{ inputs.base_branch }}
           fetch-depth: 0
 
       - name: Fetch branches used by the gates
@@ -66,13 +186,13 @@ jobs:
           set +e
           mkdir -p logs
           git fetch origin main \
-                           "${{ env.KERNEL_BRANCH }}" \
+                           "${{ inputs.kernel_branch }}" \
                            comfast-cf-wa350-support \
                            ath79-mtd-mx25l12805d-restore-name \
                            ath79-ar8216-internal-mdio || { echo "::error::fetch branches failed"; exit 1; }
           {
-            echo "base_branch    = ${{ env.BASE_BRANCH }} $(git rev-parse HEAD)"
-            echo "kernel_branch  = ${{ env.KERNEL_BRANCH }} $(git rev-parse origin/${{ env.KERNEL_BRANCH }} 2>/dev/null || git rev-parse ${{ env.KERNEL_BRANCH }})"
+            echo "base_branch    = ${{ inputs.base_branch }} $(git rev-parse HEAD)"
+            echo "kernel_branch  = ${{ inputs.kernel_branch }} $(git rev-parse origin/${{ inputs.kernel_branch }} 2>/dev/null || git rev-parse ${{ inputs.kernel_branch }})"
             echo "PR-25040 head  = $(git rev-parse origin/comfast-cf-wa350-support)"
             echo "PR-25474 head  = $(git rev-parse origin/ath79-mtd-mx25l12805d-restore-name)"
             echo "PR-25477 head  = $(git rev-parse origin/ath79-ar8216-internal-mdio)"
@@ -88,10 +208,20 @@ jobs:
           git config user.email "haddad2inc@gmail.com"
           : > logs/picks.txt
           BASE_SHA="$(git rev-parse HEAD)"
+          # the one file the Inject-DTS step overwrites from the asset branch
+          # and sha256-gates; a cherry-pick conflict confined to it carries no
+          # information (gate 6 below).
           ASSET_DTS="target/linux/ath79/dts/qca9563_comfast_cf-wa350.dts"
 
           log() { echo "$1" | tee -a logs/picks.txt; }
 
+          # gate 3: blob-level state of everything the commit touches, versus HEAD.
+          # The raw diff gives the post-image blob sha of each path, so this compares
+          # CONTENT and not patch text: a rebased/reworded twin whose files already sit
+          # in the base is recognised even when its patch-id differs.
+          #   0 = every touched blob is already byte-identical at HEAD (nothing to apply)
+          #   1 = some blobs identical, some not (the pick will merge only the remainder)
+          #   2 = no blob identical (plain pick)
           content_state() {
             local m1 m2 s1 s2 st p1 p2 same=0 diff=0
             while read -r m1 m2 s1 s2 st p1 p2; do
@@ -129,7 +259,7 @@ jobs:
               return 0
             fi
             [ "$cs" -eq 1 ] && log "PARTIAL-CONTENT-IN-BASE $label $sha (some blobs already identical; picking the rest)"
-            local out rc
+            local out rc cs
             out="$(git cherry-pick -x "$sha" 2>&1)"
             rc=$?
             printf '%s\n' "$out" >> logs/picks.txt
@@ -137,6 +267,9 @@ jobs:
               log "PICKED $label $sha"
               return 0
             fi
+            # gate 4: git refuses to create an empty commit and exits non-zero.
+            # Proof that this is "empty" and not "conflict": no CHERRY_PICK_HEAD was
+            # recorded and the index/worktree carry no change and no unmerged path.
             if { printf '%s' "$out" | grep -qi 'now empty'; } \
                || { ! git rev-parse -q --verify CHERRY_PICK_HEAD >/dev/null \
                     && git diff-index --quiet HEAD -- 2>/dev/null \
@@ -145,6 +278,12 @@ jobs:
               log "EMPTY-AFTER-PICK $label $sha (change already present; skipped, nothing lost)"
               return 0
             fi
+            # gate 6: ASSET-CONFLICT - the only unmerged path is the
+            # asset-managed DTS, which the Inject-DTS step replaces wholesale
+            # from the asset branch and sha256-gates. Resolve to the BASE side
+            # (newest reviewed content), then continue - or skip when nothing
+            # else remains to commit. Any other conflicted path falls through
+            # to the hard fail below, unchanged.
             UNMERGED="$(git diff --name-only --diff-filter=U)"
             if [ -n "$UNMERGED" ] && [ "$UNMERGED" = "$ASSET_DTS" ]; then
               git checkout --ours -- "$ASSET_DTS" 2>/dev/null && git add -- "$ASSET_DTS"
@@ -176,8 +315,8 @@ jobs:
             exit 1
           }
 
-          if [ "${{ env.INCLUDE_KERNEL_PATCHES }}" = "true" ]; then
-            KB="${{ env.KERNEL_BRANCH }}"
+          if [ "${{ inputs.include_kernel_patches }}" = "true" ]; then
+            KB="${{ inputs.kernel_branch }}"
             git rev-parse -q --verify "origin/$KB" >/dev/null && KB="origin/$KB"
             MB="$(git merge-base "$KB" HEAD)"
             N="$(git rev-list --count "$MB..$KB")"
@@ -190,9 +329,9 @@ jobs:
               log "KERNEL-RANGE-EMPTY $KB (nothing above merge-base)"
             fi
           fi
-          [ "${{ env.INCLUDE_PR25474 }}" = "true" ] && pick origin/ath79-mtd-mx25l12805d-restore-name PR-25474
-          [ "${{ env.INCLUDE_PR25477 }}" = "true" ] && pick origin/ath79-ar8216-internal-mdio PR-25477
-          [ "${{ env.INCLUDE_PR25040 }}" = "true" ] && pick origin/comfast-cf-wa350-support PR-25040
+          [ "${{ inputs.include_pr25474 }}" = "true" ] && pick origin/ath79-mtd-mx25l12805d-restore-name PR-25474
+          [ "${{ inputs.include_pr25477 }}" = "true" ] && pick origin/ath79-ar8216-internal-mdio PR-25477
+          [ "${{ inputs.include_pr25040 }}" = "true" ] && pick origin/comfast-cf-wa350-support PR-25040
           log "HEAD-NOW $(git rev-parse HEAD) (base was $BASE_SHA)"
           git log --oneline "$BASE_SHA..HEAD" | tee -a logs/picks.txt
           exit 0
@@ -202,7 +341,7 @@ jobs:
           set +e
           git fetch --depth 1 origin ci-wa350 || exit 1
           mkdir -p /tmp/assets
-          F="${{ env.DTS_FILE }}"
+          F="${{ inputs.dts_file }}"
           if git show "origin/main:dts/$F" > /tmp/assets/dts 2>/dev/null && [ -s /tmp/assets/dts ]; then
             DTS_SRC="main"
           elif git show "origin/ci-wa350:dts/$F" > /tmp/assets/dts 2>/dev/null && [ -s /tmp/assets/dts ]; then
@@ -222,19 +361,19 @@ jobs:
           D=target/linux/ath79/dts/qca9563_comfast_cf-wa350.dts
           cp /tmp/assets/dts "$D"
           S="$(sha256sum "$D" | cut -d' ' -f1)"
-          case "${{ env.DTS_FILE }}" in
+          case "${{ inputs.dts_file }}" in
             *external*)      V=EXTERNAL-MDIO;         E=c7cd13705d797229600a2d85f180fdb6736f39b493a7205c0211c746aaf015ca ;;
             *explicit*)      V=INTERNAL-EXPLICIT;     E=a755306340109abe2c63c47adb4144131011e12913f7ee3781c095be1dbe637e ;;
             *internal-mdio*) V=INTERNAL-MDIO-PRE-SWAP; E=1544a5482fabf497479b6acb6d21ec68ab450a7f253239b84ff61fd843c9bb30 ;;
             *)               V=INTERNAL-LEGACY;       E=c393c70bda0890e79ee4263306a2ac3a1ea2ad72cc27e22334a125960374778d ;;
           esac
-          { echo "variant    = $V"; echo "dts_file   = ${{ env.DTS_FILE }}"; echo "dts_sha256 = $S"; } | tee logs/variant.txt
+          { echo "variant    = $V"; echo "dts_file   = ${{ inputs.dts_file }}"; echo "dts_sha256 = $S"; } | tee logs/variant.txt
           [ "$S" = "$E" ] || { echo "::error::DTS sha mismatch"; exit 1; }
           echo "V=$V" >> "$GITHUB_ENV"
           exit 0
 
       # =====================================================================
-      # Profile-driven asset import (main → m/, general → g/, special → s/)
+      # v9: profile-driven asset import (main → m/, general → g/, special → s/)
       # Replaces the old include_files / attach_theme pair.
       # Missing subfolders are tolerated (files-only or theme-only profiles).
       # =====================================================================
@@ -331,6 +470,7 @@ jobs:
 
           # ---------------------------------------------------------------
           # 3. HARD-FORCE lldpd + watchcat (pre-defconfig)
+          #    Remove any existing y/m/not-set line, then append =y.
           # ---------------------------------------------------------------
           force_enable_pre() {
             local sym="$1"
@@ -350,7 +490,10 @@ jobs:
           make defconfig || exit 1
 
           # ---------------------------------------------------------------
-          # 5. re-force lldpd + watchcat if defconfig dropped them
+          # 5. re-force lldpd + watchcat if defconfig dropped them.
+          #    A single re-run of defconfig is enough: OpenWrt only drops a
+          #    select if its dependencies are missing, and those come from
+          #    the feeds we just installed.
           # ---------------------------------------------------------------
           need_redefconfig=0
           force_enable_post() {
@@ -371,6 +514,8 @@ jobs:
           if [ "$need_redefconfig" -eq 1 ]; then
             echo "--- Re-running defconfig to merge re-forced lldpd/watchcat ---" | tee -a logs/config-proof.txt
             make defconfig || exit 1
+            # Final sanity: if defconfig STILL drops them, fail loudly instead
+            # of silently producing an image without them.
             if ! grep -q '^CONFIG_PACKAGE_lldpd=y' .config || \
                ! grep -q '^CONFIG_PACKAGE_watchcat=y' .config; then
               echo "::error::defconfig refuses to keep lldpd/watchcat=y - dependencies likely missing on this branch"
@@ -382,7 +527,7 @@ jobs:
           # ---------------------------------------------------------------
           # 6. proofs
           # ---------------------------------------------------------------
-          grep -E '^CONFIG_TARGET_PROFILE=|^CONFIG_PACKAGE_kmod-dsa-qca8k=|^CONFIG_TARGET_ROOTFS_INITRAMFS=|^CONFIG_GCC_VERSION=|^CONFIG_PACKAGE_luci=|^CONFIG_PACKAGE_luci-theme-enan-dashboard=|^CONFIG_PACKAGE_lldpd=|^CONFIG_PACKAGE_watchcat=' .config | tee -a logs/config-proof.txt
+          grep -E '^CONFIG_TARGET_PROFILE=|^CONFIG_PACKAGE_kmod-dsa-qca8k=|^CONFIG_TARGET_ROOTFS_INITRAMFS=|^CONFIG_GCC_VERSION=|^CONFIG_PACKAGE_luci=|^CONFIG_PACKAGE_ethtool=|^CONFIG_PACKAGE_luci-theme-enan-dashboard=|^CONFIG_PACKAGE_lldpd=|^CONFIG_PACKAGE_watchcat=' .config | tee -a logs/config-proof.txt
 
           grep -q '^CONFIG_PACKAGE_luci=y'     .config || { echo "::error::luci missing after defconfig";     exit 1; }
           grep -q '^CONFIG_PACKAGE_lldpd=y'    .config || { echo "::error::lldpd missing after defconfig";    exit 1; }
@@ -412,16 +557,16 @@ jobs:
         run: |
           set +e
           {
-            echo "workflow       = build-cf-wa350-final v13"
+            echo "workflow       = build-cf-wa350-full v9"
             echo "output_suffix  = '${{ inputs.output_suffix }}'"
             echo "asset_profile  = ${{ inputs.asset_profile }}"
-            echo "base_branch    = ${{ env.BASE_BRANCH }} ($(git rev-parse ${{ env.BASE_BRANCH }} 2>/dev/null || git rev-parse origin/${{ env.BASE_BRANCH }}))"
-            echo "kernel_branch  = ${{ env.KERNEL_BRANCH }} ($(git rev-parse ${{ env.KERNEL_BRANCH }} 2>/dev/null || git rev-parse origin/${{ env.KERNEL_BRANCH }}))"
-            echo "dts_file       = ${{ env.DTS_FILE }}"
-            echo "include_kernel_patches = ${{ env.INCLUDE_KERNEL_PATCHES }}"
-            echo "include_pr25474        = ${{ env.INCLUDE_PR25474 }}"
-            echo "include_pr25477        = ${{ env.INCLUDE_PR25477 }}"
-            echo "include_pr25040        = ${{ env.INCLUDE_PR25040 }}"
+            echo "base_branch    = ${{ inputs.base_branch }} ($(git rev-parse ${{ inputs.base_branch }} 2>/dev/null || git rev-parse origin/${{ inputs.base_branch }}))"
+            echo "kernel_branch  = ${{ inputs.kernel_branch }} ($(git rev-parse ${{ inputs.kernel_branch }} 2>/dev/null || git rev-parse origin/${{ inputs.kernel_branch }}))"
+            echo "dts_file       = ${{ inputs.dts_file }}"
+            echo "include_kernel_patches = ${{ inputs.include_kernel_patches }}"
+            echo "include_pr25474        = ${{ inputs.include_pr25474 }}"
+            echo "include_pr25477        = ${{ inputs.include_pr25477 }}"
+            echo "include_pr25040        = ${{ inputs.include_pr25040 }}"
             echo "force_pkgs     = CONFIG_PACKAGE_lldpd=y CONFIG_PACKAGE_watchcat=y"
             echo "heads:"; cat logs/heads.txt 2>/dev/null
             echo "gates:"; cat logs/picks.txt 2>/dev/null | grep -E 'ALREADY-IN-BASE|EQUIVALENT-IN-BASE|TREE-ALREADY-IN-BASE|EMPTY-AFTER-PICK|ASSET-CONFLICT|PICKED|KERNEL-RANGE|HEAD-NOW'
@@ -440,7 +585,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: cf-wa350-final-${{ inputs.asset_profile }}${{ inputs.output_suffix != '' && format('-{0}', inputs.output_suffix) || '' }}-${{ github.run_number }}
+          name: cf-wa350-full-${{ inputs.dts_file }}-${{ inputs.asset_profile }}${{ inputs.output_suffix != '' && format('-{0}', inputs.output_suffix) || '' }}-${{ github.run_number }}
           path: |
             logs/
             bin/targets/ath79/generic/*cf-wa350*
