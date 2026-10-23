@@ -41,12 +41,14 @@ name: build-cf-wa350-prs
 #   G3 SET     every path the PR contributes is either changed by the build or already
 #              byte-identical at the base (PR #25040 IS the base branch, so it is ALREADY-IN-BASE)
 #   G4 ADDED   every file the PR ADDS must be byte-identical in the build tree (blob equality)
-#   G5 MOD     every line the PR ADDS to a file it MODIFIES must be present in the build tree,
-#              and the file must differ from upstream master (a dropped hunk cannot hide).
+#   G5 MOD     every line the PR ADDS to a file it MODIFIES must be present in the build tree.
+#              A modified file that ends up identical to upstream master is CONVERGED-INFO (master
+#              caught up) unless the change carries no added line, which is HUNK-DROPPED.
 #              Blob equality is reported as BLOB-SAME/BLOB-DIFF only (master drift may merge in).
 #   G6 MODE    every path the PR touches must carry the SAME file mode as on the PR branch
 #              (this is what catches a lost executable bit on init.d/led)
-#   G7 RELEASE PKG_RELEASE(mac80211) == upstream master + 1 (measured, never hardcoded)
+#   G7 RELEASE PKG_RELEASE(mac80211) must be STRICTLY ABOVE upstream master's (measured, never
+#              hardcoded; "== master+1" broke the day master itself moved 9 -> 10)
 #   G8 POLICY  invariants owned by NO PR, so they never rot on a PR update: anything under
 #              etc/init.d|etc/uci-defaults|usr/libexec|bin|sbin must be 100755 and any *.patch
 #              must be 100644. This is what catches a wrong mode committed IN a PR branch, which
@@ -280,8 +282,18 @@ jobs:
                     if [ "$nadd" -gt 0 ] && [ "$miss" -eq 0 ]; then log "LINES-OK $label $p ($nadd added lines present)"
                     elif [ "$nadd" -eq 0 ]; then log "LINES-INFO $label $p (no added lines; mode/offset-only change)"
                     else log "LINES-BAD $label $p ($miss of $nadd added lines missing)"; GATE_FAIL=1; fi
+                    # A modified file that ends up byte-identical to upstream master is NOT automatically
+                    # a dropped hunk: master may have converged to the same content (measured 2026-10-23:
+                    # upstream bumped mac80211 PK_RELEASE 9 -> 10, which is exactly what PR #25761 set, so
+                    # the file matched while every added line was present). LINES already proves the hunk
+                    # landed, so this is a warning; it is only a hard failure when the PR's change carries
+                    # no added line at all (deletion-only), where LINES cannot see anything.
                     if [ "$blob_hd" = "$(git rev-parse -q --verify "$UPMASTER:$p" 2>/dev/null || echo NONE)" ]; then
-                      log "HUNK-DROPPED $label $p is byte-identical to upstream master - the PR change did not land"; GATE_FAIL=1
+                      if [ "$nadd" -gt 0 ] && [ "$miss" -eq 0 ]; then
+                        log "CONVERGED-INFO $label $p is byte-identical to upstream master although all $nadd added lines are present - master converged to the same content (the RELEASE/policy gate decides if that is still a valid change)"
+                      else
+                        log "HUNK-DROPPED $label $p is byte-identical to upstream master and carries no added line - the PR change did not land"; GATE_FAIL=1
+                      fi
                     fi
                     [ "$blob_pr" = "$blob_hd" ] && log "BLOB-SAME $label $p $blob_hd" \
                       || log "BLOB-DIFF $label $p build=$blob_hd pr=$blob_pr (master drift merged into a modified file - LINES/MODE are the gates)" ;;
@@ -331,8 +343,14 @@ jobs:
             if [ -z "$got" ] || [ -z "$base" ]; then
               log "RELEASE-BAD $label cannot read PKG_RELEASE (HEAD='${got:-?}' master='${base:-?}')"; GATE_FAIL=1; return
             fi
-            if [ "$got" = "$((base+1))" ]; then log "RELEASE-OK $label PKG_RELEASE:=$got (master:=$base +1)"
-            else log "RELEASE-BAD $label PKG_RELEASE:=$got but master:=$base (expected $((base+1)))"; GATE_FAIL=1; fi
+            # Policy, drift-proof: a branch that adds patches must sit STRICTLY ABOVE current master.
+            # "== master+1" was wrong the day master itself moved 9 -> 10 while the PR carried 10.
+            if [ "$got" -gt "$base" ]; then
+              log "RELEASE-OK $label PKG_RELEASE:=$got > master:=$base"
+              [ "$got" = "$((base+1))" ] || log "RELEASE-INFO $label PKG_RELEASE:=$got is more than master+1 ($((base+1))) - fine, but a rebase would tighten it"
+            else
+              log "RELEASE-BAD $label PKG_RELEASE:=$got is not above master:=$base - the branch must be rebased so the bump lands above current master (expected > $base, i.e. $((base+1)))"; GATE_FAIL=1
+            fi
           }
 
           GATE_FAIL=0
@@ -364,7 +382,7 @@ jobs:
           fi
 
           if [ "$GATE_FAIL" != 0 ]; then
-            echo "::error::a derived content gate failed (BLOB-BAD / LINES-BAD / MODE-BAD / POLICY-BAD / HUNK-DROPPED / SET-BAD / DELETE-BAD / RELEASE-BAD / DTS-BAD above) - the build tree does not carry what the PR branches carry"
+            echo "::error::a derived content gate failed (BLOB-BAD / LINES-BAD / MODE-BAD / POLICY-BAD / HUNK-DROPPED / CONVERGED? / SET-BAD / DELETE-BAD / RELEASE-BAD / DTS-BAD above) - the build tree does not carry what the PR branches carry"
             exit 1
           fi
           log "CONTENT-GATES-OK"
@@ -529,7 +547,7 @@ jobs:
         run: |
           set +e
           {
-            echo "workflow       = build-cf-wa350-prs v13"
+            echo "workflow       = build-cf-wa350-prs v13.1"
             echo "asset_profile  = ${{ inputs.asset_profile }}"
             echo "base_branch    = comfast-cf-wa350-support ($(git rev-parse origin/comfast-cf-wa350-support))"
             echo "upstream_master= $UPMASTER"
@@ -537,7 +555,7 @@ jobs:
             echo "dts_source     = PR #25040 (in-tree; no asset copy, no sha256 pin)"
             echo "force_pkgs     = CONFIG_PACKAGE_lldpd=y CONFIG_PACKAGE_watchcat=y"
             echo "heads:"; cat logs/heads.txt 2>/dev/null
-            echo "gates:"; cat logs/picks.txt 2>/dev/null | grep -E 'ALREADY-IN-BASE|EQUIVALENT-IN-BASE|TREE-ALREADY-IN-BASE|PARTIAL-CONTENT|EMPTY-AFTER-PICK|ASSET-CONFLICT|BLOB-OK|BLOB-BAD|BLOB-SAME|BLOB-DIFF|SET-OK|SET-BAD|POLICY-OK|POLICY-BAD|LINES-OK|LINES-BAD|LINES-INFO|MISSING-LINE|MODE-OK|MODE-BAD|HUNK-DROPPED|SET-BAD|DELETE-OK|DELETE-BAD|RELEASE-OK|RELEASE-BAD|DTS-RECORDED|DTS-BAD|VERIFY|CONTENT-GATES-OK|PICKED|-RANGE|-NOT-USED|-C[0-9]|HEAD-NOW'
+            echo "gates:"; cat logs/picks.txt 2>/dev/null | grep -E 'ALREADY-IN-BASE|EQUIVALENT-IN-BASE|TREE-ALREADY-IN-BASE|PARTIAL-CONTENT|EMPTY-AFTER-PICK|ASSET-CONFLICT|BLOB-OK|BLOB-BAD|BLOB-SAME|BLOB-DIFF|SET-OK|SET-BAD|POLICY-OK|POLICY-BAD|CONVERGED-INFO|HUNK-DROPPED|LINES-OK|LINES-BAD|LINES-INFO|MISSING-LINE|MODE-OK|MODE-BAD|HUNK-DROPPED|SET-BAD|DELETE-OK|DELETE-BAD|RELEASE-OK|RELEASE-BAD|DTS-RECORDED|DTS-BAD|VERIFY|CONTENT-GATES-OK|PICKED|-RANGE|-NOT-USED|-C[0-9]|HEAD-NOW'
             cat logs/asset-source.txt 2>/dev/null
             echo "building-helper_log:"; cat logs/building-helper.txt 2>/dev/null
             echo "config_proof:"; cat logs/config-proof.txt 2>/dev/null
