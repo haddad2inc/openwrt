@@ -9,6 +9,7 @@
 #include <linux/etherdevice.h>
 #include <linux/if_vlan.h>
 #include <linux/inetdevice.h>
+#include <linux/mfd/syscon.h>
 #include <linux/platform_device.h>
 #include <linux/rhashtable.h>
 #include <linux/of_net.h>
@@ -149,7 +150,7 @@ static int rtldsa_mdio_loaded(void)
 	return 0;
 }
 
-static int rtldsa_ports_probe(struct rtl838x_switch_priv *priv)
+static int rtldsa_ports_probe(struct otto_dsa_priv *priv)
 {
 	struct device_node *dn, *phy_node, *led_node;
 	u32 pn;
@@ -163,6 +164,7 @@ static int rtldsa_ports_probe(struct rtl838x_switch_priv *priv)
 	led_node = of_find_compatible_node(NULL, NULL, "realtek,rtl9300-leds");
 
 	for_each_node_by_name(dn, "port") {
+		const char *managed;
 		u32 led_set;
 		char led_set_str[16] = {0};
 
@@ -195,6 +197,10 @@ static int rtldsa_ports_probe(struct rtl838x_switch_priv *priv)
 		}
 
 		priv->ports[pn].phy = !!phy_node;
+		/* In-band status as phylink reads it */
+		if (!of_property_read_string(dn, "managed", &managed) &&
+		    !strcmp(managed, "in-band-status"))
+			priv->ports[pn].inband = true;
 	}
 
 	return 0;
@@ -202,7 +208,7 @@ static int rtldsa_ports_probe(struct rtl838x_switch_priv *priv)
 
 // Currently Unused
 // /* Allocate a 64 bit octet counter located in the LOG HW table */
-// static int rtl83xx_octet_cntr_alloc(struct rtl838x_switch_priv *priv)
+// static int rtl83xx_octet_cntr_alloc(struct otto_dsa_priv *priv)
 // {
 // 	int idx;
 
@@ -220,7 +226,7 @@ static int rtldsa_ports_probe(struct rtl838x_switch_priv *priv)
 // 	return idx;
 // }
 
-int rtl83xx_port_is_under(const struct net_device *dev, struct rtl838x_switch_priv *priv)
+int rtl83xx_port_is_under(const struct net_device *dev, struct otto_dsa_priv *priv)
 {
 	/* Is the lower network device a DSA user network device of our RTL930X-switch?
 	 * Unfortunately we cannot just follow dev->dsa_prt as this is only set for the
@@ -242,9 +248,33 @@ int rtl83xx_port_is_under(const struct net_device *dev, struct rtl838x_switch_pr
 	return -EINVAL;
 }
 
+/*
+ * A port with a PHY and without in-band status takes its link state from
+ * phylib, which polls the PHY once a second. Reporting a MAC link loss to
+ * phylink would make it take the link down and then straight back up from the
+ * PHY state of the last poll, until the next poll reads the link as down. Let
+ * phylib read the PHY now instead, which also reports a new link without
+ * waiting for the poll.
+ *
+ * With in-band status, phylink takes the link state also from the PCS, and
+ * needs the MAC link change to resolve the link again when the PCS comes up
+ * after the PHY. The SFP ports have no PHY in the device tree, so the PHY of
+ * an SFP module, which goes away with the module, is not used here.
+ */
+static void rtldsa_port_link_change(struct dsa_switch *ds, int port,
+				    const struct rtldsa_port *p, bool up)
+{
+	struct dsa_port *dp = dsa_to_port(ds, port);
+
+	if (p->phy && !p->inband && dp->user && dp->user->phydev)
+		phy_mac_interrupt(dp->user->phydev);
+	else
+		dsa_port_phylink_mac_change(ds, port, up);
+}
+
 static irqreturn_t rtldsa_switch_irq(int irq, void *dev_id)
 {
-	struct rtl838x_switch_priv *priv;
+	struct otto_dsa_priv *priv;
 	struct dsa_switch *ds = dev_id;
 	u64 link, ports;
 
@@ -258,7 +288,8 @@ static irqreturn_t rtldsa_switch_irq(int irq, void *dev_id)
 
 	for (int port = 0; port < priv->r->cpu_port; port++)
 		if (ports & BIT_ULL(port))
-			dsa_port_phylink_mac_change(ds, port, link & BIT_ULL(port));
+			rtldsa_port_link_change(ds, port, &priv->ports[port],
+						link & BIT_ULL(port));
 
 	return IRQ_HANDLED;
 }
@@ -298,7 +329,7 @@ static int rtldsa_ethernet_loaded(struct platform_device *pdev)
 
 static int rtl83xx_sw_probe(struct platform_device *pdev)
 {
-	struct rtl838x_switch_priv *priv;
+	struct otto_dsa_priv *priv;
 	struct device *dev = &pdev->dev;
 	const struct rtldsa_config *r;
 	u64 bpdu_mask;
@@ -327,8 +358,12 @@ static int rtl83xx_sw_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	priv->r = r;
-	memset(priv->lag_primary, -1, sizeof(priv->lag_primary));
+	priv->map = syscon_node_to_regmap(dev->of_node);
+	if (IS_ERR(priv->map))
+		return dev_err_probe(dev, PTR_ERR(priv->map),
+				     "no switch register map\n");
 
+	memset(priv->lag_primary, -1, sizeof(priv->lag_primary));
 	priv->l2_uc_map = devm_kcalloc(dev, r->fib_entries, sizeof(*priv->l2_uc_map),
 				       GFP_KERNEL);
 	if (!priv->l2_uc_map)
@@ -443,6 +478,8 @@ static int rtl83xx_sw_probe(struct platform_device *pdev)
 	if (priv->r->lag_switch_init)
 		priv->r->lag_switch_init(priv);
 
+	otto_stats_dbgfs_init(priv);
+
 	return 0;
 
 err_register_l3:
@@ -456,13 +493,16 @@ err_register_switch:
 
 static void rtl83xx_sw_remove(struct platform_device *pdev)
 {
-	struct rtl838x_switch_priv *priv = platform_get_drvdata(pdev);
+	struct otto_dsa_priv *priv = platform_get_drvdata(pdev);
 
 	if (!priv)
 		return;
 
 	/* TODO: */
 	pr_debug("Removing platform driver for rtl83xx-sw\n");
+
+	/* Stop debugfs readers before tearing down the switch. */
+	otto_stats_dbgfs_remove(priv);
 
 	/* unregister notifiers which will create workqueue entries with
 	 * references to the switch structures. Also stop self-arming delayed

@@ -57,6 +57,7 @@
 
 #define RTL838X_SPCL_TRAP_EAPOL_CTRL		(0x6988)
 #define RTL838X_SPCL_TRAP_SWITCH_MAC_CTRL	(0x6998)
+#define RTL838X_VLAN_PORT_AFT			(0x3A00)
 
 /* Switch interrupts */
 #define RTL838X_IMR_GLB				(0x1100)
@@ -115,7 +116,7 @@ static void rtl838x_traffic_disable(int source, int dest)
 }
 
 /* Enables or disables the EEE/EEEP capability of a port */
-static void rtldsa_838x_set_mac_eee(struct rtl838x_switch_priv *priv, int port, bool enable)
+static void rtldsa_838x_set_mac_eee(struct otto_dsa_priv *priv, int port, bool enable)
 {
 	u32 v;
 
@@ -140,7 +141,7 @@ static void rtldsa_838x_set_mac_eee(struct rtl838x_switch_priv *priv, int port, 
 	priv->ports[port].eee_enabled = enable;
 }
 
-static void rtl838x_init_eee(struct rtl838x_switch_priv *priv, bool enable)
+static void rtl838x_init_eee(struct otto_dsa_priv *priv, bool enable)
 {
 	pr_debug("Setting up EEE, state: %d\n", enable);
 	sw_w32_mask(0x4, 0, RTL838X_SMI_GLB_CTRL);
@@ -210,11 +211,12 @@ const struct rtldsa_config rtldsa_838x_cfg = {
 	.stat_rst = RTL838X_STAT_RST,
 	.stat_init = otto_stats_838x_init,
 	.stat_port_std_mib = RTL838X_STAT_PORT_STD_MIB,
-	.mib_desc = &rtldsa_838x_mib_desc,
+	.mib_desc = &otto_stats_838x_mib_desc,
+	.drop_desc = &otto_stats_838x_drop_desc,
 	.stat_counters_lock = otto_stats_counters_lock_register,
 	.stat_counters_unlock = otto_stats_counters_unlock_register,
 	.stat_update_counters_atomically = otto_stats_update_counters_atomically,
-	.stat_counter_poll_interval = RTLDSA_COUNTERS_POLL_INTERVAL,
+	.stat_counter_poll_interval = OTTO_STATS_COUNTERS_POLL_INTERVAL,
 	.port_iso_ctrl = rtl838x_port_iso_ctrl,
 	.traffic_enable = rtl838x_traffic_enable,
 	.traffic_disable = rtl838x_traffic_disable,
@@ -232,16 +234,25 @@ const struct rtldsa_config rtldsa_838x_cfg = {
 	.imr_glb = RTL838X_IMR_GLB,
 	.n_counters = 128,
 	.n_pie_blocks = 12,
+	.pie_cls_flower = true,
 	.port_ignore = 0x1f,
 	.vlan_tables_read = otto_vlan_838x_tables_read,
 	.vlan_set_tagged = otto_vlan_838x_set_tagged,
 	.vlan_set_untagged = otto_vlan_838x_set_untagged,
-	.mac_force_mode_mask = RTL83XX_FORCE_EN | RTL83XX_FORCE_LINK_EN,
+	.mac_force_mode = {
+		.force_en_mask = RTL83XX_FORCE_EN,
+		.link_up_mask = RTL83XX_FORCE_LINK_EN,
+		.duplex_mask = RTL838X_DUPLEX_MODE,
+		.speed_mask = RTL838X_SPEED_MASK,
+		.tx_pause_mask = RTL838X_TX_PAUSE_EN,
+		.rx_pause_mask = RTL838X_RX_PAUSE_EN,
+	},
 	.mac_force_mode_ctrl = rtl838x_mac_force_mode_ctrl,
 	.mac_link_sts = RTL838X_MAC_LINK_STS,
 	.vlan_profile_get = otto_vlan_838x_profile_get,
 	.vlan_profile_dump = otto_vlan_838x_profile_dump,
 	.vlan_profile_setup = otto_vlan_838x_profile_setup,
+	.vlan_port_aft = RTL838X_VLAN_PORT_AFT,
 	.vlan_fwd_on_inner = otto_vlan_838x_port_forward_on_inner,
 	.set_vlan_igr_filter = rtl838x_set_igr_filter,
 	.set_vlan_egr_filter = rtl838x_set_egr_filter,
@@ -266,6 +277,7 @@ const struct rtldsa_config rtldsa_838x_cfg = {
 	.read_cam = otto_l2_838x_read_cam,
 	.write_cam = otto_l2_838x_write_cam,
 	.vlan_port_keep_tag_set = otto_vlan_838x_port_keep_tag_set,
+	.vlan_port_qinq_set = otto_vlan_838x_port_qinq_set,
 	.vlan_port_pvidmode_set = otto_vlan_838x_port_pvid_mode_set,
 	.vlan_port_pvid_set = otto_vlan_838x_port_pvid_set,
 	.fast_age = otto_l2_838x_fast_age,
@@ -278,18 +290,18 @@ const struct rtldsa_config rtldsa_838x_cfg = {
 	.l2_hash_key = otto_l2_838x_hash_key,
 	.read_mcast_pmask = otto_l2_838x_read_mcast_pmask,
 	.write_mcast_pmask = otto_l2_838x_write_mcast_pmask,
-	.pie_init = rtl838x_pie_init,
-	.pie_rule_read = rtl838x_pie_rule_read,
-	.pie_rule_write = rtl838x_pie_rule_write,
-	.pie_rule_add = rtl838x_pie_rule_add,
-	.pie_rule_rm = rtl838x_pie_rule_rm,
+	.pie_init = otto_pie_838x_init,
+	.pie_rule_read = otto_pie_838x_rule_read,
+	.pie_rule_write = otto_pie_838x_rule_write,
+	.pie_rule_add = otto_pie_838x_rule_add,
+	.pie_rule_rm = otto_pie_838x_rule_rm,
 	.l2_learning_setup = otto_l2_838x_learning_setup,
 	.packet_cntr_read = otto_stats_838x_packet_cntr_read,
 	.packet_cntr_clear = otto_stats_838x_packet_cntr_clear,
 	.set_receive_management_action = rtl838x_set_receive_management_action,
-	.get_egress_rate = rtldsa_838x_get_egress_rate,
-	.set_egress_rate = rtldsa_838x_set_egress_rate,
-	.qos_init = rtldsa_838x_qos_init,
+	.get_egress_rate = otto_qos_838x_get_egress_rate,
+	.set_egress_rate = otto_qos_838x_set_egress_rate,
+	.qos_init = otto_qos_838x_init,
 	.lag_set_distribution_algorithm = otto_lag_838x_set_distribution_algorithm,
 	.lag_set_port_members = otto_lag_838x_set_port_members,
 	.lag_setup_algomask = otto_lag_83xx_setup_algomask,
