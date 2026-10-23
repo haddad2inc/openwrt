@@ -4,14 +4,15 @@
 #define _OTTO_TC_H
 
 #include <linux/types.h>
+#include <net/pkt_cls.h>
 
 struct dsa_switch;
 struct flow_action_entry;
 struct flow_cls_offload;
-struct rtl838x_switch_priv;
+struct otto_dsa_priv;
 
-int otto_tc_init(struct rtl838x_switch_priv *priv);
-void otto_tc_cleanup(struct rtl838x_switch_priv *priv);
+int otto_tc_init(struct otto_dsa_priv *priv);
+void otto_tc_cleanup(struct otto_dsa_priv *priv);
 
 int otto_tc_cls_flower_add(struct dsa_switch *ds, int port,
 			   struct flow_cls_offload *cls, bool ingress);
@@ -32,5 +33,8 @@ int otto_tc_931x_port_rate_police_add(struct dsa_switch *ds, int port,
 int otto_tc_931x_port_rate_police_del(struct dsa_switch *ds, int port,
 				      struct flow_cls_offload *cls,
 				      bool ingress);
+
+int otto_tc_port_setup_tc(struct dsa_switch *ds, int port, enum tc_setup_type type,
+			  void *type_data);
 
 #endif /* _OTTO_TC_H */
