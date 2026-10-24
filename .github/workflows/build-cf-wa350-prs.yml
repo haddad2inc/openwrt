@@ -491,6 +491,8 @@ jobs:
           }
           force_enable_pre "CONFIG_PACKAGE_lldpd"
           force_enable_pre "CONFIG_PACKAGE_watchcat"
+          force_enable_pre "CONFIG_PACKAGE_luci-app-watchcat"
+          #CONFIG_PACKAGE_luci-app-watchcat
           ./scripts/feeds update -a >/dev/null 2>&1
           ./scripts/feeds install -a >/dev/null 2>&1
           make defconfig || exit 1
@@ -509,10 +511,12 @@ jobs:
           }
           force_enable_post "CONFIG_PACKAGE_lldpd"
           force_enable_post "CONFIG_PACKAGE_watchcat"
+          force_enable_post "CCONFIG_PACKAGE_luci-app-watchcat"
           if [ "$need_redefconfig" -eq 1 ]; then
             echo "--- Re-running defconfig to merge re-forced lldpd/watchcat ---" | tee -a logs/config-proof.txt
             make defconfig || exit 1
             if ! grep -q '^CONFIG_PACKAGE_lldpd=y' .config || \
+               ! grep -q '^CCONFIG_PACKAGE_luci-app-watchcat=y' .config || \
                ! grep -q '^CONFIG_PACKAGE_watchcat=y' .config; then
               echo "::error::defconfig refuses to keep lldpd/watchcat=y - dependencies likely missing on this branch"
               grep -E 'lldpd|watchcat' .config | tee -a logs/config-proof.txt
@@ -523,6 +527,7 @@ jobs:
           grep -q '^CONFIG_PACKAGE_luci=y'     .config || { echo "::error::luci missing after defconfig";     exit 1; }
           grep -q '^CONFIG_PACKAGE_lldpd=y'    .config || { echo "::error::lldpd missing after defconfig";    exit 1; }
           grep -q '^CONFIG_PACKAGE_watchcat=y' .config || { echo "::error::watchcat missing after defconfig"; exit 1; }
+          grep -q '^CONFIG_PACKAGE_luci-app-watchcat=y' .config || { echo "::error::watchcat-app missing after defconfig"; exit 1; }
           if [ -d "package/luci-theme-enan-dashboard" ]; then
             if grep -q '^CONFIG_PACKAGE_luci-theme-enan-dashboard=y' .config; then
               echo "✅ luci-theme-enan-dashboard enabled after defconfig." | tee -a logs/config-proof.txt

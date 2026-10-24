@@ -280,6 +280,7 @@ jobs:
           CONFIG_FEED_luci=y
           CONFIG_PACKAGE_lldpd=y
           CONFIG_PACKAGE_luci-app-watchcat=y
+          CONFIG_PACKAGE_watchcat=y
           CONFIG_PACKAGE_uhttpd=y
           SEED
 
@@ -307,6 +308,7 @@ jobs:
               echo "CONFIG_FEED_luci=y"
               echo "CONFIG_PACKAGE_lldpd=y"
               echo "CONFIG_PACKAGE_luci-app-watchcat=y"
+              echo "CONFIG_PACKAGE_watchcat=y"
               echo "CONFIG_PACKAGE_uhttpd=y"
             } >> .config
             for p in $E; do
