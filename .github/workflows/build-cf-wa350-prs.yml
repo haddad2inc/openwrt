@@ -469,9 +469,9 @@ jobs:
 
       # =====================================================================
       # .config finalisation: luci always on, theme only if the profile provided
-      # it, lldpd/watchcat hard-forced before AND after defconfig.
+      # it, lldpd/luci-app-watchcat hard-forced before AND after defconfig.
       # =====================================================================
-      - name: Config from root .config + luci + lldpd/watchcat + defconfig + proofs
+      - name: Config from root .config + luci + lldpd/luci-app-watchcat + defconfig + proofs
         run: |
           set +e
           cp /tmp/assets/.config .config
@@ -490,7 +490,7 @@ jobs:
             echo "${sym}=y" >> .config
           }
           force_enable_pre "CONFIG_PACKAGE_lldpd"
-          force_enable_pre "CONFIG_PACKAGE_watchcat"
+          force_enable_pre "CONFIG_PACKAGE_luci-app-watchcat"
           ./scripts/feeds update -a >/dev/null 2>&1
           ./scripts/feeds install -a >/dev/null 2>&1
           make defconfig || exit 1
@@ -508,21 +508,21 @@ jobs:
             need_redefconfig=1
           }
           force_enable_post "CONFIG_PACKAGE_lldpd"
-          force_enable_post "CONFIG_PACKAGE_watchcat"
+          force_enable_post "CONFIG_PACKAGE_luci-app-watchcat"
           if [ "$need_redefconfig" -eq 1 ]; then
-            echo "--- Re-running defconfig to merge re-forced lldpd/watchcat ---" | tee -a logs/config-proof.txt
+            echo "--- Re-running defconfig to merge re-forced lldpd/luci-app-watchcat ---" | tee -a logs/config-proof.txt
             make defconfig || exit 1
             if ! grep -q '^CONFIG_PACKAGE_lldpd=y' .config || \
-               ! grep -q '^CONFIG_PACKAGE_watchcat=y' .config; then
-              echo "::error::defconfig refuses to keep lldpd/watchcat=y - dependencies likely missing on this branch"
-              grep -E 'lldpd|watchcat' .config | tee -a logs/config-proof.txt
+               ! grep -q '^CONFIG_PACKAGE_luci-app-watchcat=y' .config; then
+              echo "::error::defconfig refuses to keep lldpd/luci-app-watchcat=y - dependencies likely missing on this branch"
+              grep -E 'lldpd|luci-app-watchcat' .config | tee -a logs/config-proof.txt
               exit 1
             fi
           fi
-          grep -E '^CONFIG_TARGET_PROFILE=|^CONFIG_PACKAGE_kmod-dsa-qca8k=|^CONFIG_TARGET_ROOTFS_INITRAMFS=|^CONFIG_GCC_VERSION=|^CONFIG_PACKAGE_luci=|^CONFIG_PACKAGE_ethtool=|^CONFIG_PACKAGE_luci-theme-enan-dashboard=|^CONFIG_PACKAGE_lldpd=|^CONFIG_PACKAGE_watchcat=' .config | tee -a logs/config-proof.txt
+          grep -E '^CONFIG_TARGET_PROFILE=|^CONFIG_PACKAGE_kmod-dsa-qca8k=|^CONFIG_TARGET_ROOTFS_INITRAMFS=|^CONFIG_GCC_VERSION=|^CONFIG_PACKAGE_luci=|^CONFIG_PACKAGE_ethtool=|^CONFIG_PACKAGE_luci-theme-enan-dashboard=|^CONFIG_PACKAGE_lldpd=|^CONFIG_PACKAGE_luci-app-watchcat=' .config | tee -a logs/config-proof.txt
           grep -q '^CONFIG_PACKAGE_luci=y'     .config || { echo "::error::luci missing after defconfig";     exit 1; }
           grep -q '^CONFIG_PACKAGE_lldpd=y'    .config || { echo "::error::lldpd missing after defconfig";    exit 1; }
-          grep -q '^CONFIG_PACKAGE_watchcat=y' .config || { echo "::error::watchcat missing after defconfig"; exit 1; }
+          grep -q '^CONFIG_PACKAGE_luci-app-watchcat=y' .config || { echo "::error::luci-app-watchcat missing after defconfig"; exit 1; }
           if [ -d "package/luci-theme-enan-dashboard" ]; then
             if grep -q '^CONFIG_PACKAGE_luci-theme-enan-dashboard=y' .config; then
               echo "✅ luci-theme-enan-dashboard enabled after defconfig." | tee -a logs/config-proof.txt
@@ -553,7 +553,7 @@ jobs:
             echo "upstream_master= $UPMASTER"
             echo "pr_branches    = $BR_25760 (max $MAX_25760) / $BR_25761 (max $MAX_25761) / $BR_25474 (1) / $BR_25477 (1) / comfast-cf-wa350-support (1)"
             echo "dts_source     = PR #25040 (in-tree; no asset copy, no sha256 pin)"
-            echo "force_pkgs     = CONFIG_PACKAGE_lldpd=y CONFIG_PACKAGE_watchcat=y"
+            echo "force_pkgs     = CONFIG_PACKAGE_lldpd=y CONFIG_PACKAGE_luci-app-watchcat=y"
             echo "heads:"; cat logs/heads.txt 2>/dev/null
             echo "gates:"; cat logs/picks.txt 2>/dev/null | grep -E 'ALREADY-IN-BASE|EQUIVALENT-IN-BASE|TREE-ALREADY-IN-BASE|PARTIAL-CONTENT|EMPTY-AFTER-PICK|ASSET-CONFLICT|BLOB-OK|BLOB-BAD|BLOB-SAME|BLOB-DIFF|SET-OK|SET-BAD|POLICY-OK|POLICY-BAD|CONVERGED-INFO|HUNK-DROPPED|LINES-OK|LINES-BAD|LINES-INFO|MISSING-LINE|MODE-OK|MODE-BAD|HUNK-DROPPED|SET-BAD|DELETE-OK|DELETE-BAD|RELEASE-OK|RELEASE-BAD|DTS-RECORDED|DTS-BAD|VERIFY|CONTENT-GATES-OK|PICKED|-RANGE|-NOT-USED|-C[0-9]|HEAD-NOW'
             cat logs/asset-source.txt 2>/dev/null
