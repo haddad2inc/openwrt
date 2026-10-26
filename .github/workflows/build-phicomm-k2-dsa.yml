@@ -1,13 +1,6 @@
 # build-phicomm-k2-dsa.yml — صورة اختبار Phicomm K2 v22.4 المحوَّل إلى DSA
-#
-# v11:
-#   - استبدال include_files و attach_theme بمُدخل asset_profile:
-#       main    → m/files + m/luci-theme-enan-dashboard
-#       general → g/files + g/luci-theme-enan-dashboard
-#       special → s/files + s/luci-theme-enan-dashboard
-#     خطوة واحدة تنسخ المحتويات، وتتجاهل المجلدات غير الموجودة (يمكن للملف
-#     الشخصي أن يحمل files فقط أو theme فقط).
-#
+
+
 name: build-phicomm-k2-dsa
 
 on:
@@ -45,6 +38,9 @@ on:
 
 env:
   BH_K2_REPO: https://github.com/haddad2inc/bh_k2.git
+  # الحزم التي نريد استبعادها من الصورة النهائية (غير ضرورية للمستخدم)
+  # luci-theme-bootstrap و luci-app-package-manager يتم التعامل معهما أيضًا في خطوة تعديل feeds
+  EXCLUDE_PACKAGES: "luci-theme-bootstrap luci-app-package-manager odhcp6c odhcpd odhcpd-ipv6only"
 
 jobs:
   build:
@@ -68,16 +64,16 @@ jobs:
           fail(){ echo "::error::GATE FAIL: $1"; exit 1; }
           grep -q 'ports {' "$DTS"                              || fail "G1 no ports node in $DTS"
           [ "$(grep -c 'phy-handle = <&ephy' "$DTS")" = "5" ]   || fail "G1 phy-handle count != 5"
-          [ "$(grep -c 'phy-mode = "mii"' "$DTS")" = "5" ]      || fail "G1 phy-mode mii count != 5 (internal NOT accepted)"
+          [ "$(grep -c 'phy-mode = \"mii\"' "$DTS")" = "5" ]      || fail "G1 phy-mode mii count != 5 (internal NOT accepted)"
           grep -q 'mdio-bus {' "$DTS"                           || fail "G1 no mdio-bus node"
-          grep -q 'status = "okay";' "$DTS"                     || fail "G1 mdio-bus not enabled"
-          grep -q 'label = "wan";' "$DTS"                       || fail "G1 no wan port label"
+          grep -q 'status = \"okay\";' "$DTS"                     || fail "G1 mdio-bus not enabled"
+          grep -q 'label = \"wan\";' "$DTS"                       || fail "G1 no wan port label"
           grep -q 'ethernet = <&ethernet>;' "$DTS"              || fail "G1 cpu port lacks ethernet phandle"
           awk '/^define Device\/phicomm_k2-v22.4$/,/^endef$/' "$MK" > logs/mk-block.txt
           grep -q 'kmod-dsa-mt7620' logs/mk-block.txt           || fail "G2 kmod-dsa-mt7620 missing from Device block"
           grep -q -- '-swconfig' logs/mk-block.txt              || fail "G2 -swconfig missing from Device block"
           grep -q 'DEVICE_COMPAT_VERSION := 1.1' logs/mk-block.txt || fail "G2 DEVICE_COMPAT_VERSION missing"
-          grep -A1 'phicomm,k2-v22.4)' "$NET" | grep -q 'ucidef_set_interfaces_lan_wan "lan1 lan2 lan3 lan4" "wan"' \
+          grep -A1 'phicomm,k2-v22.4)' "$NET" | grep -q 'ucidef_set_interfaces_lan_wan \"lan1 lan2 lan3 lan4\" \"wan\"' \
                                                               || fail "G3 k2-v22.4 interfaces case not in DSA form"
           grep -A6 'phicomm,k2-v22.5|' "$NET" | grep -q 'ucidef_add_switch' \
                                                               || fail "G3 k2-v22.5 lost its swconfig case (case split broken)"
@@ -146,6 +142,30 @@ jobs:
         run: |
           ./scripts/feeds update -a
           ./scripts/feeds install -a
+      - name: Prune default feed dependencies (bootstrap & package-manager)
+        run: |
+          set -e
+          LUCI_MAKE="feeds/luci/collections/luci/Makefile"
+          if [ -f "$LUCI_MAKE" ]; then
+            echo "=== Patching $LUCI_MAKE ==="
+            # استبدال luci-theme-bootstrap بالثيم المطلوب (enan-dashboard)
+            sed -i 's/luci-theme-bootstrap/luci-theme-enan-dashboard/g' "$LUCI_MAKE"
+            # إزالة luci-app-package-manager من قائمة الحزم الافتراضية
+            sed -i '/luci-app-package-manager/d' "$LUCI_MAKE"
+            echo "--- patched luci collection ---"
+            grep -nE 'luci-theme|luci-app-package-manager' "$LUCI_MAKE" || true
+          else
+            echo "::warning::$LUCI_MAKE not found — skip luci collection patch"
+          fi
+          # حذف مجلد bootstrap من feeds لمنع بنائه (اختياري، لكنه يضمن عدم إدراجه)
+          rm -rf feeds/luci/themes/luci-theme-bootstrap
+          # التأكد من وجود ثيم enan-dashboard في package/
+          if [ -d "package/luci-theme-enan-dashboard" ]; then
+            echo "✅ luci-theme-enan-dashboard present in package/"
+          else
+            echo "::error::luci-theme-enan-dashboard not found in package/ — did asset import fail?"
+            exit 1
+          fi
       - name: Probe requested packages (fixed base + extra_packages)
         env:
           EXTRA_PKGS: ${{ inputs.extra_packages }}
@@ -175,12 +195,6 @@ jobs:
           done
           echo "Probe summary: missing=$MISSING" | tee -a logs/pkg-availability.txt
           exit 0
-      # =====================================================================
-      # v11: unified asset import via asset_profile (main|general|special)
-      #   main    -> m/files + m/luci-theme-enan-dashboard
-      #   general -> g/files + g/luci-theme-enan-dashboard
-      #   special -> s/files + s/luci-theme-enan-dashboard
-      # =====================================================================
       - name: Import assets from bh_k2 (profile-driven)
         run: |
           set +e
@@ -243,10 +257,12 @@ jobs:
       - name: Seed .config + defconfig (double-pass) + config proof
         env:
           EXTRA_PKGS: ${{ inputs.extra_packages }}
+          EXCLUDE_PKGS: ${{ env.EXCLUDE_PACKAGES }}
         run: |
           set -e
           DEVSYM=TARGET_ramips_mt7620_DEVICE_phicomm_k2-v22.4
           E="${EXTRA_PKGS//,/ }"
+          X="$EXCLUDE_PKGS"
           cat > .config << 'SEED'
           CONFIG_TARGET_ramips=y
           CONFIG_TARGET_ramips_mt7620=y
@@ -267,6 +283,11 @@ jobs:
             echo 'CONFIG_PACKAGE_luci=y' >> .config
             echo 'CONFIG_PACKAGE_luci-theme-enan-dashboard=y' >> .config
           fi
+          # --- استبعاد الحزم غير الضرورية ---
+          for p in $X; do
+            [ -z "$p" ] && continue
+            echo "# CONFIG_PACKAGE_${p} is not set" >> .config
+          done
           cp .config logs/seed.config
           echo "--- seed ---"; cat logs/seed.config
           make defconfig
@@ -291,6 +312,10 @@ jobs:
               echo "CONFIG_PACKAGE_luci=y" >> .config
               echo "CONFIG_PACKAGE_luci-theme-enan-dashboard=y" >> .config
             fi
+            for p in $X; do
+              [ -z "$p" ] && continue
+              echo "# CONFIG_PACKAGE_${p} is not set" >> .config
+            done
             make defconfig
           fi
           need_redefconfig=0
@@ -318,6 +343,15 @@ jobs:
             echo "--- Re-running defconfig to merge re-forced packages ---" | tee -a logs/config-proof.txt
             make defconfig
           fi
+          # --- التحقق من استبعاد الحزم ---
+          for p in $X; do
+            [ -z "$p" ] && continue
+            if grep -q "^CONFIG_PACKAGE_${p}=y" .config; then
+              echo "::error::excluded package '${p}' still =y in .config"
+              exit 1
+            fi
+            echo "✅ excluded package '${p}' not in .config" | tee -a logs/config-proof.txt
+          done
           {
             echo "--- resolved by defconfig ---"
             grep -E "^CONFIG_${DEVSYM}=|^CONFIG_PACKAGE_kmod-dsa-mt7620=|^CONFIG_PACKAGE_swconfig=|^# CONFIG_PACKAGE_swconfig is not set" .config || true
@@ -328,6 +362,10 @@ jobs:
             done
             grep -E "^CONFIG_PACKAGE_luci=" .config || true
             grep -E "^CONFIG_PACKAGE_luci-theme-enan-dashboard=" .config || true
+            for p in $X; do
+              [ -z "$p" ] && continue
+              grep -E "^CONFIG_PACKAGE_${p}=" .config || true
+            done
           } | tee logs/config-proof.txt
           if ! grep -q "^CONFIG_${DEVSYM}=y" .config; then
             echo "::error::config proof: device STILL not selected"
@@ -364,13 +402,23 @@ jobs:
           sha256sum bin/targets/ramips/mt7620/*k2-v22.4* 2>/dev/null | tee logs/images.sha256
           MAN=$(ls bin/targets/ramips/mt7620/*k2-v22.4*sysupgrade*.manifest 2>/dev/null | head -1)
           if [ -n "$MAN" ]; then
-            grep -E '^(swconfig|kmod-dsa-mt7620|kmod-dsa-core|kmod-mt76x2|lldpd|luci-app-watchcat|uhttpd)' "$MAN" | tee logs/manifest-proof.txt || true
+            echo "--- manifest proof: excluded packages absent ---"
+            for p in ${{ env.EXCLUDE_PACKAGES }}; do
+              if grep -q "^${p} " "$MAN"; then
+                echo "::error::MANIFEST FAIL: excluded package '${p}' is still in the image"
+                exit 1
+              fi
+              echo "✅ '${p}' not in manifest"
+            done
+            echo "--- manifest proof: required packages present ---"
+            grep -E '^(swconfig|kmod-dsa-mt7620|kmod-dsa-core|kmod-mt76x2|lldpd|luci-app-watchcat|uhttpd|luci-theme-enan-dashboard)' "$MAN" | tee logs/manifest-proof.txt || true
             if grep -q '^swconfig ' "$MAN"; then echo "::error::MANIFEST FAIL: swconfig inside the image despite -swconfig"; exit 1; fi
             grep -q '^kmod-dsa-mt7620 ' "$MAN"   || { echo "::error::MANIFEST FAIL: kmod-dsa-mt7620 missing from the image";   exit 1; }
             grep -q '^lldpd ' "$MAN"              || { echo "::error::MANIFEST FAIL: lldpd missing from the image";              exit 1; }
             grep -q '^luci-app-watchcat ' "$MAN" || { echo "::error::MANIFEST FAIL: luci-app-watchcat missing from the image"; exit 1; }
             grep -q '^uhttpd ' "$MAN"             || { echo "::error::MANIFEST FAIL: uhttpd missing from the image";             exit 1; }
-            echo "MANIFEST-PROOF: OK (dsa in, swconfig out, lldpd+watchcat+uhttpd in)" | tee -a logs/manifest-proof.txt
+            grep -q '^luci-theme-enan-dashboard ' "$MAN" || { echo "::error::MANIFEST FAIL: luci-theme-enan-dashboard missing from the image"; exit 1; }
+            echo "MANIFEST-PROOF: OK (excluded absent, dsa+lldpd+watchcat+uhttpd+enan present)" | tee -a logs/manifest-proof.txt
           else
             echo "::warning::no manifest found (rc=$rc) — skip manifest proof"
           fi
@@ -380,13 +428,14 @@ jobs:
         run: |
           set +e
           {
-            echo "workflow     = build-phicomm-k2-dsa v11 (profile-driven assets: main|general|special)"
+            echo "workflow     = build-phicomm-k2-dsa v12 (exclude non-essential packages)"
             echo "output_suffix = '${{ inputs.output_suffix }}'"
             echo "asset_profile = ${{ inputs.asset_profile }}"
             echo "k2_branch    = ${{ inputs.k2_branch }} ($(cat logs/head.txt 2>/dev/null))"
             echo "extra_packages = '${{ inputs.extra_packages }}'"
+            echo "exclude_packages = '${{ env.EXCLUDE_PACKAGES }}'"
             echo "wifi_rescue  = ${{ inputs.wifi_rescue }}"
-            echo "fixed_base_pkgs = CONFIG_FEED_luci=y CONFIG_PACKAGE_lldpd=y CONFIG_PACKAGE_luci-app-watchcat=y CONFIG_PACKAGE_uhttpd=y"
+            echo "fixed_base_pkgs = CONFIG_FEED_luci=y CONFIG_PACKAGE_lldpd=y CONFIG_PACKAGE_luci-app-watchcat=y CONFIG_PACKAGE_uhttpd=y CONFIG_PACKAGE_luci-theme-enan-dashboard=y"
             echo "rescue.sha256:"; cat logs/rescue.sha256 2>/dev/null
             echo "gates:"; cat logs/gates.txt 2>/dev/null
             echo "files.sha256:"; cat logs/files.sha256 2>/dev/null
