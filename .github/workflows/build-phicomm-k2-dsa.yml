@@ -39,7 +39,6 @@ on:
 env:
   BH_K2_REPO: https://github.com/haddad2inc/bh_k2.git
   # الحزم التي نريد استبعادها من الصورة النهائية (غير ضرورية للمستخدم)
-  # luci-theme-bootstrap و luci-app-package-manager يتم التعامل معهما أيضًا في خطوة تعديل feeds
   EXCLUDE_PACKAGES: "luci-theme-bootstrap luci-app-package-manager odhcp6c odhcpd odhcpd-ipv6only"
 
 jobs:
@@ -142,30 +141,6 @@ jobs:
         run: |
           ./scripts/feeds update -a
           ./scripts/feeds install -a
-      - name: Prune default feed dependencies (bootstrap & package-manager)
-        run: |
-          set -e
-          LUCI_MAKE="feeds/luci/collections/luci/Makefile"
-          if [ -f "$LUCI_MAKE" ]; then
-            echo "=== Patching $LUCI_MAKE ==="
-            # استبدال luci-theme-bootstrap بالثيم المطلوب (enan-dashboard)
-            sed -i 's/luci-theme-bootstrap/luci-theme-enan-dashboard/g' "$LUCI_MAKE"
-            # إزالة luci-app-package-manager من قائمة الحزم الافتراضية
-            sed -i '/luci-app-package-manager/d' "$LUCI_MAKE"
-            echo "--- patched luci collection ---"
-            grep -nE 'luci-theme|luci-app-package-manager' "$LUCI_MAKE" || true
-          else
-            echo "::warning::$LUCI_MAKE not found — skip luci collection patch"
-          fi
-          # حذف مجلد bootstrap من feeds لمنع بنائه (اختياري، لكنه يضمن عدم إدراجه)
-          rm -rf feeds/luci/themes/luci-theme-bootstrap
-          # التأكد من وجود ثيم enan-dashboard في package/
-          if [ -d "package/luci-theme-enan-dashboard" ]; then
-            echo "✅ luci-theme-enan-dashboard present in package/"
-          else
-            echo "::error::luci-theme-enan-dashboard not found in package/ — did asset import fail?"
-            exit 1
-          fi
       - name: Probe requested packages (fixed base + extra_packages)
         env:
           EXTRA_PKGS: ${{ inputs.extra_packages }}
@@ -254,6 +229,33 @@ jobs:
           fi
           echo "=== Import completed for profile '${{ inputs.asset_profile }}' ===" | tee -a logs/bh_k2.txt
           exit 0
+      # =====================================================================
+      # v12.1: هذه الخطوة الآن بعد Import، لأنها تتحقق من وجود الثيم في package/
+      # =====================================================================
+      - name: Prune default feed dependencies (bootstrap & package-manager)
+        run: |
+          set -e
+          LUCI_MAKE="feeds/luci/collections/luci/Makefile"
+          if [ -f "$LUCI_MAKE" ]; then
+            echo "=== Patching $LUCI_MAKE ==="
+            # استبدال luci-theme-bootstrap بالثيم المطلوب (enan-dashboard)
+            sed -i 's/luci-theme-bootstrap/luci-theme-enan-dashboard/g' "$LUCI_MAKE"
+            # إزالة luci-app-package-manager من قائمة الحزم الافتراضية
+            sed -i '/luci-app-package-manager/d' "$LUCI_MAKE"
+            echo "--- patched luci collection ---"
+            grep -nE 'luci-theme|luci-app-package-manager' "$LUCI_MAKE" || true
+          else
+            echo "::warning::$LUCI_MAKE not found — skip luci collection patch"
+          fi
+          # حذف مجلد bootstrap من feeds لمنع بنائه
+          rm -rf feeds/luci/themes/luci-theme-bootstrap
+          # التأكد من وجود ثيم enan-dashboard في package/
+          if [ -d "package/luci-theme-enan-dashboard" ]; then
+            echo "✅ luci-theme-enan-dashboard present in package/"
+          else
+            echo "::error::luci-theme-enan-dashboard not found in package/ — did asset import fail?"
+            exit 1
+          fi
       - name: Seed .config + defconfig (double-pass) + config proof
         env:
           EXTRA_PKGS: ${{ inputs.extra_packages }}
@@ -428,7 +430,7 @@ jobs:
         run: |
           set +e
           {
-            echo "workflow     = build-phicomm-k2-dsa v12 (exclude non-essential packages)"
+            echo "workflow     = build-phicomm-k2-dsa v12.1 (exclude non-essential packages)"
             echo "output_suffix = '${{ inputs.output_suffix }}'"
             echo "asset_profile = ${{ inputs.asset_profile }}"
             echo "k2_branch    = ${{ inputs.k2_branch }} ($(cat logs/head.txt 2>/dev/null))"
