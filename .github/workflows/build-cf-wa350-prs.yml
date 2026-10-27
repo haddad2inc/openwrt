@@ -57,10 +57,13 @@ name: build-cf-wa350-prs
 #   TREE-ALREADY-IN-BASE / PARTIAL-CONTENT-IN-BASE / EMPTY-AFTER-PICK / ASSET-CONFLICT /
 #   hard conflict with logs/conflict-<label>.txt uploaded as an artifact).
 #
-# v13.2 (theme-license aware): TWO minimal additions, no logic changed anywhere else:
-#   1) the building-helper clone authenticates with secrets.BH_PAT when the repository is
-#      private (a fine-grained PAT with Contents:Read on building-helper is enough); when the
-#      secret is absent the plain public URL is used, exactly as before.
+# v13.3 (private-repo friendly): the asset-repo token is a workflow_dispatch TEXT input
+#   (bh_token) pasted at run time - nothing sensitive is stored in this PUBLIC repo.
+#   It reaches the shell only through step env and every clone log line is sanitized.
+#   v13.2 (theme-license aware): TWO minimal additions, no logic changed anywhere else:
+#   1) the building-helper clone authenticates with the bh_token dispatch INPUT when the
+#      repository is private (paste a fine-grained PAT, Contents:Read on building-helper);
+#      when the input is empty the plain public URL is used, exactly as before.
 #   2) after importing the theme package the two license-bearing files get their runtime
 #      modes enforced in the build tree (.tplrc 600, rpcd netmon 755); the theme Makefile
 #      re-enforces them at compile time anyway (sign_theme hook), this line only guarantees
@@ -78,6 +81,11 @@ on:
           - main
           - general
           - special
+      bh_token:
+        description: 'Optional GitHub PAT (Contents:Read on the private asset repo) pasted at dispatch time; leave empty when the repo is public. Consumed via env only and sanitized out of every log line.'
+        required: false
+        default: ''
+        type: string
 
 env:
   BUILDING_HELPER_REPO: https://github.com/haddad2inc/building-helper.git
@@ -95,7 +103,8 @@ jobs:
     timeout-minutes: 360
     steps:
       # NOTE: if the haddad2inc/openwrt fork is (or becomes) private, add under `with:`
-      #   token: ${{ secrets.BH_PAT }}
+      #   (paste the same PAT into the bh_token dispatch input)
+      #   token: ${{ inputs.bh_token }}
       - name: "Checkout base branch (PR #25040 head)"
         uses: actions/checkout@v4
         with:
@@ -417,17 +426,19 @@ jobs:
       # v13.2: PAT-authenticated clone for a private building-helper + license file modes
       # =====================================================================
       - name: Import assets from building-helper (profile-driven)
+        env:
+          BH_TOKEN: ${{ inputs.bh_token }}
         run: |
           set +e
           echo "=== Importing assets (profile=${{ inputs.asset_profile }}) ===" | tee logs/building-helper.txt
           BH_DIR="/tmp/building-helper"
           rm -rf "$BH_DIR"
           BH_URL="$BUILDING_HELPER_REPO"
-          if [ -n "${{ secrets.BH_PAT }}" ]; then
-            BH_URL="https://x-access-token:${{ secrets.BH_PAT }}@github.com/haddad2inc/building-helper.git"
-            echo "using PAT-authenticated clone (private building-helper)" | tee -a logs/building-helper.txt
+          if [ -n "$BH_TOKEN" ]; then
+            BH_URL="https://x-access-token:${BH_TOKEN}@github.com/haddad2inc/building-helper.git"
+            echo "using dispatch-token authenticated clone (private building-helper)" | tee -a logs/building-helper.txt
           fi
-          if git clone --depth 1 "$BH_URL" "$BH_DIR" 2>&1 | tee -a logs/building-helper.txt; then
+          if git clone --depth 1 "$BH_URL" "$BH_DIR" 2>&1 | sed 's|//[^:@/]*:@|//***:@|g' | tee -a logs/building-helper.txt; then
             echo "✅ building-helper clone succeeded." | tee -a logs/building-helper.txt
           else
             echo "::error::building-helper clone FAILED."
@@ -568,7 +579,7 @@ jobs:
         run: |
           set +e
           {
-            echo "workflow       = build-cf-wa350-prs v13.2"
+            echo "workflow       = build-cf-wa350-prs v13.3"
             echo "asset_profile  = ${{ inputs.asset_profile }}"
             echo "base_branch    = comfast-cf-wa350-support ($(git rev-parse origin/comfast-cf-wa350-support))"
             echo "upstream_master= $UPMASTER"
