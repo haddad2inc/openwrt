@@ -37,7 +37,7 @@ on:
 
 env:
   BH_K2_REPO: https://github.com/haddad2inc/bh_k2.git
-  # حزم تُستبعد مباشرة عبر .config (لا تشمل bootstrap لأنه يُدار بالـ Makefile patch)
+  # حزم تُستبعد مباشرة عبر .config + patch للـ collections
   EXCLUDE_PACKAGES: "odhcp6c odhcpd odhcpd-ipv6only luci-app-package-manager"
 
 jobs:
@@ -228,33 +228,47 @@ jobs:
           echo "=== Import completed for profile '${{ inputs.asset_profile }}' ===" | tee -a logs/bh_k2.txt
           exit 0
       # =====================================================================
-      # v12.2: Swap bootstrap → enan-dashboard (best-effort, non-fatal).
-      # يعمل فقط إذا كان package/luci-theme-enan-dashboard موجودًا.
-      # إذا لم يوجد: يُترك bootstrap كاحتياطي، والبناء يكمل بنجاح.
+      # v12.3 FIX: هذه الخطوة الآن:
+      #   1. تحذف luci-app-package-manager من كل collections دائمًا (لا exit مبكر).
+      #   2. تستبدل bootstrap→enan-dashboard فقط إذا كان الثيم موجودًا.
+      #   3. set +e + exit 0: لا تفشل البناء أبدًا.
       # =====================================================================
-      - name: Swap bootstrap theme (best-effort, non-fatal)
+      - name: Patch luci collections (non-fatal)
         run: |
           set +e
           THEME_DIR="package/luci-theme-enan-dashboard"
-          LUCI_MAKE="feeds/luci/collections/luci/Makefile"
-          LUCI_LIGHT_MAKE="feeds/luci/collections/luci-light/Makefile"
-          echo "=== Checking for $THEME_DIR ==="
-          if [ ! -d "$THEME_DIR" ]; then
-            echo "::warning::luci-theme-enan-dashboard not present in package/ — keeping bootstrap as fallback (non-fatal)"
-            echo "✅ swap skipped, build will proceed with default bootstrap theme"
-            exit 0
-          fi
-          echo "✅ luci-theme-enan-dashboard found — swapping bootstrap in luci collections"
-          for f in "$LUCI_MAKE" "$LUCI_LIGHT_MAKE"; do
-            if [ -f "$f" ]; then
-              sed -i 's/luci-theme-bootstrap/luci-theme-enan-dashboard/g' "$f"
-              echo "--- patched: $f ---"
-              grep -nE 'luci-theme' "$f" || true
+          HAS_THEME=0
+          [ -d "$THEME_DIR" ] && HAS_THEME=1
+          
+          echo "=== Step 1: remove luci-app-package-manager from ALL luci collections ==="
+          for f in feeds/luci/collections/*/Makefile; do
+            [ -f "$f" ] || continue
+            if grep -q 'luci-app-package-manager' "$f"; then
+              sed -i '/luci-app-package-manager/d' "$f"
+              echo "✅ removed luci-app-package-manager from $f"
+            else
+              echo "ℹ️ no luci-app-package-manager in $f"
             fi
           done
-          rm -rf feeds/luci/themes/luci-theme-bootstrap
-          echo "✅ bootstrap removed from feeds/luci/themes/"
-          echo "✅ swap completed"
+          
+          echo "=== Step 2: swap bootstrap→enan if theme present ==="
+          if [ "$HAS_THEME" = "1" ]; then
+            for f in feeds/luci/collections/*/Makefile; do
+              [ -f "$f" ] || continue
+              if grep -q 'luci-theme-bootstrap' "$f"; then
+                sed -i 's/luci-theme-bootstrap/luci-theme-enan-dashboard/g' "$f"
+                echo "✅ swapped bootstrap→enan in $f"
+              fi
+            done
+            # also patch any app Makefile that still references bootstrap (silences warnings)
+            find feeds/luci/applications -name Makefile -exec sed -i 's/luci-theme-bootstrap/luci-theme-enan-dashboard/g' {} \; 2>/dev/null
+            rm -rf feeds/luci/themes/luci-theme-bootstrap
+            echo "✅ removed feeds/luci/themes/luci-theme-bootstrap"
+          else
+            echo "::warning::enan-dashboard not present in package/ — keeping bootstrap as fallback"
+          fi
+          
+          echo "=== Patch completed (HAS_THEME=$HAS_THEME) ==="
           exit 0
       - name: Seed .config + defconfig (double-pass) + config proof
         env:
@@ -345,11 +359,15 @@ jobs:
             echo "--- Re-running defconfig to merge re-forced packages ---" | tee -a logs/config-proof.txt
             make defconfig
           fi
-          # --- التحقق من أن الحزم المستبعدة ليست =y ---
+          # --- التحقق من استبعاد الحزم ---
           for p in $X; do
             [ -z "$p" ] && continue
             if grep -q "^CONFIG_PACKAGE_${p}=y" .config; then
               echo "::error::excluded package '${p}' still =y in .config after defconfig"
+              echo "---- context in .config for ${p} ----" | tee -a logs/config-proof.txt
+              grep -n "${p}" .config | tee -a logs/config-proof.txt || true
+              echo "---- who depends on it in feeds ----" | tee -a logs/config-proof.txt
+              grep -rn "luci-app-package-manager" feeds/luci/collections/ 2>/dev/null | tee -a logs/config-proof.txt || true
               exit 1
             fi
             echo "✅ excluded package '${p}' not in .config" | tee -a logs/config-proof.txt
@@ -425,7 +443,6 @@ jobs:
             grep -q '^lldpd ' "$MAN"              || { echo "::error::MANIFEST FAIL: lldpd missing from the image";              exit 1; }
             grep -q '^luci-app-watchcat ' "$MAN" || { echo "::error::MANIFEST FAIL: luci-app-watchcat missing from the image"; exit 1; }
             grep -q '^uhttpd ' "$MAN"             || { echo "::error::MANIFEST FAIL: uhttpd missing from the image";             exit 1; }
-            # enan-dashboard present only if theme was imported
             if [ -d "package/luci-theme-enan-dashboard" ]; then
               grep -q '^luci-theme-enan-dashboard ' "$MAN" || { echo "::error::MANIFEST FAIL: luci-theme-enan-dashboard missing from the image"; exit 1; }
             fi
@@ -439,7 +456,7 @@ jobs:
         run: |
           set +e
           {
-            echo "workflow     = build-phicomm-k2-dsa v12.2 (based on v11, safe additions)"
+            echo "workflow     = build-phicomm-k2-dsa v12.3 (based on v11, safe additions — FIXED)"
             echo "output_suffix = '${{ inputs.output_suffix }}'"
             echo "asset_profile = ${{ inputs.asset_profile }}"
             echo "k2_branch    = ${{ inputs.k2_branch }} ($(cat logs/head.txt 2>/dev/null))"
