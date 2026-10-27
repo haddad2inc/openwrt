@@ -56,6 +56,15 @@ name: build-cf-wa350-prs
 #   plus the six pick() gates inherited from v8 (ALREADY-IN-BASE / EQUIVALENT-IN-BASE /
 #   TREE-ALREADY-IN-BASE / PARTIAL-CONTENT-IN-BASE / EMPTY-AFTER-PICK / ASSET-CONFLICT /
 #   hard conflict with logs/conflict-<label>.txt uploaded as an artifact).
+#
+# v13.2 (theme-license aware): TWO minimal additions, no logic changed anywhere else:
+#   1) the building-helper clone authenticates with secrets.BH_PAT when the repository is
+#      private (a fine-grained PAT with Contents:Read on building-helper is enough); when the
+#      secret is absent the plain public URL is used, exactly as before.
+#   2) after importing the theme package the two license-bearing files get their runtime
+#      modes enforced in the build tree (.tplrc 600, rpcd netmon 755); the theme Makefile
+#      re-enforces them at compile time anyway (sign_theme hook), this line only guarantees
+#      correct modes even before compile.
 
 on:
   workflow_dispatch:
@@ -85,6 +94,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     steps:
+      # NOTE: if the haddad2inc/openwrt fork is (or becomes) private, add under `with:`
+      #   token: ${{ secrets.BH_PAT }}
       - name: "Checkout base branch (PR #25040 head)"
         uses: actions/checkout@v4
         with:
@@ -403,6 +414,7 @@ jobs:
       # =====================================================================
       # profile-driven asset import (main -> m/, general -> g/, special -> s/)
       # verbatim logic of build-cf-wa350-final; replaces include_files/attach_theme
+      # v13.2: PAT-authenticated clone for a private building-helper + license file modes
       # =====================================================================
       - name: Import assets from building-helper (profile-driven)
         run: |
@@ -410,7 +422,12 @@ jobs:
           echo "=== Importing assets (profile=${{ inputs.asset_profile }}) ===" | tee logs/building-helper.txt
           BH_DIR="/tmp/building-helper"
           rm -rf "$BH_DIR"
-          if git clone --depth 1 "$BUILDING_HELPER_REPO" "$BH_DIR" 2>&1 | tee -a logs/building-helper.txt; then
+          BH_URL="$BUILDING_HELPER_REPO"
+          if [ -n "${{ secrets.BH_PAT }}" ]; then
+            BH_URL="https://x-access-token:${{ secrets.BH_PAT }}@github.com/haddad2inc/building-helper.git"
+            echo "using PAT-authenticated clone (private building-helper)" | tee -a logs/building-helper.txt
+          fi
+          if git clone --depth 1 "$BH_URL" "$BH_DIR" 2>&1 | tee -a logs/building-helper.txt; then
             echo "✅ building-helper clone succeeded." | tee -a logs/building-helper.txt
           else
             echo "::error::building-helper clone FAILED."
@@ -453,6 +470,10 @@ jobs:
             find "$TARGET_DIR" -type f -name "*.sh" -exec chmod +x {} \; 2>&1 | tee -a logs/building-helper.txt
             find "$TARGET_DIR" -type f -name "Makefile" -exec chmod 644 {} \; 2>&1 | tee -a logs/building-helper.txt
             find "$TARGET_DIR/files" -type f -exec chmod +x {} \; 2>/dev/null || true
+            # v13.2: enforce the license-bearing file modes in the build tree
+            # (the theme Makefile re-enforces them at compile time as well)
+            chmod 600 "$TARGET_DIR/root/usr/share/ucode/luci/.tplrc" 2>/dev/null || true
+            chmod 755 "$TARGET_DIR/root/usr/libexec/rpcd/netmon" 2>/dev/null || true
             if [ -f "$TARGET_DIR/Makefile" ]; then
               echo "✅ luci-theme-enan-dashboard imported from $SUB/luci-theme-enan-dashboard" | tee -a logs/building-helper.txt
               head -n 20 "$TARGET_DIR/Makefile" | tee -a logs/building-helper.txt
@@ -547,7 +568,7 @@ jobs:
         run: |
           set +e
           {
-            echo "workflow       = build-cf-wa350-prs v13.1"
+            echo "workflow       = build-cf-wa350-prs v13.2"
             echo "asset_profile  = ${{ inputs.asset_profile }}"
             echo "base_branch    = comfast-cf-wa350-support ($(git rev-parse origin/comfast-cf-wa350-support))"
             echo "upstream_master= $UPMASTER"

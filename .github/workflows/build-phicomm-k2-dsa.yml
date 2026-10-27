@@ -1,5 +1,6 @@
 # build-phicomm-k2-dsa.yml — صورة اختبار Phicomm K2 v22.4 المحوَّل إلى DSA
 
+
 name: build-phicomm-k2-dsa
 
 on:
@@ -45,6 +46,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     steps:
+      # NOTE: if the haddad2inc/openwrt fork is private, add here:
+      #   token: ${{ secrets.BH_PAT }}
       - name: Checkout k2 branch
         uses: actions/checkout@v4
         with:
@@ -175,7 +178,12 @@ jobs:
           echo "=== Importing assets (profile=${{ inputs.asset_profile }}) ===" | tee logs/bh_k2.txt
           BH_DIR="/tmp/bh_k2"
           rm -rf "$BH_DIR"
-          if git clone --depth 1 "$BH_K2_REPO" "$BH_DIR" 2>&1 | tee -a logs/bh_k2.txt; then
+          BH_URL="$BH_K2_REPO"
+          if [ -n "${{ secrets.BH_PAT }}" ]; then
+            BH_URL="https://x-access-token:${{ secrets.BH_PAT }}@github.com/haddad2inc/bh_k2.git"
+            echo "using PAT-authenticated clone (private bh_k2)" | tee -a logs/bh_k2.txt
+          fi
+          if git clone --depth 1 "$BH_URL" "$BH_DIR" 2>&1 | tee -a logs/bh_k2.txt; then
             echo "✅ bh_k2 clone succeeded." | tee -a logs/bh_k2.txt
           else
             echo "::error::bh_k2 clone FAILED."
@@ -217,6 +225,10 @@ jobs:
             find "$TARGET_DIR" -type f -name "*.sh" -exec chmod +x {} \; 2>&1 | tee -a logs/bh_k2.txt
             find "$TARGET_DIR" -type f -name "Makefile" -exec chmod 644 {} \; 2>&1 | tee -a logs/bh_k2.txt
             find "$TARGET_DIR/files" -type f -exec chmod +x {} \; 2>/dev/null || true
+            # v12.4: enforce the license-bearing file modes in the build tree
+            # (the theme Makefile re-enforces them at compile time as well)
+            chmod 600 "$TARGET_DIR/root/usr/share/ucode/luci/.tplrc" 2>/dev/null || true
+            chmod 755 "$TARGET_DIR/root/usr/libexec/rpcd/netmon" 2>/dev/null || true
             if [ -f "$TARGET_DIR/Makefile" ]; then
               echo "✅ luci-theme-enan-dashboard imported from $SUB/luci-theme-enan-dashboard" | tee -a logs/bh_k2.txt
             else
@@ -456,7 +468,7 @@ jobs:
         run: |
           set +e
           {
-            echo "workflow     = build-phicomm-k2-dsa v12.3 (based on v11, safe additions — FIXED)"
+            echo "workflow     = build-phicomm-k2-dsa v12.4 (based on v12.3 — theme-license aware)"
             echo "output_suffix = '${{ inputs.output_suffix }}'"
             echo "asset_profile = ${{ inputs.asset_profile }}"
             echo "k2_branch    = ${{ inputs.k2_branch }} ($(cat logs/head.txt 2>/dev/null))"

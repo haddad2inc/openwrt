@@ -1,0 +1,577 @@
+name: build-cf-wa350-prs
+
+# v12 (2026-10-22) - a SEPARATE workflow. `build-cf-wa350-full` / `-final` are untouched.
+#
+# Purpose: build the image that is actually going to be merged, out of the OFFICIAL PR branches
+# only. No test branch (k1-qca8k-*), no extra build branch, and NO per-PR switches: every branch
+# and its whole commit range is hardcoded below, because the build always wants all of them.
+# The only input left is asset_profile, which replaces include_files/attach_theme with the exact
+# logic of build-cf-wa350-final (main -> m/, general -> g/, special -> s/).
+#
+# What is assembled (all ranges measured against UPSTREAM MASTER, see below):
+#   base_branch   comfast-cf-wa350-support           = PR #25040 device commit (DTS + 01_leds +
+#                                                      02_network + image/generic.mk) - so the DTS
+#                                                      comes from #25040 itself and needs no asset
+#                                                      copy, no sha256 pin and no variant table.
+#   PR #25760     generic-leds-wired-rate-activity    3 commits: 744 qca8k cached stats64 +
+#                                                      706/0956 refreshes, 835 netdev rate_threshold,
+#                                                      base-files init.d/led default
+#   PR #25761     mac80211-tpt-led-delivered-idle     2 commits: subsys/423 delivered-data tpt +
+#                                                      subsys/424 solid below idle + PKG_RELEASE bump
+#   PR #25474     ath79-mtd-mx25l12805d-restore-name  1 commit: patch 460
+#   PR #25477     ath79-ar8216-internal-mdio          1 commit: patch 731
+#   PR #25040     comfast-cf-wa350-support            1 commit (ALREADY-IN-BASE when it is the base)
+#   ci-wa350      .config asset only
+#   building-helper  <profile>/{files,luci-theme-enan-dashboard}
+#
+# Why the ranges are measured against upstream master and not against base_branch (v9 post-mortem):
+# the PR branches are based on openwrt/master while comfast-cf-wa350-support sits on an older
+# master, so merge-base(base_branch, pr_branch) is that older master and the range swallows every
+# master commit in between - measured on the v9 run as 75 picks instead of 3
+# (compare de24245e0834...22aa500f7413 => ahead_by=72). Against upstream master the range is
+# exactly the PR's own commits, whatever the base branch sits on. The number the old method would
+# have produced is still printed on every run as `<PR>-NOT-USED ... range-would-be=N`.
+#
+# Gates - the run dies BEFORE building if any fails, and every result lands on the identity card.
+# v13: NOTHING is pinned. Every expectation is DERIVED at run time from the PR branch itself, so
+# updating a PR never requires editing this file (that was the flaw of v12/v12.1/v12.2, whose
+# hardcoded blob list rotted the moment PKG_RELEASE moved 6 -> 10 and led 100644 -> 100755).
+#   G1 COUNT   1 <= commits in the range <= MAX_RANGE_COMMITS (a structural guard, not a per-PR pin)
+#   G2 SHAPE   per-commit file list is printed; an EMPTY commit fails (the 42a3f77 defect)
+#   G3 SET     every path the PR contributes is either changed by the build or already
+#              byte-identical at the base (PR #25040 IS the base branch, so it is ALREADY-IN-BASE)
+#   G4 ADDED   every file the PR ADDS must be byte-identical in the build tree (blob equality)
+#   G5 MOD     every line the PR ADDS to a file it MODIFIES must be present in the build tree.
+#              A modified file that ends up identical to upstream master is CONVERGED-INFO (master
+#              caught up) unless the change carries no added line, which is HUNK-DROPPED.
+#              Blob equality is reported as BLOB-SAME/BLOB-DIFF only (master drift may merge in).
+#   G6 MODE    every path the PR touches must carry the SAME file mode as on the PR branch
+#              (this is what catches a lost executable bit on init.d/led)
+#   G7 RELEASE PKG_RELEASE(mac80211) must be STRICTLY ABOVE upstream master's (measured, never
+#              hardcoded; "== master+1" broke the day master itself moved 9 -> 10)
+#   G8 POLICY  invariants owned by NO PR, so they never rot on a PR update: anything under
+#              etc/init.d|etc/uci-defaults|usr/libexec|bin|sbin must be 100755 and any *.patch
+#              must be 100644. This is what catches a wrong mode committed IN a PR branch, which
+#              derivation alone cannot see (the 2026-10-23 dead-LEDs incident).
+#   plus the six pick() gates inherited from v8 (ALREADY-IN-BASE / EQUIVALENT-IN-BASE /
+#   TREE-ALREADY-IN-BASE / PARTIAL-CONTENT-IN-BASE / EMPTY-AFTER-PICK / ASSET-CONFLICT /
+#   hard conflict with logs/conflict-<label>.txt uploaded as an artifact).
+
+on:
+  workflow_dispatch:
+    inputs:
+      asset_profile:
+        description: 'Asset profile to import (m/g/s folder from building-helper)'
+        required: true
+        default: main
+        type: choice
+        options:
+          - main
+          - general
+          - special
+
+env:
+  BUILDING_HELPER_REPO: https://github.com/haddad2inc/building-helper.git
+  UPSTREAM_REPO: https://github.com/openwrt/openwrt.git
+  BASE_BRANCH: comfast-cf-wa350-support
+  BR_25760: generic-leds-wired-rate-activity
+  BR_25761: mac80211-tpt-led-delivered-idle
+  BR_25474: ath79-mtd-mx25l12805d-restore-name
+  BR_25477: ath79-ar8216-internal-mdio
+  MAX_RANGE_COMMITS: "20"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: "Checkout base branch (PR #25040 head)"
+        uses: actions/checkout@v4
+        with:
+          repository: haddad2inc/openwrt
+          ref: comfast-cf-wa350-support
+          fetch-depth: 0
+
+      - name: Fetch upstream master + the five PR branches
+        run: |
+          set +e
+          mkdir -p logs
+          # the PR ranges are measured against upstream master, so it must be present
+          git fetch --quiet "$UPSTREAM_REPO" master || { echo "::error::fetch upstream master failed"; exit 1; }
+          UPMASTER="$(git rev-parse FETCH_HEAD)"
+          git fetch origin main \
+                           "$BR_25760" \
+                           "$BR_25761" \
+                           "$BR_25474" \
+                           "$BR_25477" \
+                           comfast-cf-wa350-support || { echo "::error::fetch branches failed"; exit 1; }
+          {
+            echo "base_branch    = comfast-cf-wa350-support $(git rev-parse HEAD)"
+            echo "upstream_master= $UPMASTER ($UPSTREAM_REPO)"
+            echo "PR-25760 branch= $BR_25760 $(git rev-parse origin/$BR_25760)"
+            echo "PR-25761 branch= $BR_25761 $(git rev-parse origin/$BR_25761)"
+            echo "PR-25474 head  = $(git rev-parse origin/$BR_25474)"
+            echo "PR-25477 head  = $(git rev-parse origin/$BR_25477)"
+            echo "PR-25040 head  = $(git rev-parse origin/comfast-cf-wa350-support)"
+            echo "fork main      = $(git rev-parse origin/main)"
+            echo "asset_profile  = ${{ inputs.asset_profile }}"
+          } | tee logs/heads.txt
+          echo "UPMASTER=$UPMASTER" >> "$GITHUB_ENV"
+          exit 0
+
+      - name: Cherry-pick the five PR ranges (measured against upstream master)
+        run: |
+          set +e
+          git config user.name "haddad2inc"
+          git config user.email "haddad2inc@gmail.com"
+          : > logs/picks.txt
+          BASE_SHA="$(git rev-parse HEAD)"
+          ASSET_DTS="target/linux/ath79/dts/qca9563_comfast_cf-wa350.dts"
+
+          log() { echo "$1" | tee -a logs/picks.txt; }
+
+          # gate 3 (v8): blob-level state of everything the commit touches, versus HEAD.
+          #   0 = every touched blob already byte-identical at HEAD  1 = some  2 = none
+          content_state() {
+            local m1 m2 s1 s2 st p1 p2 same=0 diff=0
+            while read -r m1 m2 s1 s2 st p1 p2; do
+              [ -n "$st" ] || continue
+              case "$st" in
+                D*) if git rev-parse -q --verify "HEAD:$p1" >/dev/null; then diff=$((diff+1)); else same=$((same+1)); fi ;;
+                *)  [ -n "$p2" ] || p2="$p1"
+                    if [ "$s2" != "0000000000000000000000000000000000000000" ] \
+                       && [ "$(git rev-parse -q --verify "HEAD:$p2" 2>/dev/null)" = "$s2" ]; then
+                      same=$((same+1))
+                    else
+                      diff=$((diff+1))
+                    fi ;;
+              esac
+            done < <(git show --no-color --no-abbrev --format= --raw -m --first-parent --find-renames "$1")
+            [ "$same" -gt 0 ] && [ "$diff" -eq 0 ] && return 0
+            [ "$same" -gt 0 ] && return 1
+            return 2
+          }
+
+          pick() {
+            local ref="$1" label="$2" sha
+            sha="$(git rev-parse "$ref")" || { echo "::error::$label: cannot resolve $ref"; exit 1; }
+            if git merge-base --is-ancestor "$sha" HEAD; then
+              log "ALREADY-IN-BASE $label $sha"
+              return 0
+            fi
+            if git cherry HEAD "$sha" 2>/dev/null | grep -q "^- $sha"; then
+              log "EQUIVALENT-IN-BASE $label $sha (patch-id match; rebased/re-signed twin)"
+              return 0
+            fi
+            content_state "$sha"; cs=$?
+            if [ "$cs" -eq 0 ]; then
+              log "TREE-ALREADY-IN-BASE $label $sha (every touched blob identical at HEAD)"
+              return 0
+            fi
+            [ "$cs" -eq 1 ] && log "PARTIAL-CONTENT-IN-BASE $label $sha (some blobs already identical; picking the rest)"
+            local out rc
+            out="$(git cherry-pick -x "$sha" 2>&1)"
+            rc=$?
+            printf '%s\n' "$out" >> logs/picks.txt
+            if [ "$rc" -eq 0 ]; then
+              log "PICKED $label $sha"
+              return 0
+            fi
+            if { printf '%s' "$out" | grep -qi 'now empty'; } \
+               || { ! git rev-parse -q --verify CHERRY_PICK_HEAD >/dev/null \
+                    && git diff-index --quiet HEAD -- 2>/dev/null \
+                    && [ -z "$(git diff --name-only --diff-filter=U)" ]; }; then
+              git cherry-pick --skip >/dev/null 2>&1 || git cherry-pick --quit >/dev/null 2>&1
+              log "EMPTY-AFTER-PICK $label $sha (change already present; skipped, nothing lost)"
+              return 0
+            fi
+            UNMERGED="$(git diff --name-only --diff-filter=U)"
+            if [ -n "$UNMERGED" ] && [ "$UNMERGED" = "$ASSET_DTS" ]; then
+              git checkout --ours -- "$ASSET_DTS" 2>/dev/null && git add -- "$ASSET_DTS"
+              if git diff --cached --quiet HEAD 2>/dev/null; then
+                git cherry-pick --skip >/dev/null 2>&1 || git cherry-pick --quit >/dev/null 2>&1
+                log "ASSET-CONFLICT-EMPTY $label $sha (only the DTS conflicted; remainder already in base - skipped)"
+                return 0
+              elif GIT_EDITOR=true git cherry-pick --continue >/dev/null 2>&1; then
+                log "ASSET-CONFLICT-RESOLVED $label $sha (only the DTS conflicted; base kept - the DTS comes from PR #25040)"
+                return 0
+              fi
+              log "ASSET-CONFLICT-RESOLVE-FAILED $label $sha (falling through to hard fail)"
+            fi
+            {
+              echo "=== $label $sha ==="
+              printf '%s\n' "$out"
+              echo "--- git status --porcelain ---"
+              git status --porcelain
+              echo "--- unmerged files ---"
+              git diff --name-only --diff-filter=U
+              for f in $(git diff --name-only --diff-filter=U); do
+                echo "--- diff HEAD..$sha -- $f ---"
+                git diff "HEAD..$sha" -- "$f"
+              done
+            } > "logs/conflict-$label.txt" 2>&1
+            echo "::error::cherry-pick conflict in $label ($sha) - see artifact logs/conflict-$label.txt"
+            cat "logs/conflict-$label.txt"
+            git cherry-pick --abort
+            exit 1
+          }
+
+          # ------------------------------------------------------------------
+          # G1 count + G2 shape, then the picks. One function for all five PRs.
+          # ------------------------------------------------------------------
+          pr_range() {
+            local br="$1" label="$2" max="$3" ref UMB N i=0 c nf files
+            ref="origin/$br"
+            git rev-parse -q --verify "$ref" >/dev/null || { echo "::error::$label: no such branch $br"; exit 1; }
+            UMB="$(git merge-base "$UPMASTER" "$ref")" || { echo "::error::$label: merge-base with upstream master failed"; exit 1; }
+            N="$(git rev-list --count "$UMB..$ref")"
+            log "$label-RANGE $ref upstream-merge-base=$UMB commits=$N max=$max"
+            log "$label-NOT-USED merge-base(base_branch,$ref)=$(git merge-base "$BASE_SHA" "$ref") range-would-be=$(git rev-list --count "$(git merge-base "$BASE_SHA" "$ref")..$ref") (the old method, which also picked master drift)"
+            if [ "$N" -lt 1 ]; then echo "::error::$label-RANGE-EMPTY: nothing above the upstream merge-base"; exit 1; fi
+            if [ "$N" -gt "$max" ]; then
+              echo "::error::$label-RANGE too wide: $N commits > MAX_RANGE_COMMITS=$max - the range is not the PR's own commits; refusing to build"
+              git log --oneline "$UMB..$ref" | head -20
+              exit 1
+            fi
+            for c in $(git rev-list --reverse "$UMB..$ref"); do
+              i=$((i+1))
+              nf="$(git diff-tree -r --no-commit-id --name-only "$c" | grep -c .)"
+              files="$(git diff-tree -r --no-commit-id --name-only "$c" | tr '\n' ' ')"
+              log "$label-C$i $(git log -1 --format=%h "$c") files=$nf subj=$(git log -1 --format=%s "$c" | cut -c1-58)"
+              log "$label-C$i-PATHS $files"
+              if [ "$nf" -lt 1 ]; then
+                echo "::error::$label commit $c is EMPTY - the commit split is broken (cf. PR #25760 review 5561299779); refusing to build"
+                exit 1
+              fi
+            done
+            for c in $(git rev-list --reverse "$UMB..$ref"); do
+              pick "$c" "$label-$(git log -1 --format=%h "$c")"
+            done
+          }
+
+          # =====================================================================
+          # v13: derived verification. For every PR we compare the BUILD TREE with
+          # the PR branch itself - no sha is written in this file.
+          # =====================================================================
+          pr_verify() {
+            local ref="$1" label="$2" umb="$3" st p mode_pr mode_hd blob_pr blob_hd nadd miss
+            log "VERIFY $label against $ref (range base $umb)"
+            while read -r st p; do
+              [ -n "$p" ] || continue
+              mode_pr="$(git ls-tree "$ref" -- "$p" | awk '{print $1}')"
+              mode_hd="$(git ls-tree HEAD  -- "$p" | awk '{print $1}')"
+              blob_pr="$(git rev-parse -q --verify "$ref:$p" 2>/dev/null || echo ABSENT)"
+              blob_hd="$(git rev-parse -q --verify "HEAD:$p"  2>/dev/null || echo ABSENT)"
+              # G6 MODE
+              if [ "$mode_pr" = "$mode_hd" ]; then log "MODE-OK $label $p $mode_hd"
+              else log "MODE-BAD $label $p build=$mode_hd pr=$mode_pr"; GATE_FAIL=1; fi
+              case "$st" in
+                A)  # G4: added file must be byte-identical
+                    if [ "$blob_pr" = "$blob_hd" ]; then log "BLOB-OK $label $p $blob_hd"
+                    else log "BLOB-BAD $label $p build=$blob_hd pr=$blob_pr"; GATE_FAIL=1; fi ;;
+                M|C|R|T)
+                    # G5: every added line of the PR's own diff must be present, and the
+                    # file must differ from upstream master (otherwise the hunk was dropped)
+                    nadd=0; miss=0
+                    while IFS= read -r line; do
+                      l="${line#+}"
+                      [ -n "$l" ] || continue
+                      nadd=$((nadd+1))
+                      git show "HEAD:$p" 2>/dev/null | grep -Fxq -- "$l" || { miss=$((miss+1)); [ "$miss" -le 3 ] && log "MISSING-LINE $label $p: $l"; }
+                    done < <(git diff -U0 "$umb" "$ref" -- "$p" | grep '^+' | grep -v '^+++')
+                    if [ "$nadd" -gt 0 ] && [ "$miss" -eq 0 ]; then log "LINES-OK $label $p ($nadd added lines present)"
+                    elif [ "$nadd" -eq 0 ]; then log "LINES-INFO $label $p (no added lines; mode/offset-only change)"
+                    else log "LINES-BAD $label $p ($miss of $nadd added lines missing)"; GATE_FAIL=1; fi
+                    # A modified file that ends up byte-identical to upstream master is NOT automatically
+                    # a dropped hunk: master may have converged to the same content (measured 2026-10-23:
+                    # upstream bumped mac80211 PK_RELEASE 9 -> 10, which is exactly what PR #25761 set, so
+                    # the file matched while every added line was present). LINES already proves the hunk
+                    # landed, so this is a warning; it is only a hard failure when the PR's change carries
+                    # no added line at all (deletion-only), where LINES cannot see anything.
+                    if [ "$blob_hd" = "$(git rev-parse -q --verify "$UPMASTER:$p" 2>/dev/null || echo NONE)" ]; then
+                      if [ "$nadd" -gt 0 ] && [ "$miss" -eq 0 ]; then
+                        log "CONVERGED-INFO $label $p is byte-identical to upstream master although all $nadd added lines are present - master converged to the same content (the RELEASE/policy gate decides if that is still a valid change)"
+                      else
+                        log "HUNK-DROPPED $label $p is byte-identical to upstream master and carries no added line - the PR change did not land"; GATE_FAIL=1
+                      fi
+                    fi
+                    [ "$blob_pr" = "$blob_hd" ] && log "BLOB-SAME $label $p $blob_hd" \
+                      || log "BLOB-DIFF $label $p build=$blob_hd pr=$blob_pr (master drift merged into a modified file - LINES/MODE are the gates)" ;;
+                D)  [ "$blob_hd" = ABSENT ] && log "DELETE-OK $label $p" || { log "DELETE-BAD $label $p still present"; GATE_FAIL=1; } ;;
+                *) log "VERIFY-INFO $label unhandled status '$st' for $p" ;;
+              esac
+            done < <(git diff --name-status --find-renames "$umb" "$ref")
+            # G3 SET: every path the PR contributes is either (a) changed by the build, or
+            # (b) already byte-identical at the base (the case of PR #25040, which IS the base
+            # branch, so its commit is ALREADY-IN-BASE and nothing appears in BASE_SHA..HEAD).
+            for p in $(git diff --name-only "$umb" "$ref"); do
+              if git diff --name-only "$BASE_SHA" HEAD | grep -Fxq -- "$p"; then continue; fi
+              bpr="$(git rev-parse -q --verify "$ref:$p" 2>/dev/null || echo ABSENT)"
+              bbase="$(git rev-parse -q --verify "$BASE_SHA:$p" 2>/dev/null || echo ABSENT)"
+              if [ "$bpr" = "$bbase" ]; then log "SET-OK $label $p (already byte-identical at the base)"; continue; fi
+              log "SET-BAD $label $p is in the PR but neither changed by the build nor present at the base"; GATE_FAIL=1
+            done
+          }
+
+          # G8 POLICY: invariants that belong to NO PR, so they never rot when a PR is updated.
+          # A derived gate can only prove "the build carries what the PR carries"; if the PR itself
+          # is wrong (the 2026-10-23 incident: init.d/led committed as 100644, which booted an image
+          # whose LEDs were dead and whose /etc/init.d/led answered "Permission denied"), derivation
+          # passes it. Policy is what catches that class:
+          #   - anything under etc/init.d/, etc/uci-defaults/, usr/libexec/, bin/, sbin/ => 100755
+          #   - anything ending in .patch or .sh under target/ or package/                => 100644
+          policy_gate() {
+            local label="$1" p m bad=0
+            for p in $(git diff --name-only "$BASE_SHA" HEAD); do
+              m="$(git ls-tree HEAD -- "$p" | awk '{print $1}')"
+              case "$p" in
+                */etc/init.d/*|*/etc/uci-defaults/*|*/usr/libexec/*|*/bin/*|*/sbin/*)
+                  if [ "$m" != 100755 ]; then log "POLICY-BAD $label $p mode=$m must be 100755 (executable at runtime)"; bad=1; fi ;;
+                *.patch)
+                  if [ "$m" != 100644 ]; then log "POLICY-BAD $label $p mode=$m must be 100644 (a patch is data)"; bad=1; fi ;;
+              esac
+            done
+            if [ "$bad" = 0 ]; then log "POLICY-OK $label (init.d/uci-defaults/libexec/bin/sbin = 100755, *.patch = 100644)"
+            else GATE_FAIL=1; fi
+          }
+
+          # G7: PKG_RELEASE must be exactly upstream-master+1 (measured, never pinned).
+          release_gate() {
+            local label="$1" path="$2" got base
+            got="$(git show "HEAD:$path" 2>/dev/null | sed -n 's/^PKG_RELEASE:=//p' | head -1)"
+            base="$(git show "$UPMASTER:$path" 2>/dev/null | sed -n 's/^PKG_RELEASE:=//p' | head -1)"
+            if [ -z "$got" ] || [ -z "$base" ]; then
+              log "RELEASE-BAD $label cannot read PKG_RELEASE (HEAD='${got:-?}' master='${base:-?}')"; GATE_FAIL=1; return
+            fi
+            # Policy, drift-proof: a branch that adds patches must sit STRICTLY ABOVE current master.
+            # "== master+1" was wrong the day master itself moved 9 -> 10 while the PR carried 10.
+            if [ "$got" -gt "$base" ]; then
+              log "RELEASE-OK $label PKG_RELEASE:=$got > master:=$base"
+              [ "$got" = "$((base+1))" ] || log "RELEASE-INFO $label PKG_RELEASE:=$got is more than master+1 ($((base+1))) - fine, but a rebase would tighten it"
+            else
+              log "RELEASE-BAD $label PKG_RELEASE:=$got is not above master:=$base - the branch must be rebased so the bump lands above current master (expected > $base, i.e. $((base+1)))"; GATE_FAIL=1
+            fi
+          }
+
+          GATE_FAIL=0
+          pr_range comfast-cf-wa350-support PR-25040 "$MAX_RANGE_COMMITS"
+          pr_verify "origin/comfast-cf-wa350-support" PR-25040 "$(git merge-base "$UPMASTER" origin/comfast-cf-wa350-support)"
+
+          pr_range "$BR_25760" PR-25760 "$MAX_RANGE_COMMITS"
+          pr_verify "origin/$BR_25760" PR-25760 "$(git merge-base "$UPMASTER" "origin/$BR_25760")"
+
+          pr_range "$BR_25761" PR-25761 "$MAX_RANGE_COMMITS"
+          pr_verify "origin/$BR_25761" PR-25761 "$(git merge-base "$UPMASTER" "origin/$BR_25761")"
+          release_gate 25761/Makefile package/kernel/mac80211/Makefile
+
+          pr_range "$BR_25474" PR-25474 "$MAX_RANGE_COMMITS"
+          pr_verify "origin/$BR_25474" PR-25474 "$(git merge-base "$UPMASTER" "origin/$BR_25474")"
+
+          pr_range "$BR_25477" PR-25477 "$MAX_RANGE_COMMITS"
+          pr_verify "origin/$BR_25477" PR-25477 "$(git merge-base "$UPMASTER" "origin/$BR_25477")"
+
+          policy_gate build-tree
+
+          # the DTS is an ADDED file of PR #25040, so G4 above already pins it byte-for-byte;
+          # this line only records it on the identity card (no sha is asserted here).
+          DTS=target/linux/ath79/dts/qca9563_comfast_cf-wa350.dts
+          if [ -s "$DTS" ]; then
+            log "DTS-RECORDED $DTS ($(wc -l < "$DTS") lines, sha256 $(sha256sum "$DTS" | cut -c1-16)…, mode $(git ls-tree HEAD -- "$DTS" | awk '{print $1}'))"
+          else
+            log "DTS-BAD $DTS missing or empty"; GATE_FAIL=1
+          fi
+
+          if [ "$GATE_FAIL" != 0 ]; then
+            echo "::error::a derived content gate failed (BLOB-BAD / LINES-BAD / MODE-BAD / POLICY-BAD / HUNK-DROPPED / CONVERGED? / SET-BAD / DELETE-BAD / RELEASE-BAD / DTS-BAD above) - the build tree does not carry what the PR branches carry"
+            exit 1
+          fi
+          log "CONTENT-GATES-OK"
+          log "HEAD-NOW $(git rev-parse HEAD) (base was $BASE_SHA)"
+          git log --oneline "$BASE_SHA..HEAD" | tee -a logs/picks.txt
+          exit 0
+
+      - name: "Pull .config asset from ci-wa350 (the DTS comes from PR #25040, not from an asset)"
+        run: |
+          set +e
+          git fetch --depth 1 origin ci-wa350 || exit 1
+          mkdir -p /tmp/assets
+          git show "origin/ci-wa350:.config" > /tmp/assets/.config || exit 1
+          { echo "cfg_source = ci-wa350"; echo "dts_source = PR #25040 (in-tree, no asset copy, no sha pin)"; } | tee logs/asset-source.txt
+          sha256sum /tmp/assets/.config | tee logs/assets.sha256
+          exit 0
+
+      # =====================================================================
+      # profile-driven asset import (main -> m/, general -> g/, special -> s/)
+      # verbatim logic of build-cf-wa350-final; replaces include_files/attach_theme
+      # =====================================================================
+      - name: Import assets from building-helper (profile-driven)
+        run: |
+          set +e
+          echo "=== Importing assets (profile=${{ inputs.asset_profile }}) ===" | tee logs/building-helper.txt
+          BH_DIR="/tmp/building-helper"
+          rm -rf "$BH_DIR"
+          if git clone --depth 1 "$BUILDING_HELPER_REPO" "$BH_DIR" 2>&1 | tee -a logs/building-helper.txt; then
+            echo "✅ building-helper clone succeeded." | tee -a logs/building-helper.txt
+          else
+            echo "::error::building-helper clone FAILED."
+            exit 1
+          fi
+          rm -rf "$BH_DIR/.git"
+          echo "=== Contents of building-helper (top-level) ===" | tee -a logs/building-helper.txt
+          ls -la "$BH_DIR" | tee -a logs/building-helper.txt
+
+          case "${{ inputs.asset_profile }}" in
+            main)    SUB=m ;;
+            general) SUB=g ;;
+            special) SUB=s ;;
+            *)       echo "::error::unknown asset_profile '${{ inputs.asset_profile }}'"; exit 1 ;;
+          esac
+          SRC="$BH_DIR/$SUB"
+          echo "=== Selected subfolder: $SRC ===" | tee -a logs/building-helper.txt
+          if [ ! -d "$SRC" ]; then
+            echo "::error::asset_profile '${{ inputs.asset_profile }}' → $SRC not found in building-helper."
+            ls -la "$BH_DIR" | tee -a logs/building-helper.txt
+            exit 1
+          fi
+
+          if [ -d "$SRC/files" ]; then
+            mkdir -p files
+            cp -rv "$SRC/files"/. files/ 2>&1 | tee -a logs/building-helper.txt
+            echo "✅ files/ injected from $SUB/files" | tee -a logs/building-helper.txt
+            find files -maxdepth 4 -type f | sort | tee -a logs/building-helper.txt
+          else
+            echo "ℹ️ $SRC/files not present — skipping files overlay." | tee -a logs/building-helper.txt
+          fi
+
+          if [ -d "$SRC/luci-theme-enan-dashboard" ]; then
+            TARGET_PARENT="package"
+            TARGET_DIR="$TARGET_PARENT/luci-theme-enan-dashboard"
+            mkdir -p "$TARGET_PARENT"
+            rm -rf "$TARGET_DIR"
+            cp -rv "$SRC/luci-theme-enan-dashboard" "$TARGET_PARENT"/ 2>&1 | tee -a logs/building-helper.txt
+            chmod -R u+rwX,go+rX "$TARGET_DIR" 2>&1 | tee -a logs/building-helper.txt
+            find "$TARGET_DIR" -type f -name "*.sh" -exec chmod +x {} \; 2>&1 | tee -a logs/building-helper.txt
+            find "$TARGET_DIR" -type f -name "Makefile" -exec chmod 644 {} \; 2>&1 | tee -a logs/building-helper.txt
+            find "$TARGET_DIR/files" -type f -exec chmod +x {} \; 2>/dev/null || true
+            if [ -f "$TARGET_DIR/Makefile" ]; then
+              echo "✅ luci-theme-enan-dashboard imported from $SUB/luci-theme-enan-dashboard" | tee -a logs/building-helper.txt
+              head -n 20 "$TARGET_DIR/Makefile" | tee -a logs/building-helper.txt
+            else
+              echo "::error::Makefile NOT found in $TARGET_DIR"
+              exit 1
+            fi
+          else
+            echo "ℹ️ $SRC/luci-theme-enan-dashboard not present — skipping theme package." | tee -a logs/building-helper.txt
+          fi
+
+          echo "=== Import completed for profile '${{ inputs.asset_profile }}' ===" | tee -a logs/building-helper.txt
+          exit 0
+
+      # =====================================================================
+      # .config finalisation: luci always on, theme only if the profile provided
+      # it, lldpd/luci-app-watchcat hard-forced before AND after defconfig.
+      # =====================================================================
+      - name: Config from root .config + luci + lldpd/luci-app-watchcat + defconfig + proofs
+        run: |
+          set +e
+          cp /tmp/assets/.config .config
+          sed -i 's/^# CONFIG_PACKAGE_luci is not set/CONFIG_PACKAGE_luci=y/' .config
+          if [ -d "package/luci-theme-enan-dashboard" ]; then
+            echo "--- Injecting CONFIG_PACKAGE_luci-theme-enan-dashboard=y ---" | tee -a logs/building-helper.txt
+            sed -i '/^CONFIG_PACKAGE_luci-theme-enan-dashboard=/d' .config
+            sed -i '/^# CONFIG_PACKAGE_luci-theme-enan-dashboard is not set/d' .config
+            echo 'CONFIG_PACKAGE_luci-theme-enan-dashboard=y' >> .config
+          fi
+          force_enable_pre() {
+            local sym="$1"
+            echo "--- Force-enabling ${sym}=y (pre-defconfig) ---" | tee -a logs/config-proof.txt
+            sed -i "/^${sym}=/d"                     .config
+            sed -i "/^# ${sym} is not set/d"         .config
+            echo "${sym}=y" >> .config
+          }
+          force_enable_pre "CONFIG_PACKAGE_lldpd"
+          force_enable_pre "CONFIG_PACKAGE_luci-app-watchcat"
+          ./scripts/feeds update -a >/dev/null 2>&1
+          ./scripts/feeds install -a >/dev/null 2>&1
+          make defconfig || exit 1
+          need_redefconfig=0
+          force_enable_post() {
+            local sym="$1"
+            if grep -q "^${sym}=y" .config; then
+              echo "✅ ${sym}=y survived defconfig." | tee -a logs/config-proof.txt
+              return 0
+            fi
+            echo "⚠️ ${sym} not =y after defconfig → re-forcing." | tee -a logs/config-proof.txt
+            sed -i "/^${sym}=/d"             .config
+            sed -i "/^# ${sym} is not set/d" .config
+            echo "${sym}=y" >> .config
+            need_redefconfig=1
+          }
+          force_enable_post "CONFIG_PACKAGE_lldpd"
+          force_enable_post "CONFIG_PACKAGE_luci-app-watchcat"
+          if [ "$need_redefconfig" -eq 1 ]; then
+            echo "--- Re-running defconfig to merge re-forced lldpd/luci-app-watchcat ---" | tee -a logs/config-proof.txt
+            make defconfig || exit 1
+            if ! grep -q '^CONFIG_PACKAGE_lldpd=y' .config || \
+               ! grep -q '^CONFIG_PACKAGE_luci-app-watchcat=y' .config; then
+              echo "::error::defconfig refuses to keep lldpd/luci-app-watchcat=y - dependencies likely missing on this branch"
+              grep -E 'lldpd|luci-app-watchcat' .config | tee -a logs/config-proof.txt
+              exit 1
+            fi
+          fi
+          grep -E '^CONFIG_TARGET_PROFILE=|^CONFIG_PACKAGE_kmod-dsa-qca8k=|^CONFIG_TARGET_ROOTFS_INITRAMFS=|^CONFIG_GCC_VERSION=|^CONFIG_PACKAGE_luci=|^CONFIG_PACKAGE_ethtool=|^CONFIG_PACKAGE_luci-theme-enan-dashboard=|^CONFIG_PACKAGE_lldpd=|^CONFIG_PACKAGE_luci-app-watchcat=' .config | tee -a logs/config-proof.txt
+          grep -q '^CONFIG_PACKAGE_luci=y'     .config || { echo "::error::luci missing after defconfig";     exit 1; }
+          grep -q '^CONFIG_PACKAGE_lldpd=y'    .config || { echo "::error::lldpd missing after defconfig";    exit 1; }
+          grep -q '^CONFIG_PACKAGE_luci-app-watchcat=y' .config || { echo "::error::luci-app-watchcat missing after defconfig"; exit 1; }
+          if [ -d "package/luci-theme-enan-dashboard" ]; then
+            if grep -q '^CONFIG_PACKAGE_luci-theme-enan-dashboard=y' .config; then
+              echo "✅ luci-theme-enan-dashboard enabled after defconfig." | tee -a logs/config-proof.txt
+            else
+              echo "::error::luci-theme-enan-dashboard missing after defconfig"
+              exit 1
+            fi
+          fi
+          exit 0
+
+      - name: Build (sysupgrade + initramfs)
+        run: |
+          set +e
+          make -j"$(nproc)" V=s 2>&1 | tee logs/build.log
+          rc=${PIPESTATUS[0]}
+          ls -l bin/targets/ath79/generic/ | tee logs/bin-list.txt
+          sha256sum bin/targets/ath79/generic/*cf-wa350* 2>/dev/null | tee logs/images.sha256
+          exit "$rc"
+
+      - name: Identity card
+        if: always()
+        run: |
+          set +e
+          {
+            echo "workflow       = build-cf-wa350-prs v13.1"
+            echo "asset_profile  = ${{ inputs.asset_profile }}"
+            echo "base_branch    = comfast-cf-wa350-support ($(git rev-parse origin/comfast-cf-wa350-support))"
+            echo "upstream_master= $UPMASTER"
+            echo "pr_branches    = $BR_25760 (max $MAX_25760) / $BR_25761 (max $MAX_25761) / $BR_25474 (1) / $BR_25477 (1) / comfast-cf-wa350-support (1)"
+            echo "dts_source     = PR #25040 (in-tree; no asset copy, no sha256 pin)"
+            echo "force_pkgs     = CONFIG_PACKAGE_lldpd=y CONFIG_PACKAGE_luci-app-watchcat=y"
+            echo "heads:"; cat logs/heads.txt 2>/dev/null
+            echo "gates:"; cat logs/picks.txt 2>/dev/null | grep -E 'ALREADY-IN-BASE|EQUIVALENT-IN-BASE|TREE-ALREADY-IN-BASE|PARTIAL-CONTENT|EMPTY-AFTER-PICK|ASSET-CONFLICT|BLOB-OK|BLOB-BAD|BLOB-SAME|BLOB-DIFF|SET-OK|SET-BAD|POLICY-OK|POLICY-BAD|CONVERGED-INFO|HUNK-DROPPED|LINES-OK|LINES-BAD|LINES-INFO|MISSING-LINE|MODE-OK|MODE-BAD|HUNK-DROPPED|SET-BAD|DELETE-OK|DELETE-BAD|RELEASE-OK|RELEASE-BAD|DTS-RECORDED|DTS-BAD|VERIFY|CONTENT-GATES-OK|PICKED|-RANGE|-NOT-USED|-C[0-9]|HEAD-NOW'
+            cat logs/asset-source.txt 2>/dev/null
+            echo "building-helper_log:"; cat logs/building-helper.txt 2>/dev/null
+            echo "config_proof:"; cat logs/config-proof.txt 2>/dev/null
+            echo "kernel = 6.18$(grep -m1 'LINUX_VERSION-6.18' target/linux/generic/kernel-6.18 2>/dev/null | sed 's/.*= //')"
+            echo "date   = $(date -u +%FT%TZ)"
+            echo "runner = $RUNNER_NAME"
+          } > logs/00-identity.txt
+          cat logs/00-identity.txt
+          exit 0
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cf-wa350-prs-${{ inputs.asset_profile }}-${{ github.run_number }}
+          path: |
+            logs/
+            bin/targets/ath79/generic/*cf-wa350*
+          retention-days: 30
