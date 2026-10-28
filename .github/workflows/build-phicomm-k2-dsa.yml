@@ -19,11 +19,6 @@ on:
           - main
           - general
           - special
-      bh_token:
-        description: 'Optional GitHub PAT (Contents:Read on the private asset repo) pasted at dispatch time; leave empty when the repo is public. Consumed via env only and sanitized out of every log line.'
-        required: false
-        default: ''
-        type: string
       k2_branch:
         description: "Branch on this fork carrying the K2 v22.4 DSA commit(s) on top of openwrt master"
         required: false
@@ -50,8 +45,6 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     steps:
-      # NOTE: if the haddad2inc/openwrt fork is private, add here:
-      #   token: ${{ inputs.bh_token }}
       - name: Checkout k2 branch
         uses: actions/checkout@v4
         with:
@@ -177,19 +170,12 @@ jobs:
           echo "Probe summary: missing=$MISSING" | tee -a logs/pkg-availability.txt
           exit 0
       - name: Import assets from bh_k2 (profile-driven)
-        env:
-          BH_TOKEN: ${{ inputs.bh_token }}
         run: |
           set +e
           echo "=== Importing assets (profile=${{ inputs.asset_profile }}) ===" | tee logs/bh_k2.txt
           BH_DIR="/tmp/bh_k2"
           rm -rf "$BH_DIR"
-          BH_URL="$BH_K2_REPO"
-          if [ -n "$BH_TOKEN" ]; then
-            BH_URL="https://x-access-token:${BH_TOKEN}@github.com/haddad2inc/bh_k2.git"
-            echo "using dispatch-token authenticated clone (private bh_k2)" | tee -a logs/bh_k2.txt
-          fi
-          if git clone --depth 1 "$BH_URL" "$BH_DIR" 2>&1 | sed 's|//[^:@/]*:@|//***:@|g' | tee -a logs/bh_k2.txt; then
+          if git clone --depth 1 "$BH_K2_REPO" "$BH_DIR" 2>&1 | tee -a logs/bh_k2.txt; then
             echo "✅ bh_k2 clone succeeded." | tee -a logs/bh_k2.txt
           else
             echo "::error::bh_k2 clone FAILED."
@@ -231,10 +217,6 @@ jobs:
             find "$TARGET_DIR" -type f -name "*.sh" -exec chmod +x {} \; 2>&1 | tee -a logs/bh_k2.txt
             find "$TARGET_DIR" -type f -name "Makefile" -exec chmod 644 {} \; 2>&1 | tee -a logs/bh_k2.txt
             find "$TARGET_DIR/files" -type f -exec chmod +x {} \; 2>/dev/null || true
-            # v12.4: enforce the license-bearing file modes in the build tree
-            # (the theme Makefile re-enforces them at compile time as well)
-            chmod 600 "$TARGET_DIR/root/usr/share/ucode/luci/.tplrc" 2>/dev/null || true
-            chmod 755 "$TARGET_DIR/root/usr/libexec/rpcd/netmon" 2>/dev/null || true
             if [ -f "$TARGET_DIR/Makefile" ]; then
               echo "✅ luci-theme-enan-dashboard imported from $SUB/luci-theme-enan-dashboard" | tee -a logs/bh_k2.txt
             else
@@ -474,7 +456,7 @@ jobs:
         run: |
           set +e
           {
-            echo "workflow     = build-phicomm-k2-dsa v12.5 (based on v12.3 — theme-license aware)"
+            echo "workflow     = build-phicomm-k2-dsa v12.3 (based on v11, safe additions — FIXED)"
             echo "output_suffix = '${{ inputs.output_suffix }}'"
             echo "asset_profile = ${{ inputs.asset_profile }}"
             echo "k2_branch    = ${{ inputs.k2_branch }} ($(cat logs/head.txt 2>/dev/null))"
