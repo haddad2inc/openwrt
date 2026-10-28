@@ -1,4 +1,4 @@
-name: build-cf-wa350-prs
+name: build-cf-wa350
 
 # v12 (2026-10-22) - a SEPARATE workflow. `build-cf-wa350-full` / `-final` are untouched.
 #

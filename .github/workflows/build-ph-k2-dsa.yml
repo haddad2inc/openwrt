@@ -1,6 +1,6 @@
 # build-phicomm-k2-dsa.yml — صورة اختبار Phicomm K2 v22.4 المحوَّل إلى DSA
 
-name: build-phicomm-k2-dsa
+name: build-ph-k2-dsa
 
 on:
   workflow_dispatch:
