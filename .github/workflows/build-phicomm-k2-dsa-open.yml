@@ -11,7 +11,7 @@
 #   NOTE: if the haddad2inc/openwrt fork is (or becomes) private, add under the
 #   checkout step's `with:`  ->  token: ${{ inputs.bh_token }}
 
-name: build-phicomm-k2-dsa
+name: build-phicomm-k2-dsa-bh_token
 
 on:
   workflow_dispatch:
