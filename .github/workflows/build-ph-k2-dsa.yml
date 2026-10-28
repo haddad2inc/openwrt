@@ -43,7 +43,9 @@ on:
 env:
   BH_K2_REPO: https://github.com/haddad2inc/bh_k2.git
   # حزم تُستبعد مباشرة عبر .config + patch للـ collections
-  EXCLUDE_PACKAGES: "odhcp6c odhcpd odhcpd-ipv6only luci-app-package-manager"
+  # NOTE: wpad-basic-mbedtls excluded because it conflicts with wpad-mesh-mbedtls
+  #       (both provide hostapd/wpa-supplicant virtuals; cannot coexist).
+  EXCLUDE_PACKAGES: "odhcp6c odhcpd odhcpd-ipv6only luci-app-package-manager wpad-basic-mbedtls"
 
 jobs:
   build:
@@ -154,7 +156,7 @@ jobs:
           set +e
           echo "=== Availability probe ===" | tee logs/pkg-availability.txt
           echo "Fixed base (always requested):" | tee -a logs/pkg-availability.txt
-          FIXED="kmod-dsa-mt7620 lldpd luci-app-watchcat uhttpd"
+          FIXED="kmod-dsa-mt7620 lldpd luci-app-watchcat uhttpd wpad-mesh-mbedtls"
           for p in $FIXED; do
             echo "  - $p" | tee -a logs/pkg-availability.txt
           done
@@ -164,8 +166,12 @@ jobs:
           MISSING=0
           for p in $ALL; do
             [ -z "$p" ] && continue
-            if grep -rlE "^PKG_NAME[[:space:]]*[:+]?=[[:space:]]*${p}[[:space:]]*$" \
-                 package/ 2>/dev/null | head -1 | grep -q . ; then
+            # A package is considered present if either its Makefile declares
+            # PKG_NAME:=<name> (plain packages) OR define Package/<name>
+            # (variant packages such as wpad-mesh-mbedtls inside hostapd/Makefile).
+            if { grep -rlE "^PKG_NAME[[:space:]]*[:+]?=[[:space:]]*${p}[[:space:]]*$" package/ 2>/dev/null \
+                 || grep -rlE "^define[[:space:]]+(Package|KernelPackage)/${p}([[:space:]]|$)" package/ 2>/dev/null; } \
+                 | head -1 | grep -q . ; then
               echo "  OK       $p" | tee -a logs/pkg-availability.txt
             else
               echo "  MISSING  $p  (no Makefile found → defconfig will silently drop CONFIG_PACKAGE_${p})" \
@@ -308,6 +314,7 @@ jobs:
           CONFIG_PACKAGE_luci-app-watchcat=y
           CONFIG_PACKAGE_watchcat=y
           CONFIG_PACKAGE_uhttpd=y
+          CONFIG_PACKAGE_wpad-mesh-mbedtls=y
           SEED
           for p in $E; do
             [ -z "$p" ] && continue
@@ -337,6 +344,7 @@ jobs:
               echo "CONFIG_PACKAGE_luci-app-watchcat=y"
               echo "CONFIG_PACKAGE_watchcat=y"
               echo "CONFIG_PACKAGE_uhttpd=y"
+              echo "CONFIG_PACKAGE_wpad-mesh-mbedtls=y"
             } >> .config
             for p in $E; do
               [ -z "$p" ] && continue
@@ -369,6 +377,7 @@ jobs:
           force_post "CONFIG_PACKAGE_lldpd"
           force_post "CONFIG_PACKAGE_luci-app-watchcat"
           force_post "CONFIG_PACKAGE_uhttpd"
+          force_post "CONFIG_PACKAGE_wpad-mesh-mbedtls"
           for p in $E; do
             [ -z "$p" ] && continue
             force_post "CONFIG_PACKAGE_${p}"
@@ -393,13 +402,14 @@ jobs:
           {
             echo "--- resolved by defconfig ---"
             grep -E "^CONFIG_${DEVSYM}=|^CONFIG_PACKAGE_kmod-dsa-mt7620=|^CONFIG_PACKAGE_swconfig=|^# CONFIG_PACKAGE_swconfig is not set" .config || true
-            grep -E "^CONFIG_FEED_luci=|^CONFIG_PACKAGE_lldpd=|^CONFIG_PACKAGE_luci-app-watchcat=|^CONFIG_PACKAGE_uhttpd=" .config || true
+            grep -E "^CONFIG_FEED_luci=|^CONFIG_PACKAGE_lldpd=|^CONFIG_PACKAGE_luci-app-watchcat=|^CONFIG_PACKAGE_uhttpd=|^CONFIG_PACKAGE_wpad-mesh-mbedtls=" .config || true
             for p in $E; do
               [ -z "$p" ] && continue
               grep -E "^CONFIG_PACKAGE_${p}=" .config || echo "(extra) CONFIG_PACKAGE_${p} missing after defconfig"
             done
             grep -E "^CONFIG_PACKAGE_luci=" .config || true
             grep -E "^CONFIG_PACKAGE_luci-theme-enan-dashboard=" .config || true
+            grep -E "^CONFIG_PACKAGE_wpad-basic-mbedtls=" .config || true
             for p in $X; do
               [ -z "$p" ] && continue
               grep -E "^CONFIG_PACKAGE_${p}=" .config || true
@@ -414,6 +424,7 @@ jobs:
           grep -q '^CONFIG_PACKAGE_lldpd=y'             .config || { echo "::error::config proof: CONFIG_PACKAGE_lldpd != y";             exit 1; }
           grep -q '^CONFIG_PACKAGE_luci-app-watchcat=y' .config || { echo "::error::config proof: CONFIG_PACKAGE_luci-app-watchcat != y"; exit 1; }
           grep -q '^CONFIG_PACKAGE_uhttpd=y'            .config || { echo "::error::config proof: CONFIG_PACKAGE_uhttpd != y";            exit 1; }
+          grep -q '^CONFIG_PACKAGE_wpad-mesh-mbedtls=y' .config || { echo "::error::config proof: CONFIG_PACKAGE_wpad-mesh-mbedtls != y"; exit 1; }
           for p in $E; do
             [ -z "$p" ] && continue
             if grep -q "^CONFIG_PACKAGE_${p}=y" .config; then
@@ -455,12 +466,13 @@ jobs:
               echo "✅ luci-theme-bootstrap absent (theme swap applied successfully)" | tee -a logs/manifest-proof.txt
             fi
             echo "--- manifest proof: required packages present (fatal) ---" | tee -a logs/manifest-proof.txt
-            grep -E '^(swconfig|kmod-dsa-mt7620|kmod-dsa-core|kmod-mt76x2|lldpd|luci-app-watchcat|uhttpd|luci-theme-enan-dashboard)' "$MAN" | tee -a logs/manifest-proof.txt || true
+            grep -E '^(swconfig|kmod-dsa-mt7620|kmod-dsa-core|kmod-mt76x2|lldpd|luci-app-watchcat|uhttpd|luci-theme-enan-dashboard|wpad-mesh-mbedtls|wpad-basic-mbedtls)' "$MAN" | tee -a logs/manifest-proof.txt || true
             if grep -q '^swconfig ' "$MAN"; then echo "::error::MANIFEST FAIL: swconfig inside the image despite -swconfig"; exit 1; fi
             grep -q '^kmod-dsa-mt7620 ' "$MAN"   || { echo "::error::MANIFEST FAIL: kmod-dsa-mt7620 missing from the image";   exit 1; }
             grep -q '^lldpd ' "$MAN"              || { echo "::error::MANIFEST FAIL: lldpd missing from the image";              exit 1; }
             grep -q '^luci-app-watchcat ' "$MAN" || { echo "::error::MANIFEST FAIL: luci-app-watchcat missing from the image"; exit 1; }
             grep -q '^uhttpd ' "$MAN"             || { echo "::error::MANIFEST FAIL: uhttpd missing from the image";             exit 1; }
+            grep -q '^wpad-mesh-mbedtls ' "$MAN"  || { echo "::error::MANIFEST FAIL: wpad-mesh-mbedtls missing from the image";  exit 1; }
             if [ -d "package/luci-theme-enan-dashboard" ]; then
               grep -q '^luci-theme-enan-dashboard ' "$MAN" || { echo "::error::MANIFEST FAIL: luci-theme-enan-dashboard missing from the image"; exit 1; }
             fi
@@ -482,7 +494,7 @@ jobs:
             echo "exclude_packages = '${{ env.EXCLUDE_PACKAGES }}'"
             echo "wifi_rescue  = ${{ inputs.wifi_rescue }}"
             echo "theme_swap   = $([ -d package/luci-theme-enan-dashboard ] && echo 'attempted (enan-dashboard present)' || echo 'skipped (enan-dashboard absent)')"
-            echo "fixed_base_pkgs = CONFIG_FEED_luci=y CONFIG_PACKAGE_lldpd=y CONFIG_PACKAGE_luci-app-watchcat=y CONFIG_PACKAGE_uhttpd=y CONFIG_PACKAGE_luci-theme-enan-dashboard=y"
+            echo "fixed_base_pkgs = CONFIG_FEED_luci=y CONFIG_PACKAGE_lldpd=y CONFIG_PACKAGE_luci-app-watchcat=y CONFIG_PACKAGE_uhttpd=y CONFIG_PACKAGE_luci-theme-enan-dashboard=y CONFIG_PACKAGE_wpad-mesh-mbedtls=y"
             echo "rescue.sha256:"; cat logs/rescue.sha256 2>/dev/null
             echo "gates:"; cat logs/gates.txt 2>/dev/null
             echo "files.sha256:"; cat logs/files.sha256 2>/dev/null
