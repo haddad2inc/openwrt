@@ -3,8 +3,6 @@ From: Salah Ahmed <haddad2inc@gmail.com>
 Date: Wed, 14 Oct 2026 23:45:00 +0300
 Subject: [PATCH] leds: trigger-netdev: add byte-rate threshold mode
 
-leds: trigger-netdev: add byte-rate threshold mode
-
 The tx/rx modes blink once per observed change of the packet counters,
 which misses traffic forwarded in hardware (DSA bridge offload) and
 flickers on background broadcast noise. Add a rate_threshold attribute
@@ -273,7 +271,7 @@ Signed-off-by: Salah Ahmed <haddad2inc@gmail.com>
  	/* Already validated, hw control is possible with the requested mode */
  	if (trigger_data->hw_control) {
  		led_cdev->hw_control_set(led_cdev, trigger_data->mode);
-@@ -96,60 +235,23 @@ static void set_baseline_state(struct led_netdev_data *trigger_data)
+@@ -96,60 +235,23 @@ static void set_baseline_state(struct le
  	if (!led_cdev->blink_brightness)
  		led_cdev->blink_brightness = led_cdev->max_brightness;
  
@@ -296,8 +294,7 @@ Signed-off-by: Salah Ahmed <haddad2inc@gmail.com>
 -		if (test_bit(TRIGGER_NETDEV_LINK_1000, &trigger_data->mode) &&
 -		    trigger_data->link_speed == SPEED_1000)
 -			blink_on = true;
-+	netdev_set_resting(trigger_data);
- 
+-
 -		if (test_bit(TRIGGER_NETDEV_LINK_2500, &trigger_data->mode) &&
 -		    trigger_data->link_speed == SPEED_2500)
 -			blink_on = true;
@@ -323,7 +320,8 @@ Signed-off-by: Salah Ahmed <haddad2inc@gmail.com>
 -					   led_cdev->blink_brightness);
 -		else
 -			led_set_brightness(led_cdev, LED_OFF);
--
++	netdev_set_resting(trigger_data);
+ 
 -		/* If we are looking for RX/TX start periodically
 -		 * checking stats
 +	/* If we are looking for RX/TX (or a rate threshold is set) start
@@ -349,11 +347,10 @@ Signed-off-by: Salah Ahmed <haddad2inc@gmail.com>
  	}
  }
  
-@@ -198,6 +300,15 @@ static bool can_hw_control(struct led_netdev_data *trigger_data)
- 	if (interval != default_interval)
+@@ -199,6 +301,15 @@ static bool can_hw_control(struct led_ne
  		return false;
  
-+	/*
+ 	/*
 +	 * Rate mode is evaluated in software, so a threshold rules hardware
 +	 * control out the same way a non-default interval does. Writing the
 +	 * attribute re-runs this check, which is how a threshold takes the LED
@@ -362,10 +359,11 @@ Signed-off-by: Salah Ahmed <haddad2inc@gmail.com>
 +	if (trigger_data->rate_threshold_kbps)
 +		return false;
 +
- 	/*
++	/*
  	 * net_dev must be set with hw control, otherwise no
  	 * blinking can be happening and there is nothing to
-@@ -292,6 +403,7 @@ static int set_device_name(struct led_netdev_data *trigger_data,
+ 	 * offloaded. Additionally, for hw control to be
+@@ -292,6 +403,7 @@ static int set_device_name(struct led_ne
  		get_device_state(trigger_data);
  
  	trigger_data->last_activity = 0;
@@ -373,7 +371,7 @@ Signed-off-by: Salah Ahmed <haddad2inc@gmail.com>
  
  	/* Skip if we're called from netdev_trig_activate() and hw_control is true */
  	if (!trigger_data->hw_control || led_get_trigger_data(trigger_data->led_cdev))
-@@ -475,7 +587,62 @@ static ssize_t interval_store(struct device *dev,
+@@ -475,7 +587,62 @@ static ssize_t interval_store(struct dev
  	return size;
  }
  
@@ -436,7 +434,7 @@ Signed-off-by: Salah Ahmed <haddad2inc@gmail.com>
  
  static ssize_t offloaded_show(struct device *dev,
  			      struct device_attribute *attr, char *buf)
-@@ -551,6 +718,7 @@ static struct attribute *netdev_trig_attrs[] = {
+@@ -551,6 +718,7 @@ static struct attribute *netdev_trig_att
  	&dev_attr_rx_err.attr,
  	&dev_attr_tx_err.attr,
  	&dev_attr_interval.attr,
@@ -444,7 +442,7 @@ Signed-off-by: Salah Ahmed <haddad2inc@gmail.com>
  	&dev_attr_offloaded.attr,
  	NULL
  };
-@@ -597,12 +765,14 @@ static int netdev_trig_notify(struct notifier_block *nb,
+@@ -597,12 +765,14 @@ static int netdev_trig_notify(struct not
  		dev_put(trigger_data->net_dev);
  		dev_hold(dev);
  		trigger_data->net_dev = dev;
@@ -459,7 +457,7 @@ Signed-off-by: Salah Ahmed <haddad2inc@gmail.com>
  		break;
  	case NETDEV_UP:
  		trigger_data->hw_control = can_hw_control(trigger_data);
-@@ -632,6 +802,8 @@ static void netdev_trig_work(struct work_struct *work)
+@@ -632,6 +802,8 @@ static void netdev_trig_work(struct work
  	unsigned int new_activity;
  	struct rtnl_link_stats64 temp;
  	unsigned long interval;
@@ -468,7 +466,7 @@ Signed-off-by: Salah Ahmed <haddad2inc@gmail.com>
  	int invert;
  
  	/* If we dont have a device, insure we are off */
-@@ -640,6 +812,172 @@ static void netdev_trig_work(struct work_struct *work)
+@@ -640,6 +812,172 @@ static void netdev_trig_work(struct work
  		return;
  	}
  
