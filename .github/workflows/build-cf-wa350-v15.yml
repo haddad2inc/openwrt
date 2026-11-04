@@ -1,12 +1,15 @@
 name: build-cf-wa350-v15
-# v15 (2026-11-04) - Pin PR #25040 head to e0b8b37 to eliminate drift
-# Rest of the logic (lenient cherry-pick, per-PR snapshots, asset mirroring) unchanged from v14.
+# v15 (2026-11-04) - هجين بين build-cf-wa350.yml (للتجميع) و build-cf-wa350-full.yml (لمتانة الدمج)
+# - يحتفظ بآلية جمع لقطات لكل PR (من v14)
+# - يستبدل pick() الصارم بـ pick() المطور (6 بوابات) من الوركفلو الناجح
+# - يزيل البوابات المسببة للفشل: pr_verify, release_gate, policy_gate
+# - يحتفظ بجمع الأصول وضغطها مع الصور في artifact واحد
 
 on:
   workflow_dispatch:
     inputs:
       asset_profile:
-        description: 'Asset profile to import (main/general/special from building-helper)'
+        description: 'Asset profile to import (m/g/s folder from building-helper)'
         required: true
         default: main
         type: choice
@@ -21,7 +24,6 @@ env:
   BUILDING_HELPER_REPO: https://github.com/haddad2inc/building-helper.git
   UPSTREAM_REPO: https://github.com/openwrt/openwrt.git
   BASE_BRANCH: comfast-cf-wa350-support
-  BASE_SHA: e0b8b375e9904f08a5a785eadb5f145d70c38e7f   # <-- pinned head of PR #25040
   BR_25760: generic-leds-wired-rate-activity
   BR_25761: mac80211-tpt-led-delivered-idle
   BR_25474: ath79-mtd-mx25l12805d-restore-name
@@ -34,19 +36,19 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      # ---------------------------------------------------------------
-      # 1) Checkout base branch at the pinned SHA
-      # ---------------------------------------------------------------
-      - name: Checkout base branch (PR #25040 head @ e0b8b37)
+      # -----------------------------------------------------------------
+      # 1) Checkout base branch (نستخدم اسم الفرع لضمان المرونة)
+      # -----------------------------------------------------------------
+      - name: Checkout base branch
         uses: actions/checkout@v4
         with:
           repository: haddad2inc/openwrt
-          ref: ${{ env.BASE_SHA }}
+          ref: ${{ env.BASE_BRANCH }}
           fetch-depth: 0
 
-      # ---------------------------------------------------------------
-      # 2) Fetch upstream master + the five PR branches
-      # ---------------------------------------------------------------
+      # -----------------------------------------------------------------
+      # 2) جلب upstream master وكل فروع PR
+      # -----------------------------------------------------------------
       - name: Fetch upstream master + the five PR branches
         run: |
           set -e
@@ -66,9 +68,10 @@ jobs:
             printf 'HEAD %-40s = %s\n' "$b" "$(git rev-parse origin/$b 2>/dev/null || echo MISSING)"
           done
 
-      # ---------------------------------------------------------------
-      # 3) Collect source snapshots per PR (pre-pick)
-      # ---------------------------------------------------------------
+      # -----------------------------------------------------------------
+      # 3) جمع لقطات لكل PR (قبل أي دمج)
+      #    هذا يضمن أرشفة ملفات كل فرع حتى لو فشل الدمج أو تم تخطيه
+      # -----------------------------------------------------------------
       - name: Collect source snapshots per PR (pre-pick)
         run: |
           set +e
@@ -85,8 +88,7 @@ jobs:
             HEAD_SHA="$(git rev-parse "$ref")"
             UMB="$(git merge-base "$UPMASTER" "$ref")"
             if [ -z "$UMB" ]; then
-              printf 'BRANCH: %s\nHEAD: %s\nSTATUS: NO-MERGE-BASE with upstream master\n' \
-                "$br" "$HEAD_SHA" > "$dir/STATUS.txt"
+              printf 'BRANCH: %s\nHEAD: %s\nSTATUS: NO-MERGE-BASE\n' "$br" "$HEAD_SHA" > "$dir/STATUS.txt"
               return 0
             fi
             N="$(git rev-list --count "$UMB".."$ref")"
@@ -112,9 +114,7 @@ jobs:
                   mkdir -p "$(dirname "$target")"
                   git show "$ref:$f1" > "$target" 2>/dev/null || echo "COPY-FAILED $f1" >> "$dir/STATUS.txt"
                   ;;
-                D)
-                  echo "DELETED: $f1" >> "$dir/STATUS.txt"
-                  ;;
+                D) echo "DELETED: $f1" >> "$dir/STATUS.txt" ;;
                 R*|C*)
                   local target="$dir/files/$f2"
                   mkdir -p "$(dirname "$target")"
@@ -123,7 +123,6 @@ jobs:
                   ;;
               esac
             done < "$dir/files.txt"
-
             echo "COLLECTED $label: $N commits, $(wc -l < "$dir/files.txt") files"
           }
 
@@ -135,10 +134,8 @@ jobs:
 
           {
             echo "# PR Sources Index (v15)"
-            echo
             echo "Generated: $(date -u)"
             echo "Upstream master: $UPMASTER"
-            echo "Pinned base SHA: $BASE_SHA"
             echo
             for d in pr-sources/*/; do
               echo "## $d"
@@ -146,65 +143,135 @@ jobs:
               echo
             done
           } > pr-sources/INDEX.md
-
           cat pr-sources/INDEX.md
           exit 0
 
-      # ---------------------------------------------------------------
-      # 4) Lenient cherry-pick of the five PR ranges
-      # ---------------------------------------------------------------
-      - name: Cherry-pick the five PR ranges (lenient)
+      # -----------------------------------------------------------------
+      # 4) Cherry-pick باستخدام pick() المطورة (6 بوابات)
+      #    مستخرجة من build-cf-wa350-full.yml
+      # -----------------------------------------------------------------
+      - name: Cherry-pick with robust gates (from full workflow)
         run: |
           set +e
           git config user.name  "haddad2inc"
           git config user.email "haddad2inc@gmail.com"
           : > logs/picks.txt
           BASE_SHA_START="$(git rev-parse HEAD)"
-
+          ASSET_DTS="target/linux/ath79/dts/qca9563_comfast_cf-wa350.dts"
           log() { echo "$1" | tee -a logs/picks.txt; }
 
+          # content_state من الوركفلو الناجح (بوابة 3)
+          content_state() {
+            local m1 m2 s1 s2 st p1 p2 same=0 diff=0
+            while read -r m1 m2 s1 s2 st p1 p2; do
+              [ -n "$st" ] || continue
+              case "$st" in
+                D*) if git rev-parse -q --verify "HEAD:$p1" >/dev/null; then diff=$((diff+1)); else same=$((same+1)); fi ;;
+                *) [ -n "$p2" ] || p2="$p1"
+                   if [ "$s2" != "0000000000000000000000000000000000000000" ] \
+                      && [ "$(git rev-parse -q --verify "HEAD:$p2" 2>/dev/null)" = "$s2" ]; then
+                     same=$((same+1))
+                   else
+                     diff=$((diff+1))
+                   fi ;;
+              esac
+            done < <(git show --no-color --no-abbrev --format= --raw -m --first-parent --find-renames "$1")
+            [ "$same" -gt 0 ] && [ "$diff" -eq 0 ] && return 0
+            [ "$same" -gt 0 ] && return 1
+            return 2
+          }
+
+          # pick() من الوركفلو الناجح مع 6 بوابات
           pick() {
-            local ref="$1" label="$2" sha out rc
-            sha="$(git rev-parse "$ref")" || { log "ERR-CANNOT-RESOLVE $label $ref"; return 1; }
+            local ref="$1" label="$2" sha
+            sha="$(git rev-parse "$ref")" || { echo "::error::$label: cannot resolve $ref"; exit 1; }
+            # 1) ALREADY-IN-BASE
             if git merge-base --is-ancestor "$sha" HEAD; then
               log "ALREADY-IN-BASE $label $sha"; return 0
             fi
+            # 2) EQUIVALENT-IN-BASE
+            if git cherry HEAD "$sha" 2>/dev/null | grep -q "^- $sha"; then
+              log "EQUIVALENT-IN-BASE $label $sha (patch-id match)"; return 0
+            fi
+            # 3) TREE-ALREADY-IN-BASE
+            content_state "$sha"; local cs=$?
+            if [ "$cs" -eq 0 ]; then
+              log "TREE-ALREADY-IN-BASE $label $sha"; return 0
+            fi
+            [ "$cs" -eq 1 ] && log "PARTIAL-CONTENT-IN-BASE $label $sha"
+
+            local out rc
             out="$(git cherry-pick -x "$sha" 2>&1)"; rc=$?
+            printf '%s\n' "$out" >> logs/picks.txt
             if [ "$rc" -eq 0 ]; then log "PICKED $label $sha"; return 0; fi
-            out="$(git cherry-pick -x -X theirs "$sha" 2>&1)"; rc=$?
-            if [ "$rc" -eq 0 ]; then log "PICKED-THEIRS $label $sha"; return 0; fi
-            git cherry-pick --abort 2>/dev/null || true
-            log "PICK-SKIPPED $label $sha (conflict, skipped)"
-            return 0
+
+            # 4) EMPTY-AFTER-PICK
+            if { printf '%s' "$out" | grep -qi 'now empty'; } \
+               || { ! git rev-parse -q --verify CHERRY_PICK_HEAD >/dev/null \
+                    && git diff-index --quiet HEAD -- 2>/dev/null \
+                    && [ -z "$(git diff --name-only --diff-filter=U)" ]; }; then
+              git cherry-pick --skip >/dev/null 2>&1 || git cherry-pick --quit >/dev/null 2>&1
+              log "EMPTY-AFTER-PICK $label $sha (change already present; skipped)"; return 0
+            fi
+
+            # 5) ASSET-CONFLICT (DTS فقط)
+            local UNMERGED="$(git diff --name-only --diff-filter=U)"
+            if [ -n "$UNMERGED" ] && [ "$UNMERGED" = "$ASSET_DTS" ]; then
+              git checkout --ours -- "$ASSET_DTS" 2>/dev/null && git add -- "$ASSET_DTS"
+              if git diff --cached --quiet HEAD 2>/dev/null; then
+                git cherry-pick --skip >/dev/null 2>&1 || git cherry-pick --quit >/dev/null 2>&1
+                log "ASSET-CONFLICT-EMPTY $label $sha (only DTS conflicted; skipped)"; return 0
+              elif GIT_EDITOR=true git cherry-pick --continue >/dev/null 2>&1; then
+                log "ASSET-CONFLICT-RESOLVED $label $sha (base kept for DTS)"; return 0
+              fi
+            fi
+
+            # 6) فشل حقيقي
+            {
+              echo "=== $label $sha ==="
+              printf '%s\n' "$out"
+              echo "--- status ---"; git status --porcelain
+              echo "--- unmerged ---"; git diff --name-only --diff-filter=U
+            } > "logs/conflict-$label.txt" 2>&1
+            echo "::error::cherry-pick conflict in $label ($sha) - see artifact logs/conflict-$label.txt"
+            git cherry-pick --abort
+            exit 1
           }
 
+          # pr_range(): يقيس النطاق مقابل upstream master (مثل الوركفلو الناجح)
           pr_range() {
             local br="$1" label="$2" max="$3" ref UMB N
             ref="origin/$br"
-            git rev-parse -q --verify "$ref" >/dev/null || { log "ERR-NO-BRANCH $label $br"; return 0; }
-            UMB="$(git merge-base "$UPMASTER" "$ref")" || { log "ERR-MERGE-BASE $label"; return 0; }
+            git rev-parse -q --verify "$ref" >/dev/null || { echo "::error::$label: no such branch"; exit 1; }
+            UMB="$(git merge-base "$UPMASTER" "$ref")" || { echo "::error::$label: merge-base failed"; exit 1; }
             N="$(git rev-list --count "$UMB".."$ref")"
             log "$label-RANGE commits=$N max=$max"
-            if [ "$N" -lt 1 ]; then log "$label-RANGE-EMPTY: skipping"; return 0; fi
-            if [ "$N" -gt "$max" ]; then log "::warning::$label-RANGE-TOO-LARGE: $N > $max"; fi
+            if [ "$N" -lt 1 ]; then
+              log "::warning::$label-RANGE-EMPTY: nothing above upstream merge-base"
+              return 0
+            fi
+            if [ "$N" -gt "$max" ]; then
+              log "::warning::$label-RANGE-TOO-LARGE: $N > $max (continuing)"
+            fi
             for c in $(git rev-list --reverse "$UMB".."$ref"); do
               pick "$c" "$label-$(git log -1 --format=%h "$c")"
             done
           }
 
+          # استدعاء pr_range لكل فرع
           pr_range "$BASE_BRANCH" PR-25040 "$MAX_RANGE_COMMITS"
           pr_range "$BR_25760"    PR-25760 "$MAX_RANGE_COMMITS"
           pr_range "$BR_25761"    PR-25761 "$MAX_RANGE_COMMITS"
           pr_range "$BR_25474"    PR-25474 "$MAX_RANGE_COMMITS"
           pr_range "$BR_25477"    PR-25477 "$MAX_RANGE_COMMITS"
 
-          log "CONTENT-GATES-DISABLED (tolerance mode v15)"
+          log "ALL-PICKS-COMPLETED (v15 robust mode)"
           git log --oneline "$BASE_SHA_START..HEAD" | tee -a logs/picks.txt
           exit 0
 
-      # ---------------------------------------------------------------
-      # 5) .config from ci-wa350
-      # ---------------------------------------------------------------
+      # -----------------------------------------------------------------
+      # 5) جلب .config من ci-wa350
+      # -----------------------------------------------------------------
       - name: Pull .config asset from ci-wa350
         run: |
           set +e
@@ -216,9 +283,9 @@ jobs:
           echo "ci-wa350 .config -> /tmp/assets/.config ($(wc -l < /tmp/assets/.config) lines)"
           exit 0
 
-      # ---------------------------------------------------------------
-      # 6) Import assets from building-helper
-      # ---------------------------------------------------------------
+      # -----------------------------------------------------------------
+      # 6) استيراد الأصول من building-helper (مع نسخة مرآة)
+      # -----------------------------------------------------------------
       - name: Import assets from building-helper (profile-driven)
         env:
           BH_TOKEN: ${{ inputs.bh_token }}
@@ -239,7 +306,7 @@ jobs:
           fi
 
           rm -rf /tmp/bh
-          if ! git clone --depth 1 "$URL" /tmp/bh; then
+          if ! git clone --depth 1 "$URL" /tmp/bh 2>&1 | sed 's|//[^:@/]*:@|//***:@|g'; then
             echo "::warning::building-helper clone failed — continuing without assets"
             exit 0
           fi
@@ -254,36 +321,48 @@ jobs:
           fi
           exit 0
 
-      # ---------------------------------------------------------------
-      # 7) Configure OpenWrt from .config + luci + lldpd + defconfig + proofs
-      # ---------------------------------------------------------------
-      - name: Config from root .config + luci + lldpd/luci-app-watchcat + defconfig
+      # -----------------------------------------------------------------
+      # 7) إعداد .config النهائي (luci + lldpd + watchcat + defconfig)
+      # -----------------------------------------------------------------
+      - name: Config from root .config + luci + lldpd/watchcat + defconfig
         run: |
           set -e
           cp /tmp/assets/.config .config
-          echo "CONFIG_PACKAGE_luci=y"                    >> .config
-          echo "CONFIG_PACKAGE_luci-ssl=y"                >> .config
-          echo "CONFIG_PACKAGE_luci-app-watchcat=y"       >> .config
-          echo "CONFIG_PACKAGE_watchcat=y"                >> .config
-          echo "CONFIG_PACKAGE_lldpd=y"                   >> .config
-          echo "CONFIG_PACKAGE_luci-app-lldpd=y"          >> .config
-          make defconfig
+          sed -i 's/^# CONFIG_PACKAGE_luci is not set/CONFIG_PACKAGE_luci=y/' .config
+          # تفعيل lldpd و watchcat قبل defconfig
+          for sym in CONFIG_PACKAGE_lldpd CONFIG_PACKAGE_watchcat; do
+            sed -i "/^${sym}=/d" .config
+            sed -i "/^# ${sym} is not set/d" .config
+            echo "${sym}=y" >> .config
+          done
+          ./scripts/feeds update -a >/dev/null 2>&1
+          ./scripts/feeds install -a >/dev/null 2>&1
+          make defconfig || exit 1
+          # التحقق بعد defconfig
+          for sym in CONFIG_PACKAGE_lldpd CONFIG_PACKAGE_watchcat; do
+            if ! grep -q "^${sym}=y" .config; then
+              echo "::error::${sym} missing after defconfig"
+              exit 1
+            fi
+          done
           cp .config logs/final.config
           echo "Final .config saved to logs/final.config"
 
-      # ---------------------------------------------------------------
-      # 8) Build sysupgrade + initramfs
-      # ---------------------------------------------------------------
+      # -----------------------------------------------------------------
+      # 8) البناء
+      # -----------------------------------------------------------------
       - name: Build (sysupgrade + initramfs)
         run: |
           set -e
-          nproc
           make -j"$(nproc)" V=s 2>&1 | tee logs/build.log
-          echo "BUILD-EXIT=$?" | tee -a logs/build.log
+          rc=${PIPESTATUS[0]}
+          ls -l bin/targets/ath79/generic/ | tee logs/bin-list.txt
+          sha256sum bin/targets/ath79/generic/*cf-wa350* 2>/dev/null | tee logs/images.sha256 || true
+          exit "$rc"
 
-      # ---------------------------------------------------------------
-      # 9) Package pr-sources + logs
-      # ---------------------------------------------------------------
+      # -----------------------------------------------------------------
+      # 9) ضغط لقطات PR والسجلات
+      # -----------------------------------------------------------------
       - name: Package pr-sources + logs
         if: always()
         run: |
@@ -295,24 +374,21 @@ jobs:
           fi
           if [ -d logs ]; then
             ( cd logs && zip -rq ../dist/logs-v15.zip . )
-            echo "logs zip:       $(du -h dist/logs-v15.zip | cut -f1)"
+            echo "logs zip: $(du -h dist/logs-v15.zip | cut -f1)"
           fi
           ls -lah dist/ || true
           exit 0
 
-      # ---------------------------------------------------------------
-      # 10) Upload firmware + PR sources + logs
-      # ---------------------------------------------------------------
+      # -----------------------------------------------------------------
+      # 10) رفع كل شيء في artifact واحد
+      # -----------------------------------------------------------------
       - name: Upload firmware + PR sources + logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: cf-wa350-v15-${{ github.run_number }}
           path: |
-            bin/targets/**/*.bin
-            bin/targets/**/*.itb
-            bin/targets/**/*.tar
-            bin/targets/**/*.manifest
+            bin/targets/ath79/generic/*cf-wa350*
             dist/*.zip
           retention-days: 30
           if-no-files-found: warn
